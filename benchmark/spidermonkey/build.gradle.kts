@@ -17,9 +17,9 @@ dependencies {
 jmh {
     jvmArgs.addAll(listOf("--enable-preview"))
     fork.set(1)
-    warmupIterations.set(3)
-    iterations.set(5)
-    benchmarkMode.set(listOf("thrpt", "avgt"))
+    warmupIterations.set(2)
+    iterations.set(3)
+    benchmarkMode.set(listOf("thrpt"))
     profilers.addAll(listOf("gc"))
     forceGC.set(true)
 }
