@@ -6,6 +6,7 @@ import net.core.WriteBuffer;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.RecordComponent;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -22,47 +23,70 @@ public final class CodecRegistry {
     ) {}
 
     private sealed interface ComponentCodec {
-        void encode(Object value, WriteBuffer wb);
+        /**
+         * Encode a field directly from a record into a ByteBuffer, avoiding boxing.
+         * The accessor MethodHandle reads the field, and the codec writes it.
+         */
+        void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable;
         Object decode(ReadBuffer rb);
     }
 
     private record IntCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeInt((int) value); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            buf.putInt((int) accessor.invoke(msg));
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readInt(); }
     }
 
     private record FloatCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeFloat((float) value); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            buf.putFloat((float) accessor.invoke(msg));
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readFloat(); }
     }
 
     private record LongCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeLong((long) value); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            buf.putLong((long) accessor.invoke(msg));
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readLong(); }
     }
 
     private record DoubleCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeDouble((double) value); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            buf.putDouble((double) accessor.invoke(msg));
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readDouble(); }
     }
 
     private record ByteCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeByte((byte) value); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            buf.put((byte) accessor.invoke(msg));
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readByte(); }
     }
 
     private record ShortCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeShort((short) value); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            buf.putShort((short) accessor.invoke(msg));
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readShort(); }
     }
 
     private record StringCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeString((String) value); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            var value = (String) accessor.invoke(msg);
+            var bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            buf.putShort((short) bytes.length);
+            buf.put(bytes);
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readString(); }
     }
 
     private record BooleanCodec() implements ComponentCodec {
-        @Override public void encode(Object value, WriteBuffer wb) { wb.writeByte((byte) ((boolean) value ? 1 : 0)); }
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            buf.put((byte) ((boolean) accessor.invoke(msg) ? 1 : 0));
+        }
         @Override public Object decode(ReadBuffer rb) { return rb.readByte() != 0; }
     }
 
@@ -102,15 +126,14 @@ public final class CodecRegistry {
     public void encode(Record msg, WriteBuffer wb) {
         var entry = byClass.get(msg.getClass());
         if (entry == null) {
-            // Auto-register for types sent via broadcast/unicast
             register((Class<? extends Record>) msg.getClass());
             entry = byClass.get(msg.getClass());
         }
-        wb.writeShort((short) entry.typeId());
+        var buf = wb.buffer();
+        buf.putShort((short) entry.typeId());
         for (int i = 0; i < entry.accessors().size(); i++) {
             try {
-                Object value = entry.accessors().get(i).invoke(msg);
-                entry.components().get(i).encode(value, wb);
+                entry.components().get(i).encodeDirect(entry.accessors().get(i), msg, buf);
             } catch (Throwable e) {
                 throw new RuntimeException("Failed to encode component " + i, e);
             }
