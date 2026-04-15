@@ -2,6 +2,7 @@ package jtroop.server;
 
 import jtroop.codec.CodecRegistry;
 import jtroop.core.EventLoop;
+import jtroop.core.EventLoopGroup;
 import jtroop.core.Handshake;
 import jtroop.core.ReadBuffer;
 import jtroop.core.WriteBuffer;
@@ -36,7 +37,8 @@ public final class Server implements AutoCloseable {
     private final ServiceRegistry serviceRegistry;
     private final CodecRegistry codec;
     private final SessionStore sessions;
-    private final EventLoop eventLoop;
+    private final EventLoop acceptLoop;
+    private final EventLoopGroup workerGroup;
     private final ByteBuffer serverEncodeBuf = ByteBuffer.allocate(65536);
     private final ByteBuffer serverWireBuf = ByteBuffer.allocate(65536);
     private final Map<Class<? extends Record>, Integer> boundPorts = new HashMap<>();
@@ -44,6 +46,7 @@ public final class Server implements AutoCloseable {
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new HashMap<>();
     private final Map<SelectionKey, ConnectionId> keyToConnection = new HashMap<>();
     private final Map<ConnectionId, SelectionKey> connectionToKey = new HashMap<>();
+    private final Map<ConnectionId, SocketChannel> connectionChannels = new HashMap<>();
     private final Map<ConnectionId, ListenerConfig> connectionConfig = new HashMap<>();
     @SuppressWarnings("rawtypes")
     private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers;
@@ -55,7 +58,7 @@ public final class Server implements AutoCloseable {
     private Server(List<ListenerConfig> listeners, ServiceRegistry serviceRegistry,
                    CodecRegistry codec,
                    Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers,
-                   java.util.concurrent.Executor executor) {
+                   java.util.concurrent.Executor executor, int workerCount) {
         this.listeners = listeners;
         this.serviceRegistry = serviceRegistry;
         this.codec = codec;
@@ -63,9 +66,10 @@ public final class Server implements AutoCloseable {
         this.executor = executor != null ? executor : Runnable::run;
         this.sessions = new SessionStore(4096);
         try {
-            this.eventLoop = new EventLoop("server-loop");
+            this.acceptLoop = new EventLoop("server-accept");
+            this.workerGroup = new EventLoopGroup(workerCount);
         } catch (IOException e) {
-            throw new RuntimeException("Failed to create event loop", e);
+            throw new RuntimeException("Failed to create event loops", e);
         }
         // Wire broadcast and unicast
         serviceRegistry.setBroadcast(this::broadcastImpl);
@@ -74,28 +78,25 @@ public final class Server implements AutoCloseable {
 
     private void broadcastImpl(Record message) {
         sessions.forEachActive(connId -> {
-            var selKey = connectionToKey.get(connId);
-            if (selKey != null && selKey.isValid()) {
-                var config = connectionConfig.get(connId);
-                if (config != null) {
-                    sendResponse(message, config, (SocketChannel) selKey.channel());
-                }
+            var channel = connectionChannels.get(connId);
+            var config = connectionConfig.get(connId);
+            if (channel != null && channel.isConnected() && config != null) {
+                sendResponse(message, config, channel);
             }
         });
     }
 
     private void unicastImpl(ConnectionId target, Record message) {
-        var selKey = connectionToKey.get(target);
-        if (selKey != null && selKey.isValid()) {
-            var config = connectionConfig.get(target);
-            if (config != null) {
-                sendResponse(message, config, (SocketChannel) selKey.channel());
-            }
+        var channel = connectionChannels.get(target);
+        var config = connectionConfig.get(target);
+        if (channel != null && channel.isConnected() && config != null) {
+            sendResponse(message, config, channel);
         }
     }
 
     public void start() throws IOException {
-        eventLoop.start();
+        acceptLoop.start();
+        workerGroup.start();
         for (var listener : listeners) {
             if (listener.transport().isTcp()) {
                 startTcpListener(listener);
@@ -111,10 +112,10 @@ public final class Server implements AutoCloseable {
         int port = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
         boundPorts.put(config.connectionType(), port);
 
-        eventLoop.submit(() -> {
+        acceptLoop.submit(() -> {
             try {
                 serverChannel.configureBlocking(false);
-                serverChannel.register(eventLoop.selector(), SelectionKey.OP_ACCEPT,
+                serverChannel.register(acceptLoop.selector(), SelectionKey.OP_ACCEPT,
                         (EventLoop.KeyHandler) key -> {
                             if (key.isAcceptable()) {
                                 acceptClient(serverChannel, config);
@@ -133,11 +134,12 @@ public final class Server implements AutoCloseable {
         boundUdpPorts.put(config.connectionType(), port);
         udpChannels.put(config.connectionType(), channel);
 
-        eventLoop.submit(() -> {
+        var udpLoop = workerGroup.next();
+        udpLoop.submit(() -> {
             try {
                 channel.configureBlocking(false);
                 var readBuf = ByteBuffer.allocate(65536);
-                channel.register(eventLoop.selector(), SelectionKey.OP_READ,
+                channel.register(udpLoop.selector(), SelectionKey.OP_READ,
                         (EventLoop.KeyHandler) key -> {
                             if (key.isReadable()) {
                                 handleUdpRead(channel, config, readBuf);
@@ -180,11 +182,22 @@ public final class Server implements AutoCloseable {
             handshakePending.add(connId);
         }
 
-        var selKey = clientChannel.register(eventLoop.selector(), SelectionKey.OP_READ,
-                (EventLoop.KeyHandler) key -> handleRead(key, connId, config, readBuf));
-        keyToConnection.put(selKey, connId);
-        connectionToKey.put(connId, selKey);
+        connectionChannels.put(connId, clientChannel);
         connectionConfig.put(connId, config);
+
+        // Assign to a worker loop (round-robin)
+        var workerLoop = workerGroup.next();
+        workerLoop.submit(() -> {
+            try {
+                var selKey = clientChannel.register(workerLoop.selector(), SelectionKey.OP_READ,
+                        (EventLoop.KeyHandler) key -> handleRead(key, connId, config, readBuf));
+                keyToConnection.put(selKey, connId);
+                connectionToKey.put(connId, selKey);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to register client channel", e);
+            }
+        });
+
         if (!needsHandshake) {
             serviceRegistry.dispatchConnect(connId);
         }
@@ -203,6 +216,7 @@ public final class Server implements AutoCloseable {
             keyToConnection.remove(key);
             connectionToKey.remove(connId);
             connectionConfig.remove(connId);
+            connectionChannels.remove(connId);
             return;
         }
         if (n > 0) {
@@ -320,12 +334,13 @@ public final class Server implements AutoCloseable {
     }
 
     public boolean isRunning() {
-        return eventLoop.isRunning();
+        return acceptLoop.isRunning();
     }
 
     @Override
     public void close() {
-        eventLoop.close();
+        acceptLoop.close();
+        workerGroup.close();
     }
 
     public static Builder builder() {
@@ -340,6 +355,7 @@ public final class Server implements AutoCloseable {
         @SuppressWarnings("rawtypes")
         private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers = new HashMap<>();
         private java.util.concurrent.Executor executor;
+        private int eventLoops = 1;
 
         public Builder listen(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
             listeners.add(new ListenerConfig(connectionType, transport, new Pipeline(layers), layers));
@@ -369,8 +385,14 @@ public final class Server implements AutoCloseable {
             return this;
         }
 
+        public Builder eventLoops(int count) {
+            this.eventLoops = count;
+            return this;
+        }
+
         public Server build() {
-            return new Server(List.copyOf(listeners), serviceRegistry, codec, Map.copyOf(handshakeHandlers), executor);
+            return new Server(List.copyOf(listeners), serviceRegistry, codec,
+                    Map.copyOf(handshakeHandlers), executor, eventLoops);
         }
     }
 }

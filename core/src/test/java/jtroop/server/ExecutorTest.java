@@ -80,8 +80,8 @@ class ExecutorTest {
         var reply = client.request(new Msg(2), Reply.class);
         assertNotNull(reply);
         assertEquals(2, reply.id());
-        // Default executor runs inline on EventLoop thread
-        assertEquals("server-loop", reply.thread());
+        // Default executor runs inline on worker EventLoop thread
+        assertTrue(reply.thread().startsWith("event-loop-"), "Expected worker thread, got: " + reply.thread());
 
         client.close();
         server.close();
