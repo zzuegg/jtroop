@@ -12,26 +12,28 @@ All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. J
 
 ### Throughput (ops/ms) — higher is better
 
-| Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
-|-----------|--------|-----------|------------------|
-| positionUpdate | 28,572 ± 494 | 2,521 ± 12,579 | 605 ± 56 |
-| chatMessage | 19,955 ± 59 | 1,145 ± 6,750 | 573 ± 18 |
-| mixedTraffic (10 msg) | 2,533 ± 29 | 217 ± 1,232 | 59 ± 4 |
+| Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
+|-----------|--------|----------------|-----------|------------------|
+| positionUpdate | 30,736 | 670 | 2,521 ± 12,579 | 605 ± 56 |
+| chatMessage | 22,253 | 500 | 1,145 ± 6,750 | 573 ± 18 |
+| mixedTraffic (10 msg) | 2,577 | — | 217 ± 1,232 | 59 ± 4 |
 
 ### Allocation (B/op) — lower is better
 
-| Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
-|-----------|--------|-----------|------------------|
-| positionUpdate | 5 ± 0 | 20,595 ± 175,663 | 456 ± 29 |
-| chatMessage | 111 ± 0 | 70,159 ± 601,257 | 863 ± 6 |
-| mixedTraffic (10 msg) | 521 ± 0 | 246,816 ± 2,105,978 | 6,315 ± 42 |
+| Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
+|-----------|--------|----------------|-----------|------------------|
+| positionUpdate | 0 | 477 | 20,595 ± 175,663 | 456 ± 29 |
+| chatMessage | 111 | 1,131 | 70,159 ± 601,257 | 863 ± 6 |
+| mixedTraffic (10 msg) | 521 | — | 246,816 ± 2,105,978 | 6,315 ± 42 |
 
 ### Notes
 
-- Netty's high error margins indicate GC-induced variance. Without blocking `.sync()` per write, Netty's fire-and-forget path generates significant GC pressure, causing some iterations to stall during collection while others run unimpeded.
-- SpiderMonkey results are stable but throughput is limited by its thread-per-kernel model and reflection-based serialization.
-- jtroop's error margins are consistently below 3%, indicating stable performance without GC interference.
-- The mixedTraffic benchmark measures batches of 10 messages per operation (8 position + 2 chat). Per-message throughput is consistent with the single-message benchmarks.
+- **jtroop fire-and-forget**: stages encoded bytes into a pre-allocated direct ByteBuffer. The EventLoop flushes on a 1ms poll cycle. 0 B/op for position updates.
+- **jtroop blocking**: same encode+stage path, then `selector.wakeup()` + spin-wait until the EventLoop flushes. The ~477 B/op comes from JDK NIO internals (`SocketChannel.write()` and `selector.wakeup()` internal allocations). Cannot be eliminated without `Unsafe` or `io_uring`.
+- **Netty fire-and-forget**: high error margins indicate GC-induced variance. Without `.sync()`, Netty's async path generates significant GC pressure.
+- **SpiderMonkey**: stable but throughput limited by thread-per-kernel model and reflection-based serialization.
+- **All benchmarks** use proper object encoding/decoding through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
+- The mixedTraffic benchmark measures batches of 10 messages per operation (8 position + 2 chat).
 
 ## Design Approach
 
@@ -209,6 +211,7 @@ jtroop/
 | stageWrite | 103 | 7,464 | Eliminate lambda + queue node via pre-allocated write slots |
 | No boxing | 38 | 8,265 | Direct ByteBuffer writes, no primitive boxing |
 | Generated codecs | 5 | 28,572 | Bytecode codecs via java.lang.classfile + 1ms select |
+| Direct ByteBuffers | 0 | 30,736 | Direct write buffers, spin-wait blocking, encodeToWire split |
 
 See [docs/performance-journey.md](docs/performance-journey.md) for details.
 

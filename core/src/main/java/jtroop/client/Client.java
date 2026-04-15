@@ -227,33 +227,16 @@ public final class Client implements AutoCloseable {
             return;
         }
 
-        // Find which TCP connection this message goes through
-        var connType = resolveConnection(message.getClass());
-        var config = configByType.get(connType);
-        if (config == null) config = udpConfigByType.get(connType); // fallback to UDP-only group
-        var channel = channels.get(connType);
-        if (channel == null) {
-            // Try UDP fallback for connection groups that only have UDP
-            sendUdp(message);
-            return;
-        }
-        if (config == null) {
-            throw new IllegalStateException("No connection for " + message.getClass().getName());
-        }
+        // Phase 1: encode — small inlinable method, EA eliminates the record
+        int encodedBytes = encodeToWire(message);
 
-        // Encode on caller thread, stage for async write (zero-alloc hot path)
-        encodeBuf.clear();
-        var wb = new WriteBuffer(encodeBuf);
-        codec.encode(message, wb);
-        encodeBuf.flip();
-
-        wireBuf.clear();
-        config.pipeline().encodeOutbound(encodeBuf, wireBuf);
-        wireBuf.flip();
-
-        var slot = channelSlots.get(connType);
-        if (slot != null) {
-            eventLoop.stageWrite(slot, wireBuf);
+        // Phase 2: stage for async write
+        if (encodedBytes > 0) {
+            var connType = resolveConnection(message.getClass());
+            var slot = channelSlots.get(connType);
+            if (slot != null) {
+                eventLoop.stageWrite(slot, wireBuf);
+            }
         }
     }
 
@@ -261,35 +244,42 @@ public final class Client implements AutoCloseable {
      * Blocking send — encodes, stages to EventLoop, blocks until EventLoop
      * has flushed bytes to the socket. Same path as send() but with completion wait.
      * Comparable to Netty's writeAndFlush().sync().
-     * Zero allocation — uses LockSupport.park/unpark for the wait.
+     *
+     * Split into encode (small, inlinable → EA eliminates record) and
+     * flush (complex, not inlined → but record is already dead).
      */
     @SuppressWarnings("unchecked")
     public void sendBlocking(Record message) {
-        var msgType = (Class<? extends Record>) message.getClass();
-        if (datagramMessageTypes.contains(msgType)) {
-            sendUdp(message);
-            return;
-        }
+        // Phase 1: encode — small method, C2 inlines → record is scalar-replaced
+        int encodedBytes = encodeToWire(message);
 
+        // Phase 2: stage + block — record is dead here, only wireBuf bytes matter
+        if (encodedBytes > 0) {
+            var connType = resolveConnection(message.getClass());
+            var slot = channelSlots.get(connType);
+            if (slot != null) {
+                eventLoop.stageWriteAndFlush(slot, wireBuf);
+            }
+        }
+    }
+
+    /**
+     * Encode a message into wireBuf. Returns number of encoded bytes.
+     * Small enough for C2 to inline → EA can scalar-replace the record.
+     */
+    private int encodeToWire(Record message) {
         var connType = resolveConnection(message.getClass());
         var config = configByType.get(connType);
-        if (config == null) {
-            throw new IllegalStateException("No connection for " + message.getClass().getName());
-        }
+        if (config == null) return 0;
 
         encodeBuf.clear();
-        var wb = new WriteBuffer(encodeBuf);
-        codec.encode(message, wb);
+        codec.encode(message, new WriteBuffer(encodeBuf));
         encodeBuf.flip();
 
         wireBuf.clear();
         config.pipeline().encodeOutbound(encodeBuf, wireBuf);
         wireBuf.flip();
-
-        var slot = channelSlots.get(connType);
-        if (slot != null) {
-            eventLoop.stageWriteAndFlush(slot, wireBuf);
-        }
+        return wireBuf.remaining();
     }
 
     private void sendUdp(Record message) {

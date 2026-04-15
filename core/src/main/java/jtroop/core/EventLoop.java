@@ -77,13 +77,11 @@ public final class EventLoop implements Runnable, AutoCloseable {
      * Zero allocation — uses LockSupport.park/unpark.
      */
     public void stageWriteAndFlush(int slot, ByteBuffer data) {
-        waitingThreads[slot] = Thread.currentThread();
         stageWrite(slot, data);
-        selector.wakeup(); // break select(1) immediately
+        selector.wakeup();
         while (pendingWrite[slot]) {
-            java.util.concurrent.locks.LockSupport.park();
+            Thread.onSpinWait();
         }
-        waitingThreads[slot] = null;
     }
 
     public void flush() {
