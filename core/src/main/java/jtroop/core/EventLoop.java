@@ -79,8 +79,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
     public void stageWriteAndFlush(int slot, ByteBuffer data) {
         waitingThreads[slot] = Thread.currentThread();
         stageWrite(slot, data);
-        selector.wakeup();
-        // Park until EventLoop flushes this slot
+        selector.wakeup(); // break select(1) immediately
         while (pendingWrite[slot]) {
             java.util.concurrent.locks.LockSupport.park();
         }
@@ -118,6 +117,13 @@ public final class EventLoop implements Runnable, AutoCloseable {
         while ((task = setupQueue.poll()) != null) {
             task.run();
         }
+    }
+
+    private boolean hasPendingWrites() {
+        for (int i = 0; i < activeSlots; i++) {
+            if (pendingWrite[i]) return true;
+        }
+        return false;
     }
 
     private void flushPendingWrites() throws IOException {
