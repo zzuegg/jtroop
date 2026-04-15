@@ -32,7 +32,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
         this.writeTargets = new SocketChannel[maxConnections];
         this.waitingThreads = new Thread[maxConnections];
         for (int i = 0; i < maxConnections; i++) {
-            writeBuffers[i] = ByteBuffer.allocate(8192);
+            writeBuffers[i] = ByteBuffer.allocateDirect(8192);
         }
     }
 
