@@ -2,33 +2,34 @@ plugins {
     java
 }
 
-repositories {
-    mavenCentral()
-}
-
-group = "net"
-version = "0.1.0-SNAPSHOT"
-
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(26)
+allprojects {
+    repositories {
+        mavenCentral()
     }
 }
 
-tasks.withType<JavaCompile> {
-    options.compilerArgs.addAll(listOf("--enable-preview"))
-}
+subprojects {
+    apply(plugin = "java")
 
-tasks.withType<Test> {
-    useJUnitPlatform()
-    jvmArgs("--enable-preview")
-}
+    group = "net"
+    version = "0.1.0-SNAPSHOT"
 
-tasks.withType<JavaExec> {
-    jvmArgs("--enable-preview")
-}
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(26)
+        }
+    }
 
-dependencies {
-    testImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    tasks.withType<JavaCompile> {
+        options.compilerArgs.addAll(listOf("--enable-preview"))
+    }
+
+    tasks.withType<Test> {
+        useJUnitPlatform()
+        jvmArgs("--enable-preview")
+    }
+
+    tasks.withType<JavaExec> {
+        jvmArgs("--enable-preview")
+    }
 }
