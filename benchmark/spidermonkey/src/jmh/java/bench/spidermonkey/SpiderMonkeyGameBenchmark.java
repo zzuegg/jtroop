@@ -6,13 +6,11 @@ import com.jme3.network.serializing.Serializable;
 import com.jme3.network.serializing.Serializer;
 import org.openjdk.jmh.annotations.*;
 
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * JMH benchmark: jMonkeyEngine SpiderMonkey game server processing
- * position updates + chat messages. Measures throughput and GC allocation rate.
+ * JMH benchmark: jMonkeyEngine SpiderMonkey game server.
+ * Fire-and-forget sends (no blocking) for fair comparison with Netty and jtroop.
  */
 @BenchmarkMode({Mode.Throughput, Mode.AverageTime})
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
@@ -45,25 +43,22 @@ public class SpiderMonkeyGameBenchmark {
 
     private Server server;
     private Client client;
-    private volatile CountDownLatch receiveLatch;
 
     @Setup(Level.Trial)
     public void setup() throws Exception {
         Serializer.registerClass(PositionUpdateMsg.class);
         Serializer.registerClass(ChatMsg.class);
 
-        int port = 44557; // fixed port for benchmark
+        int port = 44557;
         server = Network.createServer(port);
         server.addMessageListener((source, message) -> {
-            var latch = receiveLatch;
-            if (latch != null) latch.countDown();
+            // Process — just receive
         }, PositionUpdateMsg.class, ChatMsg.class);
         server.start();
 
         client = Network.connectToServer("localhost", port);
         client.start();
 
-        // Wait for connection
         Thread.sleep(500);
     }
 
@@ -74,22 +69,17 @@ public class SpiderMonkeyGameBenchmark {
     }
 
     @Benchmark
-    public void positionUpdate() throws Exception {
-        receiveLatch = new CountDownLatch(1);
+    public void positionUpdate() {
         client.send(new PositionUpdateMsg(1.0f, 2.0f, 3.0f, 0.5f));
-        receiveLatch.await(1, TimeUnit.SECONDS);
     }
 
     @Benchmark
-    public void chatMessage() throws Exception {
-        receiveLatch = new CountDownLatch(1);
+    public void chatMessage() {
         client.send(new ChatMsg(GameMessages.CHAT_TEXT, 1));
-        receiveLatch.await(1, TimeUnit.SECONDS);
     }
 
     @Benchmark
-    public void mixedTraffic() throws Exception {
-        receiveLatch = new CountDownLatch(10);
+    public void mixedTraffic() {
         for (int i = 0; i < 10; i++) {
             if (i < 8) {
                 client.send(new PositionUpdateMsg(i * 0.1f, i * 0.2f, i * 0.3f, i * 0.01f));
@@ -97,6 +87,5 @@ public class SpiderMonkeyGameBenchmark {
                 client.send(new ChatMsg(GameMessages.CHAT_TEXT, i));
             }
         }
-        receiveLatch.await(2, TimeUnit.SECONDS);
     }
 }

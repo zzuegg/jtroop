@@ -14,17 +14,17 @@ All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. J
 
 | Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|-----------|------------------|
-| positionUpdate | 28,572 ± 494 | 2,521 ± 12,579 | 141 ± 7 |
-| chatMessage | 19,955 ± 59 | 1,145 ± 6,750 | 144 ± 8 |
-| mixedTraffic (10 msg) | 2,533 ± 29 | 217 ± 1,232 | 54 ± 2 |
+| positionUpdate | 28,572 ± 494 | 2,521 ± 12,579 | 605 ± 56 |
+| chatMessage | 19,955 ± 59 | 1,145 ± 6,750 | 573 ± 18 |
+| mixedTraffic (10 msg) | 2,533 ± 29 | 217 ± 1,232 | 59 ± 4 |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|-----------|------------------|
-| positionUpdate | 5 ± 0 | 20,595 ± 175,663 | 576 ± 0 |
-| chatMessage | 111 ± 0 | 70,159 ± 601,257 | 1,024 ± 0 |
-| mixedTraffic (10 msg) | 521 ± 0 | 246,816 ± 2,105,978 | 6,101 ± 46 |
+| positionUpdate | 5 ± 0 | 20,595 ± 175,663 | 456 ± 29 |
+| chatMessage | 111 ± 0 | 70,159 ± 601,257 | 863 ± 6 |
+| mixedTraffic (10 msg) | 521 ± 0 | 246,816 ± 2,105,978 | 6,315 ± 42 |
 
 ### Notes
 
