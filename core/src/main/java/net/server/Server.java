@@ -49,14 +49,18 @@ public final class Server implements AutoCloseable {
     private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers;
     private final Set<ConnectionId> handshakePending = new HashSet<>();
 
+    private final java.util.concurrent.Executor executor;
+
     @SuppressWarnings("rawtypes")
     private Server(List<ListenerConfig> listeners, ServiceRegistry serviceRegistry,
                    CodecRegistry codec,
-                   Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers) {
+                   Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers,
+                   java.util.concurrent.Executor executor) {
         this.listeners = listeners;
         this.serviceRegistry = serviceRegistry;
         this.codec = codec;
         this.handshakeHandlers = handshakeHandlers;
+        this.executor = executor != null ? executor : Runnable::run;
         this.sessions = new SessionStore(4096);
         try {
             this.eventLoop = new EventLoop("server-loop");
@@ -336,6 +340,7 @@ public final class Server implements AutoCloseable {
         private final ServiceRegistry serviceRegistry = new ServiceRegistry(codec);
         @SuppressWarnings("rawtypes")
         private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers = new HashMap<>();
+        private java.util.concurrent.Executor executor;
 
         public Builder listen(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
             listeners.add(new ListenerConfig(connectionType, transport, new Pipeline(layers), layers));
@@ -360,8 +365,13 @@ public final class Server implements AutoCloseable {
             return this;
         }
 
+        public Builder executor(java.util.concurrent.Executor executor) {
+            this.executor = executor;
+            return this;
+        }
+
         public Server build() {
-            return new Server(List.copyOf(listeners), serviceRegistry, codec, Map.copyOf(handshakeHandlers));
+            return new Server(List.copyOf(listeners), serviceRegistry, codec, Map.copyOf(handshakeHandlers), executor);
         }
     }
 }

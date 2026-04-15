@@ -34,9 +34,11 @@ public final class Client implements AutoCloseable {
     private final ByteBuffer encodeBuf = ByteBuffer.allocate(65536);
     private final ByteBuffer wireBuf = ByteBuffer.allocate(65536);
     private final Map<Class<? extends Record>, SocketChannel> channels = new HashMap<>();
+    private final Map<Class<? extends Record>, Integer> channelSlots = new HashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> configByType = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> udpConfigByType = new HashMap<>();
+    private final java.util.concurrent.Executor executor;
     private final Set<Class<? extends Record>> datagramMessageTypes;
     private final Map<Integer, CompletableFuture<Record>> pendingRequests = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers;
@@ -45,17 +47,21 @@ public final class Client implements AutoCloseable {
     private final Set<Class<? extends Record>> handshakePending = ConcurrentHashMap.newKeySet();
     private int requestIdCounter = 0;
 
+    private int nextSlot = 0;
+
     private Client(List<ConnectionConfig> connections, CodecRegistry codec,
                    Map<Class<? extends Record>, Class<? extends Record>> serviceToConnection,
                    Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers,
                    Map<Class<? extends Record>, Record> handshakeInstances,
-                   Set<Class<? extends Record>> datagramMessageTypes) {
+                   Set<Class<? extends Record>> datagramMessageTypes,
+                   java.util.concurrent.Executor executor) {
         this.connections = connections;
         this.codec = codec;
         this.serviceToConnection = serviceToConnection;
         this.messageHandlers = messageHandlers;
         this.handshakeInstances = handshakeInstances;
         this.datagramMessageTypes = datagramMessageTypes;
+        this.executor = executor != null ? executor : Runnable::run; // default: same thread
         for (var conn : connections) {
             if (conn.transport().isUdp()) {
                 udpConfigByType.put(conn.connectionType(), conn);
@@ -87,6 +93,9 @@ public final class Client implements AutoCloseable {
         channel.connect(config.transport().address());
         channel.configureBlocking(false);
         channels.put(config.connectionType(), channel);
+        int slot = nextSlot++;
+        channelSlots.put(config.connectionType(), slot);
+        eventLoop.registerWriteTarget(slot, channel);
 
         // Send handshake if we have a handshake instance
         var hsInstance = handshakeInstances.get(config.connectionType());
@@ -232,24 +241,20 @@ public final class Client implements AutoCloseable {
             throw new IllegalStateException("No connection for " + message.getClass().getName());
         }
 
-        var tcpChannel = channel;
-        var pipelineRef = config.pipeline();
-        eventLoop.submit(() -> {
-            try {
-                encodeBuf.clear();
-                var wb = new WriteBuffer(encodeBuf);
-                codec.encode(message, wb);
-                encodeBuf.flip();
+        // Encode on caller thread, stage for async write (zero-alloc hot path)
+        encodeBuf.clear();
+        var wb = new WriteBuffer(encodeBuf);
+        codec.encode(message, wb);
+        encodeBuf.flip();
 
-                wireBuf.clear();
-                pipelineRef.encodeOutbound(encodeBuf, wireBuf);
-                wireBuf.flip();
+        wireBuf.clear();
+        config.pipeline().encodeOutbound(encodeBuf, wireBuf);
+        wireBuf.flip();
 
-                tcpChannel.write(wireBuf);
-            } catch (IOException e) {
-                throw new RuntimeException("Send failed", e);
-            }
-        });
+        var slot = channelSlots.get(connType);
+        if (slot != null) {
+            eventLoop.stageWrite(slot, wireBuf);
+        }
     }
 
     private void sendUdp(Record message) {
@@ -349,6 +354,7 @@ public final class Client implements AutoCloseable {
         private final Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers = new HashMap<>();
         private final Map<Class<? extends Record>, Record> handshakeInstances = new HashMap<>();
         private final Set<Class<? extends Record>> datagramMessageTypes = new HashSet<>();
+        private java.util.concurrent.Executor executor;
 
         public Builder connect(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
             connections.add(new ConnectionConfig(connectionType, transport, new Pipeline(layers), layers));
@@ -398,9 +404,15 @@ public final class Client implements AutoCloseable {
             return this;
         }
 
+        public Builder executor(java.util.concurrent.Executor executor) {
+            this.executor = executor;
+            return this;
+        }
+
         public Client build() {
             return new Client(List.copyOf(connections), codec, Map.copyOf(serviceToConnection),
-                    Map.copyOf(messageHandlers), Map.copyOf(handshakeInstances), Set.copyOf(datagramMessageTypes));
+                    Map.copyOf(messageHandlers), Map.copyOf(handshakeInstances), Set.copyOf(datagramMessageTypes),
+                    executor);
         }
     }
 }
