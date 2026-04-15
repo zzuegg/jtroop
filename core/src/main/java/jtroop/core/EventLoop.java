@@ -100,7 +100,6 @@ public final class EventLoop implements Runnable, AutoCloseable {
     public void run() {
         while (running) {
             try {
-                // Short timeout for fire-and-forget flush; wakeup() for blocking sends
                 selector.select(1);
                 processSetupTasks();
                 flushPendingWrites();
