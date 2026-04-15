@@ -14,17 +14,17 @@ All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. J
 
 | Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|-----------|------------------|
-| positionUpdate | 7,478 ± 99 | 2,310 ± 14,176 | 141 ± 7 |
-| chatMessage | 7,007 ± 218 | 1,142 ± 6,626 | 144 ± 8 |
-| mixedTraffic (10 msg) | 748 ± 22 | 222 ± 1,349 | 54 ± 2 |
+| positionUpdate | 28,572 ± 494 | 2,521 ± 12,579 | 141 ± 7 |
+| chatMessage | 19,955 ± 59 | 1,145 ± 6,750 | 144 ± 8 |
+| mixedTraffic (10 msg) | 2,533 ± 29 | 217 ± 1,232 | 54 ± 2 |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|-----------|------------------|
-| positionUpdate | 92 ± 1 | 22,696 ± 193,767 | 576 ± 0 |
-| chatMessage | 166 ± 2 | 211,400 ± 1,817,370 | 1,024 ± 0 |
-| mixedTraffic (10 msg) | 683 ± 1 | 1,019,013 ± 8,754,722 | 6,101 ± 46 |
+| positionUpdate | 5 ± 0 | 20,595 ± 175,663 | 576 ± 0 |
+| chatMessage | 111 ± 0 | 70,159 ± 601,257 | 1,024 ± 0 |
+| mixedTraffic (10 msg) | 521 ± 0 | 246,816 ± 2,105,978 | 6,101 ± 46 |
 
 ### Notes
 
@@ -208,6 +208,7 @@ jtroop/
 | Buffer reuse | 150 | 5,799 | Pre-allocate and reuse encode/wire buffers |
 | stageWrite | 103 | 7,464 | Eliminate lambda + queue node via pre-allocated write slots |
 | No boxing | 38 | 8,265 | Direct ByteBuffer writes, no primitive boxing |
+| Generated codecs | 5 | 28,572 | Bytecode codecs via java.lang.classfile + 1ms select |
 
 See [docs/performance-journey.md](docs/performance-journey.md) for details.
 
