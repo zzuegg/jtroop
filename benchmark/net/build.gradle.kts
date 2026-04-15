@@ -15,8 +15,8 @@ dependencies {
 jmh {
     jvmArgs.addAll(listOf("--enable-preview"))
     fork.set(1)
-    warmupIterations.set(2)
-    iterations.set(3)
+    warmupIterations.set(1)
+    iterations.set(2)
     benchmarkMode.set(listOf("thrpt"))
     includes.set(listOf("NetGameBenchmark"))
     profilers.addAll(listOf("gc"))
