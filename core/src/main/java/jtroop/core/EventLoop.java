@@ -3,8 +3,6 @@ package jtroop.core;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
@@ -14,15 +12,15 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private final Thread thread;
     private volatile boolean running;
 
-    // Cold path: channel registration, setup tasks (rare, allocation OK)
     private final Queue<Runnable> setupQueue = new ConcurrentLinkedQueue<>();
 
-    // Hot path: write commands (connection slot → pending write buffer)
+    // Hot path: per-slot write buffers with lightweight spin-lock
+    // Writer copies bytes in, sets dirty flag. EventLoop drains on each cycle.
     private final ByteBuffer[] writeBuffers;
     private final boolean[] pendingWrite;
     private final SocketChannel[] writeTargets;
     private final int maxConnections;
-    private volatile int activeSlots = 0; // highest registered slot + 1
+    private volatile int activeSlots = 0;
 
     public EventLoop(String name, int maxConnections) throws IOException {
         this.selector = Selector.open();
@@ -46,39 +44,33 @@ public final class EventLoop implements Runnable, AutoCloseable {
         thread.start();
     }
 
-    /**
-     * Cold path: submit a setup task (channel registration, etc.).
-     * Allocates — only use for rare operations.
-     */
     public void submit(Runnable task) {
         setupQueue.add(task);
         selector.wakeup();
     }
 
     /**
-     * Hot path: stage bytes for writing to a connection slot.
-     * Zero allocation — copies bytes into pre-allocated slot buffer,
-     * sets pending flag, wakes selector.
+     * Hot path: stage bytes for writing. Uses synchronized on the per-slot buffer
+     * (biased locking makes uncontended case ~6ns). EventLoop flushes on each cycle.
      */
     public void stageWrite(int slot, ByteBuffer data) {
         var buf = writeBuffers[slot];
         var channel = writeTargets[slot];
         synchronized (buf) {
-            // If buffer would overflow, flush first
             if (buf.remaining() < data.remaining() && channel != null) {
                 buf.flip();
-                try { channel.write(buf); } catch (java.io.IOException _) {}
+                try { channel.write(buf); } catch (IOException _) {}
                 buf.clear();
             }
             buf.put(data);
             pendingWrite[slot] = true;
         }
+    }
+
+    public void flush() {
         selector.wakeup();
     }
 
-    /**
-     * Register a connection slot for writing.
-     */
     public void registerWriteTarget(int slot, SocketChannel channel) {
         writeTargets[slot] = channel;
         if (slot >= activeSlots) activeSlots = slot + 1;
@@ -88,7 +80,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
     public void run() {
         while (running) {
             try {
-                selector.select(100);
+                selector.select(1); // 1ms for low latency
                 processSetupTasks();
                 flushPendingWrites();
                 processSelectedKeys();

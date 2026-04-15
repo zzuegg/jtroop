@@ -145,18 +145,21 @@ class ForwarderTest {
         client.start();
         Thread.sleep(300);
 
-        // Send 100 fire-and-forget messages
-        for (int i = 0; i < 100; i++) {
-            client.send(new FireMsg(i));
+        // Send messages in bursts with gaps so they span multiple TCP segments
+        for (int burst = 0; burst < 10; burst++) {
+            for (int i = 0; i < 10; i++) {
+                client.send(new FireMsg(burst * 10 + i));
+            }
+            client.flush();
+            Thread.sleep(20); // gap between bursts → separate TCP segments
         }
 
-        // Wait some time for messages to arrive
         Thread.sleep(1000);
 
-        // With 50% drop, expect roughly 25-75 to arrive
+        // With 50% drop rate per TCP read, expect some bursts dropped and some passed
         int receivedCount = handler.received.size();
-        assertTrue(receivedCount < 90, "Expected some drops, got " + receivedCount + "/100");
-        assertTrue(receivedCount > 10, "Expected some to arrive, got " + receivedCount + "/100");
+        assertTrue(receivedCount < 95, "Expected some drops, got " + receivedCount + "/100");
+        assertTrue(receivedCount > 5, "Expected some to arrive, got " + receivedCount + "/100");
 
         client.close();
         forwarder.close();

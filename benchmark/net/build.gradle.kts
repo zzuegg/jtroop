@@ -18,5 +18,5 @@ jmh {
     warmupIterations.set(3)
     iterations.set(5)
     benchmarkMode.set(listOf("thrpt", "avgt"))
-    profilers.addAll(listOf("gc", "stack"))
+    profilers.addAll(listOf("gc"))
 }

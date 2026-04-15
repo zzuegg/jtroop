@@ -327,6 +327,11 @@ public final class Client implements AutoCloseable {
                         }));
     }
 
+    /** Flush pending writes immediately. Call after send() for low-latency. */
+    public void flush() {
+        eventLoop.flush();
+    }
+
     public boolean isConnected(Class<? extends Record> connectionType) {
         var channel = channels.get(connectionType);
         return channel != null && channel.isConnected();
