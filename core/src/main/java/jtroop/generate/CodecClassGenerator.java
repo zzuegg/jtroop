@@ -31,14 +31,19 @@ public final class CodecClassGenerator {
 
     @SuppressWarnings("unchecked")
     public static GeneratedCodec generate(Class<? extends Record> recordType) {
-        // Only generate for types accessible from our package
-        if (recordType.isMemberClass() || recordType.isLocalClass() || recordType.isAnonymousClass()) {
-            throw new IllegalArgumentException("Cannot generate codec for inner/local class: " + recordType.getName());
+        MethodHandles.Lookup lookup;
+        String className;
+        try {
+            // Use privateLookupIn so the generated class can access the record type
+            lookup = MethodHandles.privateLookupIn(recordType, MethodHandles.lookup());
+            // Hidden class must be in the same package as the lookup class
+            var pkg = recordType.getPackageName().replace('.', '/');
+            className = pkg + "/Codec$" + recordType.getSimpleName();
+        } catch (IllegalAccessException e) {
+            throw new IllegalArgumentException("Cannot access record type: " + recordType.getName(), e);
         }
-        var lookup = MethodHandles.lookup();
         var components = recordType.getRecordComponents();
         var recordDesc = ClassDesc.of(recordType.getName());
-        var className = "jtroop/generate/Codec$" + recordType.getSimpleName();
 
         byte[] bytes = ClassFile.of().build(ClassDesc.of(className.replace('/', '.')), cb -> {
             cb.withFlags(ACC_PUBLIC | ACC_FINAL);
