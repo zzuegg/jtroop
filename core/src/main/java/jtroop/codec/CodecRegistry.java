@@ -19,7 +19,8 @@ public final class CodecRegistry {
             int typeId,
             MethodHandle constructor,
             List<ComponentCodec> components,
-            List<MethodHandle> accessors
+            List<MethodHandle> accessors,
+            jtroop.generate.CodecClassGenerator.GeneratedCodec generatedCodec
     ) {}
 
     private sealed interface ComponentCodec {
@@ -100,7 +101,14 @@ public final class CodecRegistry {
         var components = buildComponentCodecs(type);
         var constructor = buildConstructor(type);
         var accessors = buildAccessors(type);
-        var entry = new CodecEntry(type, id, constructor, components, accessors);
+        // Try to generate bytecode codec; fall back to reflection if it fails
+        jtroop.generate.CodecClassGenerator.GeneratedCodec generated = null;
+        try {
+            generated = jtroop.generate.CodecClassGenerator.generate(type);
+        } catch (Exception _) {
+            // Fall back to MethodHandle-based codec
+        }
+        var entry = new CodecEntry(type, id, constructor, components, accessors, generated);
         byClass.put(type, entry);
         byId.put(id, entry);
     }
@@ -131,11 +139,15 @@ public final class CodecRegistry {
         }
         var buf = wb.buffer();
         buf.putShort((short) entry.typeId());
-        for (int i = 0; i < entry.accessors().size(); i++) {
-            try {
-                entry.components().get(i).encodeDirect(entry.accessors().get(i), msg, buf);
-            } catch (Throwable e) {
-                throw new RuntimeException("Failed to encode component " + i, e);
+        if (entry.generatedCodec() != null) {
+            entry.generatedCodec().encode(msg, buf);
+        } else {
+            for (int i = 0; i < entry.accessors().size(); i++) {
+                try {
+                    entry.components().get(i).encodeDirect(entry.accessors().get(i), msg, buf);
+                } catch (Throwable e) {
+                    throw new RuntimeException("Failed to encode component " + i, e);
+                }
             }
         }
     }
@@ -144,6 +156,9 @@ public final class CodecRegistry {
         int typeId = rb.readShort() & 0xFFFF;
         var entry = byId.get(typeId);
         if (entry == null) throw new IllegalArgumentException("Unknown type id: " + typeId);
+        if (entry.generatedCodec() != null) {
+            return entry.generatedCodec().decode(rb.buffer());
+        }
         var args = new Object[entry.components().size()];
         for (int i = 0; i < args.length; i++) {
             args[i] = entry.components().get(i).decode(rb);
