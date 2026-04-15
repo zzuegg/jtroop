@@ -30,6 +30,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
         this.writeBuffers = new ByteBuffer[maxConnections];
         this.pendingWrite = new boolean[maxConnections];
         this.writeTargets = new SocketChannel[maxConnections];
+        this.waitingThreads = new Thread[maxConnections];
         for (int i = 0; i < maxConnections; i++) {
             writeBuffers[i] = ByteBuffer.allocate(8192);
         }
@@ -65,6 +66,25 @@ public final class EventLoop implements Runnable, AutoCloseable {
             buf.put(data);
             pendingWrite[slot] = true;
         }
+    }
+
+    // Per-slot thread to unpark after flush (for blocking send)
+    private final Thread[] waitingThreads;
+
+    /**
+     * Stage bytes and block until the EventLoop has flushed them to the socket.
+     * Goes through the full EventLoop path: stage → wake selector → EventLoop flushes → unpark caller.
+     * Zero allocation — uses LockSupport.park/unpark.
+     */
+    public void stageWriteAndFlush(int slot, ByteBuffer data) {
+        waitingThreads[slot] = Thread.currentThread();
+        stageWrite(slot, data);
+        selector.wakeup();
+        // Park until EventLoop flushes this slot
+        while (pendingWrite[slot]) {
+            java.util.concurrent.locks.LockSupport.park();
+        }
+        waitingThreads[slot] = null;
     }
 
     public void flush() {
@@ -112,6 +132,11 @@ public final class EventLoop implements Runnable, AutoCloseable {
                         buf.compact();
                         pendingWrite[i] = false;
                     }
+                }
+                // Unpark any thread waiting for this slot's flush
+                var waiter = waitingThreads[i];
+                if (waiter != null) {
+                    java.util.concurrent.locks.LockSupport.unpark(waiter);
                 }
             }
         }

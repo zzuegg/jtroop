@@ -258,8 +258,10 @@ public final class Client implements AutoCloseable {
     }
 
     /**
-     * Blocking send — encodes and writes directly to the socket, returns when
-     * bytes are handed to the kernel. Comparable to Netty's writeAndFlush().sync().
+     * Blocking send — encodes, stages to EventLoop, blocks until EventLoop
+     * has flushed bytes to the socket. Same path as send() but with completion wait.
+     * Comparable to Netty's writeAndFlush().sync().
+     * Zero allocation — uses LockSupport.park/unpark for the wait.
      */
     @SuppressWarnings("unchecked")
     public void sendBlocking(Record message) {
@@ -271,8 +273,7 @@ public final class Client implements AutoCloseable {
 
         var connType = resolveConnection(message.getClass());
         var config = configByType.get(connType);
-        var channel = channels.get(connType);
-        if (channel == null || config == null) {
+        if (config == null) {
             throw new IllegalStateException("No connection for " + message.getClass().getName());
         }
 
@@ -285,12 +286,9 @@ public final class Client implements AutoCloseable {
         config.pipeline().encodeOutbound(encodeBuf, wireBuf);
         wireBuf.flip();
 
-        try {
-            while (wireBuf.hasRemaining()) {
-                channel.write(wireBuf);
-            }
-        } catch (IOException e) {
-            throw new RuntimeException("Send failed", e);
+        var slot = channelSlots.get(connType);
+        if (slot != null) {
+            eventLoop.stageWriteAndFlush(slot, wireBuf);
         }
     }
 
