@@ -13,4 +13,6 @@ public final class Layers {
     public static SequencingLayer sequencing() { return new SequencingLayer(); }
     public static DuplicateFilterLayer duplicateFilter() { return new DuplicateFilterLayer(1024); }
     public static DuplicateFilterLayer duplicateFilter(int capacity) { return new DuplicateFilterLayer(capacity); }
+    public static AckLayer ack() { return new AckLayer(); }
+    public static AckLayer ack(long retransmitTimeoutMs) { return new AckLayer(retransmitTimeoutMs); }
 }
