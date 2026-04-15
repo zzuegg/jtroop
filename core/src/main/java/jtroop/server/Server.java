@@ -327,6 +327,14 @@ public final class Server implements AutoCloseable {
         return p;
     }
 
+    public void switchPipeline(ConnectionId connId, Pipeline newPipeline) {
+        var oldConfig = connectionConfig.get(connId);
+        if (oldConfig != null) {
+            connectionConfig.put(connId, new ListenerConfig(
+                    oldConfig.connectionType(), oldConfig.transport(), newPipeline, null));
+        }
+    }
+
     public int port(Class<? extends Record> connectionType) {
         var p = boundPorts.get(connectionType);
         if (p == null) throw new IllegalArgumentException("No listener for " + connectionType.getName());
