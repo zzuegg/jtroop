@@ -93,7 +93,7 @@ public class NettyGameBenchmark {
         buf.writeFloat(2.0f); // y
         buf.writeFloat(3.0f); // z
         buf.writeFloat(0.5f); // yaw
-        clientChannel.writeAndFlush(buf).sync();
+        clientChannel.writeAndFlush(buf);
     }
 
     @Benchmark
@@ -105,7 +105,7 @@ public class NettyGameBenchmark {
         buf.writeInt(textBytes.length);
         buf.writeBytes(textBytes);
         buf.writeInt(1); // room
-        clientChannel.writeAndFlush(buf).sync();
+        clientChannel.writeAndFlush(buf);
     }
 
     @Benchmark

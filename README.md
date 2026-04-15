@@ -2,55 +2,47 @@
 
 **J**ava **T**yped **R**ecord-**O**riented **O**ptimized **P**rotocol
 
-A high-performance, zero-dependency networking module for JDK 26+ that achieves near-zero allocation on hot paths through Escape Analysis-friendly design. 50x faster throughput and 22x less GC pressure than Netty.
+A zero-dependency networking module for JDK 26+ that minimizes hot-path allocation through EA-friendly design.
 
 ## Benchmark Results
 
-Game scenario: TCP server + client, length-prefix framing. Position updates (16B payload), chat messages (~70B payload), mixed traffic (80% position + 20% chat).
+Game scenario: TCP server + client, length-prefix framing, fire-and-forget sends. Position updates (16B payload), chat messages (~70B payload), mixed traffic (80% position + 20% chat, 10 messages per batch).
 
-JDK 26, JMH with `-prof gc`, single fork, 5 measurement iterations.
+All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. JDK 26, JMH with `-prof gc`, single fork, 5 measurement iterations.
 
 ### Throughput (ops/ms) — higher is better
 
-| Benchmark | jtroop | Netty | SpiderMonkey |
-|-----------|--------|-------|--------------|
-| positionUpdate | **7,701** | 174 | 141 |
-| chatMessage | **7,730** | 179 | 144 |
-| mixedTraffic | **710** | 226 | 54 |
+| Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
+|-----------|--------|-----------|------------------|
+| positionUpdate | 7,478 ± 99 | 2,310 ± 14,176 | 141 ± 7 |
+| chatMessage | 7,007 ± 218 | 1,142 ± 6,626 | 144 ± 8 |
+| mixedTraffic (10 msg) | 748 ± 22 | 222 ± 1,349 | 54 ± 2 |
 
 ### Allocation (B/op) — lower is better
 
-| Benchmark | jtroop | Netty | SpiderMonkey |
-|-----------|--------|-------|--------------|
-| positionUpdate | **54** | 863 | 576 |
-| chatMessage | **126** | 976 | 1,024 |
-| mixedTraffic | **529** | 983,339 | 6,101 |
+| Benchmark | jtroop | Netty 4.2 | SpiderMonkey 3.7 |
+|-----------|--------|-----------|------------------|
+| positionUpdate | 92 ± 1 | 22,696 ± 193,767 | 576 ± 0 |
+| chatMessage | 166 ± 2 | 211,400 ± 1,817,370 | 1,024 ± 0 |
+| mixedTraffic (10 msg) | 683 ± 1 | 1,019,013 ± 8,754,722 | 6,101 ± 46 |
 
-### Summary
+### Notes
 
-| vs Netty | Allocation | Throughput |
-|----------|-----------|------------|
-| positionUpdate | **16x less** | **44x faster** |
-| chatMessage | **7.8x less** | **43x faster** |
-| mixedTraffic | **1,858x less** | **3.1x faster** |
+- Netty's high error margins indicate GC-induced variance. Without blocking `.sync()` per write, Netty's fire-and-forget path generates significant GC pressure, causing some iterations to stall during collection while others run unimpeded.
+- SpiderMonkey results are stable but throughput is limited by its thread-per-kernel model and reflection-based serialization.
+- jtroop's error margins are consistently below 3%, indicating stable performance without GC interference.
+- The mixedTraffic benchmark measures batches of 10 messages per operation (8 position + 2 chat). Per-message throughput is consistent with the single-message benchmarks.
 
-| vs SpiderMonkey | Allocation | Throughput |
-|-----------------|-----------|------------|
-| positionUpdate | **10.7x less** | **54.6x faster** |
-| chatMessage | **8.1x less** | **53.7x faster** |
-| mixedTraffic | **11.5x less** | **13.2x faster** |
+## Design Approach
 
-## Why It's Fast
+jtroop minimizes allocation on the hot path through these techniques:
 
-jtroop is designed *for* the JIT, not around it. Every hot-path design decision is informed by C2's Escape Analysis capabilities:
-
-- **Pre-allocated buffer reuse** — encode and wire buffers are allocated once and reused across all messages. No per-message ByteBuffer allocation.
-- **stageWrite** — encoded bytes are copied into pre-allocated per-slot buffers. No lambda, no Runnable, no queue node allocation per send.
-- **Direct ByteBuffer encoding** — codec reads record fields via MethodHandle and writes directly to ByteBuffer with primitive casts. No boxing (no `float -> Float -> Object` roundtrip).
-- **Fused pipeline** — layers compose at build time into a single call chain with pre-allocated temp buffers. No per-layer allocation.
-- **SoA session storage** — connection state in parallel primitive arrays (`long[]`, `int[]`). No per-connection objects.
-
-The remaining ~38 B/op for position updates is the `PositionUpdate` record object created by the benchmark caller — not framework allocation.
+- **Pre-allocated buffer reuse** — encode and wire buffers are allocated once per connection and reused across messages.
+- **stageWrite** — encoded bytes are copied into pre-allocated per-slot write buffers in the EventLoop. No lambda, Runnable, or queue node allocation per send.
+- **Direct ByteBuffer encoding** — codec reads record fields via MethodHandle and writes directly to ByteBuffer with primitive casts, avoiding boxing.
+- **Bytecode-generated codecs** — for public record types, `java.lang.classfile` generates hidden classes with direct field access.
+- **Fused pipeline generation** — `java.lang.classfile` generates a hidden class per unique layer stack, calling each layer via `invokevirtual` on the concrete type.
+- **SoA session storage** — connection state in parallel primitive arrays. `ConnectionId` is a packed long (index + generation).
 
 ## Quick Start
 
@@ -64,6 +56,7 @@ var server = Server.builder()
         Layers.encryption(key), Layers.sequencing())
     .addService(ChatHandler.class, GameConn.class)
     .addService(MovementHandler.class, GameConn.class)
+    .eventLoops(4)
     .build();
 server.start();
 ```
@@ -88,7 +81,7 @@ chat.send(new ChatMessage("hello", 1));
 // Request/response
 ChatHistory h = chat.getHistory(new HistoryRequest(1));
 
-// @Datagram → UDP
+// @Datagram routes to UDP
 MovementService move = client.service(MovementService.class);
 move.position(new PositionUpdate(x, y, z, yaw));
 ```
@@ -97,9 +90,9 @@ move.position(new PositionUpdate(x, y, z, yaw));
 
 ```java
 interface ChatService {
-    void send(ChatMessage msg);                    // fire-and-forget → TCP
-    ChatHistory getHistory(HistoryRequest req);    // request/response → TCP
-    @Datagram void typing(TypingIndicator t);      // best-effort → UDP
+    void send(ChatMessage msg);                    // fire-and-forget, TCP
+    ChatHistory getHistory(HistoryRequest req);    // request/response, TCP
+    @Datagram void typing(TypingIndicator t);      // fire-and-forget, UDP
 }
 ```
 
@@ -131,7 +124,6 @@ record GameConn(int version, int capabilityMask) {
     record Accepted(int negotiatedVersion, int activeMask) {}
 }
 
-// Server validates on connect
 Server.builder()
     .onHandshake(GameConn.class, req -> {
         int common = req.capabilityMask() & SUPPORTED;
@@ -140,7 +132,6 @@ Server.builder()
             : null;  // reject
     })
 
-// Client sends capabilities
 Client.builder()
     .connect(new GameConn(2, GameConn.CHAT | GameConn.MOVE),
         Transport.tcp("game.example.com", 8080), Layers.framing())
@@ -174,63 +165,51 @@ forwarder.start();
 |---------|--------|
 | TCP + UDP transport | Done |
 | Composable layer pipeline (framing, encryption, compression) | Done |
-| UDP reliability layers (sequencing, duplicate filter) | Done |
+| UDP reliability layers (sequencing, duplicate filter, ack/retransmit) | Done |
 | Service contracts (shared interfaces) | Done |
 | Annotation-driven handlers (@OnMessage, @OnConnect, @OnDisconnect) | Done |
 | @Datagram routing (TCP default, UDP opt-in) | Done |
 | Typed connection groups (multiple servers, mixed transports) | Done |
 | Handshake / capability negotiation | Done |
 | Request/response + fire-and-forget + server push | Done |
-| Typed service proxies (client.service(ChatService.class)) | Done |
+| Typed service proxies (client.service(Interface.class)) | Done |
 | Broadcast / Unicast injectables | Done |
 | Configurable executor (virtual thread support) | Done |
 | Test forwarder (latency, packet loss, reorder) — TCP + UDP | Done |
-| JMH benchmark suite (vs Netty, vs SpiderMonkey) | Done |
-| MPSC ring buffer (lock-free, zero-alloc) | Done |
-| Bytecode-generated codecs (java.lang.classfile) | Done |
-| Fused pipeline generation (hidden classes) | Done |
 | EventLoopGroup (round-robin connection distribution) | Done |
 | Protocol upgrade (server.switchPipeline()) | Done |
-| Layers.ack() — reliable UDP with retransmit | Done |
+| Bytecode-generated codecs (java.lang.classfile + hidden classes) | Done |
+| Fused pipeline generation (hidden classes) | Done |
+| MPSC ring buffer (lock-free, zero-alloc) | Done |
+| JMH benchmark suite (vs Netty 4.2, vs SpiderMonkey 3.7) | Done |
 
 ## Architecture
 
 ```
 jtroop/
-├── core/           EventLoop, ReadBuffer, WriteBuffer, MpscRingBuffer, Handshake
+├── core/           EventLoop, EventLoopGroup, ReadBuffer, WriteBuffer, MpscRingBuffer
 ├── transport/      Transport (sealed: TCP, UDP), TcpTransport, UdpTransport
 ├── pipeline/       Layer, Pipeline, Layers factory
-│   └── layers/     Framing, Compression, Encryption, Sequencing, DuplicateFilter
-├── codec/          CodecRegistry (record ↔ ByteBuffer, deterministic type IDs)
+│   └── layers/     Framing, Compression, Encryption, Sequencing, DuplicateFilter, Ack
+├── codec/          CodecRegistry (record <-> ByteBuffer, deterministic type IDs)
 ├── service/        @OnMessage, @Handles, @Datagram, ServiceRegistry, Broadcast, Unicast
 ├── session/        ConnectionId (packed long), SessionStore (SoA arrays)
 ├── server/         Server, Server.Builder
 ├── client/         Client, Client.Builder, service proxy generation
+├── generate/       CodecClassGenerator, FusedPipelineGenerator (java.lang.classfile)
 └── testing/        Forwarder (TCP + UDP proxy with impairment profiles)
 ```
 
-## Performance Journey
+## Optimization History
 
-From naive implementation to 50x faster than Netty in four optimization passes:
-
-| Pass | positionUpdate B/op | positionUpdate ops/ms | What changed |
-|------|--------------------|-----------------------|--------------|
-| Naive | 197,768 | 150 | Baseline — allocates 192KB of ByteBuffers per message |
+| Pass | positionUpdate B/op | positionUpdate ops/ms | Change |
+|------|--------------------|-----------------------|--------|
+| Naive | 197,768 | 150 | Baseline |
 | Buffer reuse | 150 | 5,799 | Pre-allocate and reuse encode/wire buffers |
 | stageWrite | 103 | 7,464 | Eliminate lambda + queue node via pre-allocated write slots |
-| No boxing | **38** | **8,265** | Direct ByteBuffer writes via MethodHandle, no primitive boxing |
+| No boxing | 38 | 8,265 | Direct ByteBuffer writes, no primitive boxing |
 
-See [docs/performance-journey.md](docs/performance-journey.md) for the full story.
-
-## Why Netty Can't Do This
-
-1. **Interface pipeline blocks EA** — `invokeinterface` is megamorphic, JIT can't inline
-2. **Must pool buffers** — objects escape through handler boundaries, EA can't help
-3. **Object-per-message** — decoded messages, contexts, promises are heap objects by design
-4. **Targets Java 8+** — can't use modern EA improvements or classfile API
-5. **Runtime-mutable pipeline** — prevents build-time fusion
-
-jtroop designs *for* the JIT. Netty designs *around* it.
+See [docs/performance-journey.md](docs/performance-journey.md) for details.
 
 ## Requirements
 
@@ -238,28 +217,13 @@ jtroop designs *for* the JIT. Netty designs *around* it.
 - Zero external dependencies (java.base only)
 - Gradle 9+ with Kotlin DSL
 
-## Roadmap
-
-- [x] Bytecode-generated codecs via `java.lang.classfile` + hidden classes
-- [x] Fused pipeline generation (hidden class per layer stack)
-- [x] EventLoopGroup with round-robin connection distribution
-- [x] Protocol upgrade support (`server.switchPipeline()`)
-- [x] `Layers.ack()` — reliable UDP with retransmit
-
 ## Running Benchmarks
 
 ```bash
-# jtroop
-gradle :benchmark:net:jmh
-
-# Netty
-gradle :benchmark:netty:jmh
-
-# SpiderMonkey
-gradle :benchmark:spidermonkey:jmh
-
-# All tests
-gradle :core:test
+gradle :benchmark:net:jmh          # jtroop
+gradle :benchmark:netty:jmh        # Netty 4.2
+gradle :benchmark:spidermonkey:jmh # SpiderMonkey 3.7
+gradle :core:test                  # all tests
 ```
 
 ## License
