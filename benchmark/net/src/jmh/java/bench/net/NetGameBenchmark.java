@@ -1,15 +1,15 @@
 package bench.net;
 
 import bench.GameMessages;
-import net.client.Client;
-import net.codec.CodecRegistry;
-import net.core.ReadBuffer;
-import net.core.WriteBuffer;
-import net.pipeline.layers.FramingLayer;
-import net.server.Server;
-import net.service.*;
-import net.session.ConnectionId;
-import net.transport.Transport;
+import jtroop.client.Client;
+import jtroop.codec.CodecRegistry;
+import jtroop.core.ReadBuffer;
+import jtroop.core.WriteBuffer;
+import jtroop.pipeline.layers.FramingLayer;
+import jtroop.server.Server;
+import jtroop.service.*;
+import jtroop.session.ConnectionId;
+import jtroop.transport.Transport;
 import org.openjdk.jmh.annotations.*;
 
 import java.nio.ByteBuffer;

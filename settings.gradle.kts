@@ -1,4 +1,4 @@
-rootProject.name = "net"
+rootProject.name = "jtroop"
 
 include("core")
 include("benchmark:common")

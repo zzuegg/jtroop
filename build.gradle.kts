@@ -11,7 +11,7 @@ allprojects {
 subprojects {
     apply(plugin = "java")
 
-    group = "net"
+    group = "jtroop"
     version = "0.1.0-SNAPSHOT"
 
     java {
