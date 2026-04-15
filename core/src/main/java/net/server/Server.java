@@ -273,19 +273,18 @@ public final class Server implements AutoCloseable {
 
     private void processInbound(ByteBuffer wire, ConnectionId sender, ListenerConfig config,
                                 SocketChannel channel) {
-        // Decode through pipeline
         var frame = config.pipeline().decodeInbound(wire);
         while (frame != null) {
             var rb = new ReadBuffer(frame);
             var message = codec.decode(rb);
 
-            // Dispatch to handler
-            var result = serviceRegistry.dispatch(message, sender);
-
-            // If there's a response, send it back
-            if (result instanceof Record response) {
-                sendResponse(response, config, channel);
-            }
+            // Dispatch to handler via executor (supports virtual threads)
+            executor.execute(() -> {
+                var result = serviceRegistry.dispatch(message, sender);
+                if (result instanceof Record response) {
+                    sendResponse(response, config, channel);
+                }
+            });
 
             frame = config.pipeline().decodeInbound(wire);
         }
