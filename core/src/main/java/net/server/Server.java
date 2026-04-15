@@ -37,6 +37,8 @@ public final class Server implements AutoCloseable {
     private final CodecRegistry codec;
     private final SessionStore sessions;
     private final EventLoop eventLoop;
+    private final ByteBuffer serverEncodeBuf = ByteBuffer.allocate(65536);
+    private final ByteBuffer serverWireBuf = ByteBuffer.allocate(65536);
     private final Map<Class<? extends Record>, Integer> boundPorts = new HashMap<>();
     private final Map<Class<? extends Record>, Integer> boundUdpPorts = new HashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new HashMap<>();
@@ -286,17 +288,17 @@ public final class Server implements AutoCloseable {
     }
 
     private void sendResponse(Record response, ListenerConfig config, SocketChannel channel) {
-        var buf = ByteBuffer.allocate(65536);
-        var wb = new WriteBuffer(buf);
+        serverEncodeBuf.clear();
+        var wb = new WriteBuffer(serverEncodeBuf);
         codec.encode(response, wb);
-        buf.flip();
+        serverEncodeBuf.flip();
 
-        var wire = ByteBuffer.allocate(65536);
-        config.pipeline().encodeOutbound(buf, wire);
-        wire.flip();
+        serverWireBuf.clear();
+        config.pipeline().encodeOutbound(serverEncodeBuf, serverWireBuf);
+        serverWireBuf.flip();
 
         try {
-            channel.write(wire);
+            channel.write(serverWireBuf);
         } catch (IOException e) {
             // Connection lost
         }

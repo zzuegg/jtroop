@@ -31,6 +31,8 @@ public final class Client implements AutoCloseable {
     private final CodecRegistry codec;
     private final Map<Class<? extends Record>, Class<? extends Record>> serviceToConnection;
     private final EventLoop eventLoop;
+    private final ByteBuffer encodeBuf = ByteBuffer.allocate(65536);
+    private final ByteBuffer wireBuf = ByteBuffer.allocate(65536);
     private final Map<Class<? extends Record>, SocketChannel> channels = new HashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> configByType = new HashMap<>();
@@ -230,19 +232,20 @@ public final class Client implements AutoCloseable {
             throw new IllegalStateException("No connection for " + message.getClass().getName());
         }
 
-        var buf = ByteBuffer.allocate(65536);
-        var wb = new WriteBuffer(buf);
-        codec.encode(message, wb);
-        buf.flip();
-
-        var wire = ByteBuffer.allocate(65536);
-        config.pipeline().encodeOutbound(buf, wire);
-        wire.flip();
-
         var tcpChannel = channel;
+        var pipelineRef = config.pipeline();
         eventLoop.submit(() -> {
             try {
-                tcpChannel.write(wire);
+                encodeBuf.clear();
+                var wb = new WriteBuffer(encodeBuf);
+                codec.encode(message, wb);
+                encodeBuf.flip();
+
+                wireBuf.clear();
+                pipelineRef.encodeOutbound(encodeBuf, wireBuf);
+                wireBuf.flip();
+
+                tcpChannel.write(wireBuf);
             } catch (IOException e) {
                 throw new RuntimeException("Send failed", e);
             }
@@ -256,14 +259,14 @@ public final class Client implements AutoCloseable {
             throw new IllegalStateException("No UDP connection for " + message.getClass().getName());
         }
 
-        // UDP: encode message directly (no framing needed)
-        var buf = ByteBuffer.allocate(65536);
-        var wb = new WriteBuffer(buf);
+        // UDP: encode message directly (no framing needed), reuse buffer
+        encodeBuf.clear();
+        var wb = new WriteBuffer(encodeBuf);
         codec.encode(message, wb);
-        buf.flip();
+        encodeBuf.flip();
 
         try {
-            udpChannel.write(buf);
+            udpChannel.write(encodeBuf);
         } catch (IOException e) {
             // UDP send failure — best effort
         }
