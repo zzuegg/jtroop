@@ -98,139 +98,73 @@ Verify with:
 - `MethodHandles.Lookup.defineClass()` for monomorphic dispatch
 - No `Unsafe`, no Valhalla required for zero-allocation
 
-## Public API style (from japes)
+## API design principles
 
-### Builder pattern for construction
+### Annotation-driven, auto-wired
+Users declare intent via annotations. The framework discovers, resolves, and wires everything at runtime. No manual registration of handlers, no boilerplate. The user writes a plain class with annotated methods — the framework does the rest.
 
 ```java
-// Fluent builder → immutable runtime object
-var world = World.builder()
-    .addSystem(Physics.class)
-    .addPlugin(H2PersistencePlugin.autoSync("jdbc:h2:./data"))
-    .addResource(new Config(60))
-    .chunkSize(1024)
+class MyHandler {
+    @OnMessage
+    void handle(@Read Header h, @Write Mut<Body> body, Res<Config> cfg) { ... }
+}
+// Framework: discovers method, resolves parameter types, generates dispatch
+```
+
+### Records as data, annotations as metadata
+- All user data types are `record` — immutable, decomposable, EA-friendly
+- Annotations on types for classification (`@Persistent`, `@Compressed`, `@Encrypted`)
+- Annotations on parameters for access mode (`@Read`, `@Write`)
+- Annotations on methods for dispatch (`@OnMessage`, `@OnConnect`, `@OnDisconnect`)
+- Read once at startup, zero per-message cost
+
+### Builder for construction, fluent chaining
+```java
+var server = Server.builder()
+    .addHandler(MyHandler.class)
+    .addPlugin(compressionPlugin)
+    .port(8080)
     .build();
 ```
+- `builder()` → mutable config → `build()` → immutable runtime
+- `addPlugin(Plugin)` bundles handlers + resources + config (`@FunctionalInterface void install(Builder)`)
 
-- `builder()` static factory, returns mutable builder
-- Builder methods return `this` for chaining
-- `build()` validates and constructs the immutable object
-- Plugins bundle systems + resources: `addPlugin(Plugin)` where `Plugin` is `@FunctionalInterface void install(Builder)`
-
-### Entity as value type
-
+### Identifiers as packed value types
 ```java
-// Entity is a record (value type) — no identity, no null-check issues
-public record Entity(long id) {
-    public int index()      { return (int)(id >>> 32); }
-    public int generation() { return (int) id; }
-    public static Entity of(int index, int generation) { ... }
-}
-
-var e = world.spawn(new Position(0, 0), new Velocity(1, 1));
-world.setComponent(e, new Position(5, 5));
-world.despawn(e);
+record ConnectionId(long id) { ... }  // packed index + generation
 ```
+- No object identity, no null issues — just a long
+- Generation counter detects use-after-disconnect (stale handle)
 
-- Entity is a packed long, not an object with identity
-- Generation prevents use-after-free (stale handles detected)
-- All mutation methods take Entity as first arg
-
-### Components are records, mutations take records
-
+### Consumer-based iteration for zero allocation
 ```java
-// Components: immutable records, no setters
-record Position(float x, float y, float z) {}
-record Health(int hp) {}
+// Allocates: returns List
+var list = accessor.activeConnections();
 
-// Mutation: create new record, framework decomposes into SoA
-world.setComponent(entity, new Position(x + dx, y + dy, z + dz));
-
-// Read: framework reconstructs record from SoA (EA eliminates it if fields extracted)
-var pos = world.getComponent(entity, Position.class);
-float x = pos.x();  // scalar-replaced — 0 B/op
+// Zero-alloc: callback
+accessor.forEachActiveConnection(conn -> { ... });
 ```
+- Always provide `forEachX(Consumer)` alongside list-returning convenience
+- Hot paths use consumer form; cold paths can use list form
 
-### Annotations for metadata, not behavior
-
-```java
-@Persistent          // included in save/load
-@NetworkSync         // included in network sync
-@ValueTracked        // equality check before marking changed
-@SparseStorage       // (future) sparse set storage hint
-```
-
-- Annotations are `@Retention(RUNTIME)`, `@Target(TYPE)`
-- Framework reads them once at registration, zero per-tick cost
-- No annotation processing, no code generation at compile time — all runtime
-
-### Systems are plain methods with annotated parameters
-
-```java
-class Physics {
-    @System
-    void integrate(@Read Velocity v, @Write Mut<Position> p) {
-        var cur = p.get();
-        p.set(new Position(cur.x() + v.dx(), cur.y() + v.dy(), cur.z() + v.dz()));
-    }
-}
-```
-
-- `@Read` = read-only access, `@Write` = mutable via `Mut<T>` wrapper
-- `Res<T>` / `ResMut<T>` for singleton resources
-- `Commands` for deferred mutations (spawn/despawn/add/remove)
-- `Entity` parameter for the current entity's ID
-- Framework generates bytecode per system → monomorphic dispatch → EA works
-
-### Deferred commands flush at stage boundaries
-
-```java
-@System void spawner(Commands cmds) {
-    cmds.spawn(new Position(0, 0), new Health(100));
-    cmds.despawn(entity);
-    cmds.set(entity, new Health(50));
-}
-// Commands applied after all systems in the stage finish
-```
-
-- Commands stored in flat buffer (int[] ops, long[] ids, Object[] refs)
-- Zero per-command allocation after warmup
-- `cmds.applyTo(world)` for manual flush outside tick
-
-### Read-only accessor for non-system code
-
-```java
-var accessor = world.accessor();
-accessor.forEachPersistentEntity(entity -> { ... });
-accessor.forEachPersistentEntityComponent((entity, comp) -> { ... });
-var pos = accessor.getComponent(entity, Position.class);
-```
-
-- `WorldAccessor` is off the hot tick path — no EA impact
-- Consumer-based iteration avoids intermediate list allocation
-- List-returning convenience overloads for simple cases
+### Deferred operations via command buffer
+Mutations that can't happen during iteration are buffered and flushed at safe points. Buffer uses flat parallel arrays (not object-per-command), reused across cycles.
 
 ### Naming conventions
 
-| Pattern | Example | When |
-|---|---|---|
-| `getX` | `getComponent`, `getResource` | read that may fail |
-| `hasX` | `hasComponent` | boolean check |
-| `setX` | `setComponent`, `setResource` | overwrite existing |
-| `addX` | `addSystem`, `addPlugin`, `addComponent` | append/register |
-| `removeX` | `removeComponent` | delete |
-| `spawn` / `despawn` | `spawn(Record...)`, `despawn(Entity)` | entity lifecycle |
-| `forEachX` | `forEachPersistentEntity` | zero-alloc callback iteration |
-| `xBuilder` | `spawnBuilder`, `bulkSpawnWithIdBuilder` | pre-resolved bulk path |
-| `clear` | `world.clear()` | reset to empty state |
-| `close` | `world.close()` | release resources (executor) |
+| Pattern | When |
+|---|---|
+| `get/set/has/add/remove` | CRUD on typed data |
+| `forEachX(Consumer)` | zero-alloc iteration |
+| `xBuilder(types...)` | pre-resolved bulk path |
+| `clear()` / `close()` | lifecycle |
+| `onX` | event/callback annotations |
 
-### Visibility rules
-
-- **Public**: user-facing API (spawn, despawn, tick, save, load, accessor, builder)
-- **Package-private**: framework internals (CommandProcessor, *ById methods, entityAllocator)
+### Visibility
+- **Public**: user-facing API only
+- **Package-private**: all framework internals — move collaborating classes into the same package
+- **`final` classes**: no subclassing of framework types
 - **No `protected`**: no inheritance in the API
-- **`final` classes**: World, WorldBuilder, WorldAccessor, Commands, Entity — no subclassing
 
 ## Reference
 
