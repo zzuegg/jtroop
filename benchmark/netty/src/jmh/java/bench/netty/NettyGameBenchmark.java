@@ -11,14 +11,19 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
+import io.netty.handler.codec.MessageToByteEncoder;
+import io.netty.handler.codec.ByteToMessageDecoder;
 import org.openjdk.jmh.annotations.*;
 
-import java.util.concurrent.CountDownLatch;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * JMH benchmark: Netty game server processing position updates + chat messages.
- * Measures throughput and GC allocation rate.
+ * JMH benchmark: Netty game server with proper object encoding/decoding.
+ * Client sends typed message objects through an encoder pipeline.
+ * Server decodes bytes into typed objects and dispatches.
+ * This matches what jtroop does: record → codec → pipeline → wire → decode → dispatch.
  */
 @BenchmarkMode({Mode.Throughput, Mode.AverageTime})
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
@@ -28,12 +33,83 @@ import java.util.concurrent.TimeUnit;
 @Fork(value = 1, jvmArgs = {"--enable-preview"})
 public class NettyGameBenchmark {
 
+    // Message types — equivalent to jtroop records
+    public record PositionUpdate(float x, float y, float z, float yaw) {}
+    public record ChatMessage(String text, int room) {}
+
+    // Encoder: object → bytes (equivalent to jtroop codec encode)
+    static class GameMessageEncoder extends MessageToByteEncoder<Object> {
+        @Override
+        protected void encode(ChannelHandlerContext ctx, Object msg, ByteBuf out) {
+            switch (msg) {
+                case PositionUpdate p -> {
+                    out.writeShort(GameMessages.MSG_POSITION_UPDATE);
+                    out.writeFloat(p.x());
+                    out.writeFloat(p.y());
+                    out.writeFloat(p.z());
+                    out.writeFloat(p.yaw());
+                }
+                case ChatMessage c -> {
+                    out.writeShort(GameMessages.MSG_CHAT);
+                    var bytes = c.text().getBytes(StandardCharsets.UTF_8);
+                    out.writeInt(bytes.length);
+                    out.writeBytes(bytes);
+                    out.writeInt(c.room());
+                }
+                default -> throw new IllegalArgumentException("Unknown message: " + msg);
+            }
+        }
+    }
+
+    // Decoder: bytes → object (equivalent to jtroop codec decode)
+    static class GameMessageDecoder extends ByteToMessageDecoder {
+        @Override
+        protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+            if (in.readableBytes() < 2) return;
+            in.markReaderIndex();
+            int type = in.readShort();
+            switch (type) {
+                case GameMessages.MSG_POSITION_UPDATE -> {
+                    if (in.readableBytes() < 16) { in.resetReaderIndex(); return; }
+                    out.add(new PositionUpdate(in.readFloat(), in.readFloat(),
+                            in.readFloat(), in.readFloat()));
+                }
+                case GameMessages.MSG_CHAT -> {
+                    if (in.readableBytes() < 4) { in.resetReaderIndex(); return; }
+                    int len = in.readInt();
+                    if (in.readableBytes() < len + 4) { in.resetReaderIndex(); return; }
+                    var bytes = new byte[len];
+                    in.readBytes(bytes);
+                    int room = in.readInt();
+                    out.add(new ChatMessage(new String(bytes, StandardCharsets.UTF_8), room));
+                }
+                default -> in.resetReaderIndex();
+            }
+        }
+    }
+
+    // Server handler: receives typed objects (equivalent to jtroop @OnMessage handler)
+    static class ServerHandler extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            switch (msg) {
+                case PositionUpdate p -> { /* process position */ }
+                case ChatMessage c -> { /* process chat */ }
+                default -> {}
+            }
+        }
+    }
+
+    static class ClientHandler extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) { }
+    }
+
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private EventLoopGroup clientGroup;
     private Channel serverChannel;
     private Channel clientChannel;
-    private int port;
 
     @Setup(Level.Trial)
     public void setup() throws Exception {
@@ -50,6 +126,7 @@ public class NettyGameBenchmark {
                         ch.pipeline().addLast(
                                 new LengthFieldBasedFrameDecoder(65536, 0, 4, 0, 4),
                                 new LengthFieldPrepender(4),
+                                new GameMessageDecoder(),
                                 new ServerHandler()
                         );
                     }
@@ -57,7 +134,6 @@ public class NettyGameBenchmark {
 
         var bindFuture = serverBootstrap.bind(0).sync();
         serverChannel = bindFuture.channel();
-        port = ((java.net.InetSocketAddress) serverChannel.localAddress()).getPort();
 
         var clientBootstrap = new Bootstrap()
                 .group(clientGroup)
@@ -68,12 +144,14 @@ public class NettyGameBenchmark {
                         ch.pipeline().addLast(
                                 new LengthFieldBasedFrameDecoder(65536, 0, 4, 0, 4),
                                 new LengthFieldPrepender(4),
+                                new GameMessageEncoder(),
                                 new ClientHandler()
                         );
                     }
                 });
 
-        clientChannel = clientBootstrap.connect("localhost", port).sync().channel();
+        clientChannel = clientBootstrap.connect("localhost",
+                ((java.net.InetSocketAddress) serverChannel.localAddress()).getPort()).sync().channel();
     }
 
     @TearDown(Level.Trial)
@@ -85,83 +163,39 @@ public class NettyGameBenchmark {
         bossGroup.shutdownGracefully().sync();
     }
 
+    // --- Fire-and-forget benchmarks ---
+
     @Benchmark
-    public void positionUpdate() throws Exception {
-        var buf = clientChannel.alloc().buffer(GameMessages.POSITION_UPDATE_SIZE + 2);
-        buf.writeShort(GameMessages.MSG_POSITION_UPDATE);
-        buf.writeFloat(1.0f); // x
-        buf.writeFloat(2.0f); // y
-        buf.writeFloat(3.0f); // z
-        buf.writeFloat(0.5f); // yaw
-        clientChannel.writeAndFlush(buf);
+    public void positionUpdate() {
+        clientChannel.writeAndFlush(new PositionUpdate(1.0f, 2.0f, 3.0f, 0.5f));
     }
 
     @Benchmark
-    public void chatMessage() throws Exception {
-        var text = GameMessages.CHAT_TEXT;
-        var textBytes = text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        var buf = clientChannel.alloc().buffer(2 + 4 + textBytes.length + 4);
-        buf.writeShort(GameMessages.MSG_CHAT);
-        buf.writeInt(textBytes.length);
-        buf.writeBytes(textBytes);
-        buf.writeInt(1); // room
-        clientChannel.writeAndFlush(buf);
+    public void chatMessage() {
+        clientChannel.writeAndFlush(new ChatMessage(GameMessages.CHAT_TEXT, 1));
     }
 
     @Benchmark
-    public void mixedTraffic() throws Exception {
-        // 80% position updates, 20% chat (typical game workload)
+    public void mixedTraffic() {
         for (int i = 0; i < 10; i++) {
             if (i < 8) {
-                var buf = clientChannel.alloc().buffer(GameMessages.POSITION_UPDATE_SIZE + 2);
-                buf.writeShort(GameMessages.MSG_POSITION_UPDATE);
-                buf.writeFloat(i * 0.1f);
-                buf.writeFloat(i * 0.2f);
-                buf.writeFloat(i * 0.3f);
-                buf.writeFloat(i * 0.01f);
-                clientChannel.writeAndFlush(buf);
+                clientChannel.writeAndFlush(
+                        new PositionUpdate(i * 0.1f, i * 0.2f, i * 0.3f, i * 0.01f));
             } else {
-                var textBytes = GameMessages.CHAT_TEXT.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                var buf = clientChannel.alloc().buffer(2 + 4 + textBytes.length + 4);
-                buf.writeShort(GameMessages.MSG_CHAT);
-                buf.writeInt(textBytes.length);
-                buf.writeBytes(textBytes);
-                buf.writeInt(i);
-                clientChannel.writeAndFlush(buf);
+                clientChannel.writeAndFlush(new ChatMessage(GameMessages.CHAT_TEXT, i));
             }
-        }
-        clientChannel.flush();
-    }
-
-    static class ServerHandler extends ChannelInboundHandlerAdapter {
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            var buf = (ByteBuf) msg;
-            int msgType = buf.readShort();
-            switch (msgType) {
-                case GameMessages.MSG_POSITION_UPDATE -> {
-                    float x = buf.readFloat();
-                    float y = buf.readFloat();
-                    float z = buf.readFloat();
-                    float yaw = buf.readFloat();
-                    // Process position — in real game: update world state
-                }
-                case GameMessages.MSG_CHAT -> {
-                    int textLen = buf.readInt();
-                    var textBytes = new byte[textLen];
-                    buf.readBytes(textBytes);
-                    int room = buf.readInt();
-                    // Process chat — in real game: broadcast
-                }
-            }
-            buf.release();
         }
     }
 
-    static class ClientHandler extends ChannelInboundHandlerAdapter {
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            ((ByteBuf) msg).release();
-        }
+    // --- Blocking benchmarks (comparable to jtroop sendBlocking) ---
+
+    @Benchmark
+    public void positionUpdate_blocking() throws Exception {
+        clientChannel.writeAndFlush(new PositionUpdate(1.0f, 2.0f, 3.0f, 0.5f)).sync();
+    }
+
+    @Benchmark
+    public void chatMessage_blocking() throws Exception {
+        clientChannel.writeAndFlush(new ChatMessage(GameMessages.CHAT_TEXT, 1)).sync();
     }
 }

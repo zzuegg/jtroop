@@ -257,6 +257,43 @@ public final class Client implements AutoCloseable {
         }
     }
 
+    /**
+     * Blocking send — encodes and writes directly to the socket, returns when
+     * bytes are handed to the kernel. Comparable to Netty's writeAndFlush().sync().
+     */
+    @SuppressWarnings("unchecked")
+    public void sendBlocking(Record message) {
+        var msgType = (Class<? extends Record>) message.getClass();
+        if (datagramMessageTypes.contains(msgType)) {
+            sendUdp(message);
+            return;
+        }
+
+        var connType = resolveConnection(message.getClass());
+        var config = configByType.get(connType);
+        var channel = channels.get(connType);
+        if (channel == null || config == null) {
+            throw new IllegalStateException("No connection for " + message.getClass().getName());
+        }
+
+        encodeBuf.clear();
+        var wb = new WriteBuffer(encodeBuf);
+        codec.encode(message, wb);
+        encodeBuf.flip();
+
+        wireBuf.clear();
+        config.pipeline().encodeOutbound(encodeBuf, wireBuf);
+        wireBuf.flip();
+
+        try {
+            while (wireBuf.hasRemaining()) {
+                channel.write(wireBuf);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Send failed", e);
+        }
+    }
+
     private void sendUdp(Record message) {
         var connType = resolveConnection(message.getClass());
         var udpChannel = udpChannels.get(connType);

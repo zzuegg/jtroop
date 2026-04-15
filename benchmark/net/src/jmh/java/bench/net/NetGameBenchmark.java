@@ -85,8 +85,18 @@ public class NetGameBenchmark {
     }
 
     @Benchmark
+    public void positionUpdate_blocking() {
+        client.sendBlocking(new PositionUpdate(1.0f, 2.0f, 3.0f, 0.5f));
+    }
+
+    @Benchmark
     public void chatMessage() {
         client.send(new ChatMessage(GameMessages.CHAT_TEXT, 1));
+    }
+
+    @Benchmark
+    public void chatMessage_blocking() {
+        client.sendBlocking(new ChatMessage(GameMessages.CHAT_TEXT, 1));
     }
 
     @Benchmark
