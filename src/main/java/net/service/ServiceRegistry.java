@@ -17,11 +17,15 @@ public final class ServiceRegistry {
             boolean hasReturn
     ) {}
 
+    private record LifecycleEntry(Object instance, MethodHandle method) {}
+
     private final CodecRegistry codec;
     private final Map<Class<? extends Record>, HandlerEntry> handlers = new HashMap<>();
     private final Map<Class<?>, Class<?>> handlerToInterface = new HashMap<>();
     private final Map<Class<?>, Set<Class<? extends Record>>> interfaceToMessageTypes = new HashMap<>();
     private final Set<Class<? extends Record>> datagramTypes = new HashSet<>();
+    private final List<LifecycleEntry> connectHandlers = new ArrayList<>();
+    private final List<LifecycleEntry> disconnectHandlers = new ArrayList<>();
 
     public ServiceRegistry(CodecRegistry codec) {
         this.codec = codec;
@@ -97,7 +101,28 @@ public final class ServiceRegistry {
                 throw new RuntimeException("Cannot access method: " + m.getName(), e);
             }
         }
+
+        // Scan for lifecycle methods
+        for (Method m : handlerClass.getDeclaredMethods()) {
+            m.setAccessible(true);
+            try {
+                if (m.isAnnotationPresent(OnConnect.class)) {
+                    connectHandlers.add(new LifecycleEntry(handlerInstance, lookup.unreflect(m)));
+                }
+                if (m.isAnnotationPresent(OnDisconnect.class)) {
+                    disconnectHandlers.add(new LifecycleEntry(handlerInstance, lookup.unreflect(m)));
+                }
+            } catch (IllegalAccessException e) {
+                throw new RuntimeException("Cannot access lifecycle method: " + m.getName(), e);
+            }
+        }
     }
+
+    private Broadcast broadcast;
+    private Unicast unicast;
+
+    public void setBroadcast(Broadcast broadcast) { this.broadcast = broadcast; }
+    public void setUnicast(Unicast unicast) { this.unicast = unicast; }
 
     public Object dispatch(Record message, ConnectionId sender) {
         var entry = handlers.get(message.getClass());
@@ -105,10 +130,8 @@ public final class ServiceRegistry {
             throw new IllegalArgumentException("No handler for message type: " + message.getClass().getName());
         }
         try {
-            // Invoke with (instance, message, sender)
             var method = entry.method();
             var params = method.type().parameterList();
-            // Build args: instance, then match parameters
             var args = new Object[params.size()];
             args[0] = entry.instance();
             for (int i = 1; i < params.size(); i++) {
@@ -117,11 +140,35 @@ public final class ServiceRegistry {
                     args[i] = message;
                 } else if (paramType == ConnectionId.class) {
                     args[i] = sender;
+                } else if (paramType == Broadcast.class) {
+                    args[i] = broadcast;
+                } else if (paramType == Unicast.class) {
+                    args[i] = unicast;
                 }
             }
             return method.invokeWithArguments(args);
         } catch (Throwable e) {
             throw new RuntimeException("Dispatch failed for " + message.getClass().getName(), e);
+        }
+    }
+
+    public void dispatchConnect(ConnectionId id) {
+        for (var entry : connectHandlers) {
+            try {
+                entry.method().invoke(entry.instance(), id);
+            } catch (Throwable e) {
+                throw new RuntimeException("OnConnect dispatch failed", e);
+            }
+        }
+    }
+
+    public void dispatchDisconnect(ConnectionId id) {
+        for (var entry : disconnectHandlers) {
+            try {
+                entry.method().invoke(entry.instance(), id);
+            } catch (Throwable e) {
+                throw new RuntimeException("OnDisconnect dispatch failed", e);
+            }
         }
     }
 

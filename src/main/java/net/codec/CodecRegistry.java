@@ -98,9 +98,14 @@ public final class CodecRegistry {
         return entry.type();
     }
 
+    @SuppressWarnings("unchecked")
     public void encode(Record msg, WriteBuffer wb) {
         var entry = byClass.get(msg.getClass());
-        if (entry == null) throw new IllegalArgumentException("Unregistered type: " + msg.getClass().getName());
+        if (entry == null) {
+            // Auto-register for types sent via broadcast/unicast
+            register((Class<? extends Record>) msg.getClass());
+            entry = byClass.get(msg.getClass());
+        }
         wb.writeShort((short) entry.typeId());
         for (int i = 0; i < entry.accessors().size(); i++) {
             try {

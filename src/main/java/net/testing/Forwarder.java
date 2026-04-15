@@ -41,13 +41,30 @@ public final class Forwarder implements AutoCloseable {
         running = true;
 
         for (var fwd : forwards) {
-            var serverChannel = ServerSocketChannel.open();
-            serverChannel.configureBlocking(false);
-            serverChannel.bind(fwd.listenTransport().address());
-            int port = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
-            boundPorts.add(port);
-            serverChannels.add(serverChannel);
-            serverChannel.register(selector, SelectionKey.OP_ACCEPT, fwd);
+            if (fwd.listenTransport().isTcp()) {
+                var serverChannel = ServerSocketChannel.open();
+                serverChannel.configureBlocking(false);
+                serverChannel.bind(fwd.listenTransport().address());
+                int port = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
+                boundPorts.add(port);
+                serverChannels.add(serverChannel);
+                serverChannel.register(selector, SelectionKey.OP_ACCEPT, fwd);
+            } else {
+                // UDP forwarder
+                var listenChannel = java.nio.channels.DatagramChannel.open();
+                listenChannel.configureBlocking(false);
+                listenChannel.bind(fwd.listenTransport().address());
+                int port = ((InetSocketAddress) listenChannel.getLocalAddress()).getPort();
+                boundPorts.add(port);
+
+                var targetAddr = new InetSocketAddress(fwd.targetHost(), fwd.targetPort());
+                var targetChannel = java.nio.channels.DatagramChannel.open();
+                targetChannel.configureBlocking(false);
+
+                var readBuf = ByteBuffer.allocate(65536);
+                var udpState = new UdpForwardState(listenChannel, targetChannel, targetAddr, fwd, readBuf);
+                listenChannel.register(selector, SelectionKey.OP_READ, udpState);
+            }
         }
 
         acceptThread.start();
@@ -67,11 +84,53 @@ public final class Forwarder implements AutoCloseable {
                         handleAccept(key, fwd);
                     } else if (key.isReadable() && key.attachment() instanceof PipeState pipe) {
                         handleRead(key, pipe);
+                    } else if (key.isReadable() && key.attachment() instanceof UdpForwardState udp) {
+                        handleUdpRead(udp);
                     }
                 }
             } catch (IOException e) {
                 if (running) throw new RuntimeException("Forwarder error", e);
             }
+        }
+    }
+
+    private record UdpForwardState(
+            java.nio.channels.DatagramChannel listenChannel,
+            java.nio.channels.DatagramChannel targetChannel,
+            InetSocketAddress targetAddr,
+            ForwardConfig config,
+            ByteBuffer readBuf
+    ) {}
+
+    private void handleUdpRead(UdpForwardState state) throws IOException {
+        state.readBuf().clear();
+        var sender = state.listenChannel().receive(state.readBuf());
+        if (sender == null) return;
+        state.readBuf().flip();
+
+        var data = new byte[state.readBuf().remaining()];
+        state.readBuf().get(data);
+
+        // Apply impairments
+        if (state.config().packetLoss() > 0 && rng.nextDouble() < state.config().packetLoss()) {
+            return; // drop
+        }
+
+        long delayMs = 0;
+        if (state.config().latencyMin() != null && state.config().latencyMax() != null) {
+            long min = state.config().latencyMin().toMillis();
+            long max = state.config().latencyMax().toMillis();
+            delayMs = min + (long) (rng.nextDouble() * (max - min));
+        }
+
+        if (delayMs > 0) {
+            scheduler.schedule(() -> {
+                try {
+                    state.targetChannel().send(ByteBuffer.wrap(data), state.targetAddr());
+                } catch (IOException _) {}
+            }, delayMs, TimeUnit.MILLISECONDS);
+        } else {
+            state.targetChannel().send(ByteBuffer.wrap(data), state.targetAddr());
         }
     }
 
