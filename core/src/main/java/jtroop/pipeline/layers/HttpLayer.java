@@ -193,7 +193,12 @@ public final class HttpLayer implements Layer {
             out.put(HTTP_200_OK_HEADER);
             writeIntAsDecimal(out, bodyLen);
             out.put(KEEPALIVE_CRLF);
-            for (int i = 0; i < bodyLen; i++) out.put(frame.get(bodyStart + i));
+            // Bulk copy body — ByteBuffer.put(src, offset, length) avoids
+            // per-byte get/put overhead and lets the JIT emit a single memcpy.
+            int savedLimit = frame.limit();
+            frame.limit(bodyStart + bodyLen).position(bodyStart);
+            out.put(frame);
+            frame.limit(savedLimit);
             return;
         }
 
@@ -207,7 +212,12 @@ public final class HttpLayer implements Layer {
         // HEAD: advertise the would-be body length, then suppress the body itself.
         writeIntAsDecimal(out, bodyLen);
         out.put(connectionLine);
-        for (int i = 0; i < writtenBodyLen; i++) out.put(frame.get(bodyStart + i));
+        if (writtenBodyLen > 0) {
+            int savedLimit = frame.limit();
+            frame.limit(bodyStart + writtenBodyLen).position(bodyStart);
+            out.put(frame);
+            frame.limit(savedLimit);
+        }
     }
 
     /** Whether the most recently decoded request asked for a persistent connection. */
