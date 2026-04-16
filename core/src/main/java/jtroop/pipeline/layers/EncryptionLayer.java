@@ -69,7 +69,7 @@ public final class EncryptionLayer implements Layer {
     }
 
     @Override
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         var s = state.get();
         int plainLen = payload.remaining();
         int cipherLen = plainLen + GCM_TAG_BYTES;
@@ -124,7 +124,7 @@ public final class EncryptionLayer implements Layer {
     }
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         if (wire.remaining() < IV_LENGTH + LENGTH_PREFIX_BYTES) return null;
 
         // Peek without consuming so a short read leaves wire untouched.

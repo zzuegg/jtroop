@@ -30,17 +30,35 @@ import static java.lang.classfile.ClassFile.*;
  * <p>Memory bound: one entry per unique shape for the app lifetime. Typical apps
  * have O(10) shapes (plain, framing, framing+encryption, http, websocket, …), not
  * O(connections). No eviction in v1 — document the metaspace cost.
+ *
+ * <h2>Context parameter (per-connection view)</h2>
+ * Each layer call takes a {@link Layer.Context} as the first argument. The
+ * generated {@code encodeOutbound} / {@code decodeInbound} methods take the
+ * Context in slot 1 and pass it through by {@code aload 1} before each
+ * {@code invokevirtual}. One extra bytecode instruction per layer call — no
+ * impact on scalar replacement since the Context reference is a plain local.
  */
 public final class FusedPipelineGenerator {
 
     public interface FusedPipeline {
-        void encodeOutbound(ByteBuffer payload, ByteBuffer wire);
-        ByteBuffer decodeInbound(ByteBuffer wire);
+        void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer wire);
+        ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire);
+
+        /** Test / cold-path convenience: forwards with a shared no-op Context. */
+        default void encodeOutbound(ByteBuffer payload, ByteBuffer wire) {
+            encodeOutbound(jtroop.pipeline.LayerContext.NOOP, payload, wire);
+        }
+        /** Test / cold-path convenience: see {@link #encodeOutbound(ByteBuffer, ByteBuffer)}. */
+        default ByteBuffer decodeInbound(ByteBuffer wire) {
+            return decodeInbound(jtroop.pipeline.LayerContext.NOOP, wire);
+        }
     }
 
     private static final ClassDesc CD_ByteBuffer = ClassDesc.of("java.nio.ByteBuffer");
     private static final ClassDesc CD_FusedPipeline = ClassDesc.of(
             "jtroop.generate.FusedPipelineGenerator$FusedPipeline");
+    private static final ClassDesc CD_Context = ClassDesc.of(
+            "jtroop.pipeline.Layer$Context");
 
     /**
      * Shape key: ordered tuple of concrete {@link Layer} classes. Two Pipelines
@@ -158,14 +176,14 @@ public final class FusedPipelineGenerator {
                 b.return_();
             });
 
-            // encodeOutbound: calls each layer's encodeOutbound in sequence
+            // encodeOutbound(Context, ByteBuffer payload, ByteBuffer wire)
+            //   slot 1 = Context ctx
+            //   slot 2 = ByteBuffer payload
+            //   slot 3 = ByteBuffer wire
             var thisDesc = ClassDesc.of(className.replace('/', '.'));
             cb.withMethodBody("encodeOutbound",
-                    MethodTypeDesc.of(ConstantDescs.CD_void, CD_ByteBuffer, CD_ByteBuffer),
+                    MethodTypeDesc.of(ConstantDescs.CD_void, CD_Context, CD_ByteBuffer, CD_ByteBuffer),
                     ACC_PUBLIC, b -> {
-                        // current = payload (slot 1)
-                        // wire = slot 2
-
                         for (int i = 0; i < layers.length; i++) {
                             // tmp[i].clear()
                             b.aload(0);
@@ -174,11 +192,12 @@ public final class FusedPipelineGenerator {
                                     MethodTypeDesc.of(ClassDesc.of("java.nio.Buffer")));
                             b.pop();
 
-                            // layer[i].encodeOutbound(current, tmp[i])
+                            // layer[i].encodeOutbound(ctx, current, tmp[i])
                             b.aload(0);
                             b.getfield(thisDesc, "layer" + i, layerDescs[i]);
+                            b.aload(1); // ctx
                             if (i == 0) {
-                                b.aload(1); // payload
+                                b.aload(2); // payload
                             } else {
                                 b.aload(0);
                                 b.getfield(thisDesc, "tmp" + (i - 1), CD_ByteBuffer);
@@ -186,7 +205,7 @@ public final class FusedPipelineGenerator {
                             b.aload(0);
                             b.getfield(thisDesc, "tmp" + i, CD_ByteBuffer);
                             b.invokevirtual(layerDescs[i], "encodeOutbound",
-                                    MethodTypeDesc.of(ConstantDescs.CD_void, CD_ByteBuffer, CD_ByteBuffer));
+                                    MethodTypeDesc.of(ConstantDescs.CD_void, CD_Context, CD_ByteBuffer, CD_ByteBuffer));
 
                             // tmp[i].flip()
                             b.aload(0);
@@ -197,7 +216,7 @@ public final class FusedPipelineGenerator {
                         }
 
                         // wire.put(last tmp)
-                        b.aload(2); // wire
+                        b.aload(3); // wire
                         b.aload(0);
                         b.getfield(thisDesc, "tmp" + (layers.length - 1), CD_ByteBuffer);
                         b.invokevirtual(CD_ByteBuffer, "put",
@@ -206,29 +225,33 @@ public final class FusedPipelineGenerator {
                         b.return_();
                     });
 
-            // decodeInbound: calls each layer's decodeInbound in reverse
+            // decodeInbound(Context, ByteBuffer wire)
+            //   slot 1 = Context ctx
+            //   slot 2 = ByteBuffer wire
+            //   slot 3 = ByteBuffer current (rolling)
             cb.withMethodBody("decodeInbound",
-                    MethodTypeDesc.of(CD_ByteBuffer, CD_ByteBuffer),
+                    MethodTypeDesc.of(CD_ByteBuffer, CD_Context, CD_ByteBuffer),
                     ACC_PUBLIC, b -> {
-                        b.aload(1); // wire → current on stack
-                        b.astore(2); // store in slot 2
+                        b.aload(2); // wire → current on stack
+                        b.astore(3); // store in slot 3
 
                         for (int i = layers.length - 1; i >= 0; i--) {
                             b.aload(0);
                             b.getfield(thisDesc, "layer" + i, layerDescs[i]);
-                            b.aload(2); // current
+                            b.aload(1); // ctx
+                            b.aload(3); // current
                             b.invokevirtual(layerDescs[i], "decodeInbound",
-                                    MethodTypeDesc.of(CD_ByteBuffer, CD_ByteBuffer));
-                            b.astore(2); // new current
+                                    MethodTypeDesc.of(CD_ByteBuffer, CD_Context, CD_ByteBuffer));
+                            b.astore(3); // new current
                             // null check
-                            b.aload(2);
+                            b.aload(3);
                             var continueLabel = b.newLabel();
                             b.ifnonnull(continueLabel);
                             b.aconst_null();
                             b.areturn();
                             b.labelBinding(continueLabel);
                         }
-                        b.aload(2);
+                        b.aload(3);
                         b.areturn();
                     });
         });
@@ -242,10 +265,10 @@ public final class FusedPipelineGenerator {
     }
 
     private static class IdentityPipeline implements FusedPipeline {
-        @Override public void encodeOutbound(ByteBuffer payload, ByteBuffer wire) {
+        @Override public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer wire) {
             wire.put(payload);
         }
-        @Override public ByteBuffer decodeInbound(ByteBuffer wire) {
+        @Override public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
             return wire;
         }
     }

@@ -86,7 +86,7 @@ public final class WebSocketLayer implements Layer {
     }
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         int start = wire.position();
         int limit = wire.limit();
         if (limit - start < 2) return null;
@@ -147,7 +147,7 @@ public final class WebSocketLayer implements Layer {
     }
 
     @Override
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         int len = payload.remaining();
         // FIN + text opcode
         out.put((byte) (0x80 | OPCODE_TEXT));

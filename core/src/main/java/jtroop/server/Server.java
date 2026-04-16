@@ -7,6 +7,7 @@ import jtroop.core.Handshake;
 import jtroop.core.ReadBuffer;
 import jtroop.core.WriteBuffer;
 import jtroop.pipeline.Layer;
+import jtroop.pipeline.LayerContext;
 import jtroop.pipeline.Pipeline;
 import jtroop.service.ServiceRegistry;
 import jtroop.session.ConnectionId;
@@ -56,6 +57,12 @@ public final class Server implements AutoCloseable {
     private final Map<ConnectionId, SelectionKey> connectionToKey = new ConcurrentHashMap<>();
     private final Map<ConnectionId, SocketChannel> connectionChannels = new ConcurrentHashMap<>();
     private final Map<ConnectionId, ListenerConfig> connectionConfig = new ConcurrentHashMap<>();
+    // Per-connection Layer.Context. One instance per accepted connection,
+    // reused across every pipeline call on that connection. The Context holds
+    // the packed connection id, peer address, byte counters and
+    // closeAfterFlush / closeNow hooks that enqueue onto the owning worker
+    // loop.
+    private final Map<ConnectionId, LayerContext> connectionContexts = new ConcurrentHashMap<>();
     // Flat per-slot channel table for zero-lookup broadcast fan-out. Indexed
     // by session slot (ConnectionId.index); {@code null} means "slot not in
     // use". Parallel to SessionStore's state arrays — populated on accept,
@@ -135,7 +142,11 @@ public final class Server implements AutoCloseable {
             encodeBuf.flip();
 
             wireBuf.clear();
-            anyConfig.pipeline().encodeOutbound(encodeBuf, wireBuf);
+            // Broadcast encodes once against any active pipeline — there is no
+            // single Context to pin. NOOP is fine: bundled layers that actually
+            // observe the ctx (AllowListLayer, RateLimitLayer) are early-decode
+            // filters, not encoders.
+            anyConfig.pipeline().encodeOutbound(LayerContext.NOOP, encodeBuf, wireBuf);
             wireBuf.flip();
 
             // Fan out the pre-encoded bytes. No lambda capture.
@@ -189,7 +200,7 @@ public final class Server implements AutoCloseable {
         var channel = connectionChannels.get(target);
         var config = connectionConfig.get(target);
         if (channel != null && channel.isConnected() && config != null) {
-            sendResponse(message, config, channel);
+            sendResponse(message, config, channel, target);
         }
     }
 
@@ -362,6 +373,22 @@ public final class Server implements AutoCloseable {
 
         connectionChannels.put(connId, clientChannel);
         connectionConfig.put(connId, config);
+
+        // Allocate the per-connection Layer.Context once. Close callbacks
+        // dispatch through {@link #closeConnection}, which itself routes to
+        // the owning worker loop — safe to invoke from any thread.
+        InetSocketAddress peer = null;
+        try {
+            var remote = clientChannel.getRemoteAddress();
+            if (remote instanceof InetSocketAddress isa) peer = isa;
+        } catch (IOException _) { /* socket may already be torn down */ }
+        var ctx = new LayerContext(
+                connId.id(),
+                peer,
+                System.nanoTime(),
+                /* closeAfterFlush */ () -> closeConnection(connId),
+                /* closeNow */        () -> closeConnection(connId));
+        connectionContexts.put(connId, ctx);
         // Publish to the flat per-slot table for zero-lookup broadcast fan-out.
         // Happens-before a concurrent broadcast observer via SessionStore's
         // synchronized methods: sessions.allocate released the active-bit
@@ -417,12 +444,17 @@ public final class Server implements AutoCloseable {
             return;
         }
         if (n > 0) {
+            // Update the per-connection Context byte counter BEFORE the
+            // pipeline sees the bytes, so early-filter layers (rate limit,
+            // slowloris) see the latest cumulative read.
+            var ctx = connectionContexts.get(connId);
+            if (ctx != null) ctx.addBytesRead(n);
             readBuf.flip();
             try {
                 if (handshakePending.contains(connId)) {
-                    processHandshake(readBuf, connId, config, channel, key);
+                    processHandshake(readBuf, connId, config, channel, key, ctx);
                 } else {
-                    processInbound(readBuf, connId, config, channel);
+                    processInbound(readBuf, connId, config, channel, ctx);
                 }
             } catch (Throwable t) {
                 // Malformed / malicious input: framing length out of range,
@@ -446,8 +478,9 @@ public final class Server implements AutoCloseable {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private void processHandshake(ByteBuffer wire, ConnectionId connId, ListenerConfig config,
-                                   SocketChannel channel, SelectionKey key) {
-        var frame = config.pipeline().decodeInbound(wire);
+                                   SocketChannel channel, SelectionKey key, LayerContext ctx) {
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        var frame = config.pipeline().decodeInbound(lc, wire);
         if (frame == null) return;
 
         var rb = new ReadBuffer(frame);
@@ -468,9 +501,11 @@ public final class Server implements AutoCloseable {
             codec.encode(accepted, wb);
             buf.flip();
             var wireBuf = ByteBuffer.allocate(65536);
-            config.pipeline().encodeOutbound(buf, wireBuf);
+            config.pipeline().encodeOutbound(lc, buf, wireBuf);
             wireBuf.flip();
+            int written = wireBuf.remaining();
             writeFully(channel, wireBuf);
+            if (ctx != null) ctx.addBytesWritten(written);
             handshakePending.remove(connId);
             serviceRegistry.dispatchConnect(connId);
         } else {
@@ -485,9 +520,13 @@ public final class Server implements AutoCloseable {
         wb.writeByte(Handshake.REJECTED);
         buf.flip();
         var wireBuf = ByteBuffer.allocate(256);
-        config.pipeline().encodeOutbound(buf, wireBuf);
+        var ctx = connectionContexts.get(connId);
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        config.pipeline().encodeOutbound(lc, buf, wireBuf);
         wireBuf.flip();
+        int written = wireBuf.remaining();
         writeFully(channel, wireBuf);
+        if (ctx != null) ctx.addBytesWritten(written);
         try { channel.close(); } catch (IOException _) {}
         key.cancel();
         handshakePending.remove(connId);
@@ -499,17 +538,19 @@ public final class Server implements AutoCloseable {
         keyToConnection.remove(key);
         connectionToKey.remove(connId);
         connectionConfig.remove(connId);
+        connectionContexts.remove(connId);
     }
 
     private void processInbound(ByteBuffer wire, ConnectionId sender, ListenerConfig config,
-                                SocketChannel channel) {
+                                SocketChannel channel, LayerContext ctx) {
         // Hot path: fused (hidden-class, monomorphic invokevirtual) so C2 can
         // inline the whole layer decode chain and EA can scalar-replace
         // transient objects across it. Plain Pipeline.decodeInbound dispatches
         // each Layer call via invokeinterface on Layer[], which blocks
         // inlining (CLAUDE.md rule 4).
         var fused = config.pipeline().fused();
-        var frame = fused.decodeInbound(wire);
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        var frame = fused.decodeInbound(lc, wire);
         while (frame != null) {
             // Peek the 2-byte type id before allocating anything. @ZeroAlloc
             // handlers skip codec.decode entirely — no Record, no String, no
@@ -531,16 +572,17 @@ public final class Server implements AutoCloseable {
                 executor.execute(() -> {
                     var result = serviceRegistry.dispatch(message, sender);
                     if (result instanceof Record response) {
-                        sendResponse(response, config, channel);
+                        sendResponse(response, config, channel, sender);
                     }
                 });
             }
 
-            frame = fused.decodeInbound(wire);
+            frame = fused.decodeInbound(lc, wire);
         }
     }
 
-    private void sendResponse(Record response, ListenerConfig config, SocketChannel channel) {
+    private void sendResponse(Record response, ListenerConfig config, SocketChannel channel,
+                               ConnectionId connId) {
         var encodeBuf = serverEncodeBuf.get();
         var wireBuf = serverWireBuf.get();
         encodeBuf.clear();
@@ -550,8 +592,11 @@ public final class Server implements AutoCloseable {
 
         wireBuf.clear();
         // Hot path: fused pipeline (monomorphic invokevirtual) — see processInbound.
-        config.pipeline().fused().encodeOutbound(encodeBuf, wireBuf);
+        var ctx = connectionContexts.get(connId);
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        config.pipeline().fused().encodeOutbound(lc, encodeBuf, wireBuf);
         wireBuf.flip();
+        int written = wireBuf.remaining();
 
         // Multiple threads (worker loops + executor) may send to the same channel
         // (broadcast + handler reply). Serialize per-channel to prevent interleaved
@@ -560,6 +605,7 @@ public final class Server implements AutoCloseable {
         synchronized (channel) {
             writeFully(channel, wireBuf);
         }
+        if (ctx != null) ctx.addBytesWritten(written);
     }
 
     /**
@@ -615,6 +661,7 @@ public final class Server implements AutoCloseable {
         connectionToKey.remove(connId);
         connectionConfig.remove(connId);
         connectionChannels.remove(connId);
+        connectionContexts.remove(connId);
     }
 
     /**

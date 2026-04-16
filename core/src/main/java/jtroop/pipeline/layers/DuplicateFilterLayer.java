@@ -33,13 +33,13 @@ public final class DuplicateFilterLayer implements Layer {
     }
 
     @Override
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         // Pass through — duplicate filter is receive-side only
         out.put(payload);
     }
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         if (wire.remaining() < 4) return null;
         int startPos = wire.position();
         int seq = wire.getInt(startPos); // peek without advancing

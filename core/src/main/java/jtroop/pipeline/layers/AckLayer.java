@@ -61,7 +61,7 @@ public final class AckLayer implements Layer {
     }
 
     @Override
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         int seq = sendSeq++;
         out.putInt(seq);
         int payloadStart = payload.position();
@@ -117,7 +117,7 @@ public final class AckLayer implements Layer {
     }
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         if (wire.remaining() < 4) return null;
         int seq = wire.getInt();
         pendingAckSeq = seq;

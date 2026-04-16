@@ -39,13 +39,13 @@ public final class FramingLayer implements Layer {
     private ByteBuffer view;
 
     @Override
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         out.putInt(payload.remaining());
         out.put(payload);
     }
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         if (wire.remaining() < 4) return null;
         int startPos = wire.position();
         // Peek length prefix without advancing position — no reset() needed on partial.

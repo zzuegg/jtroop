@@ -5,6 +5,7 @@ import jtroop.core.EventLoop;
 import jtroop.core.ReadBuffer;
 import jtroop.core.WriteBuffer;
 import jtroop.pipeline.Layer;
+import jtroop.pipeline.LayerContext;
 import jtroop.pipeline.Pipeline;
 import jtroop.service.ServiceRegistry;
 import jtroop.transport.Transport;
@@ -58,6 +59,10 @@ public final class Client implements AutoCloseable {
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannelByMsgType = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> configByType = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> udpConfigByType = new HashMap<>();
+    // Per-connection LayerContext. Allocated on connect, keyed by connection
+    // type (the Client's analogue of ConnectionId). Passed into every
+    // pipeline call on the connection's hot path.
+    private final Map<Class<? extends Record>, LayerContext> contextsByType = new ConcurrentHashMap<>();
     private final java.util.concurrent.Executor executor;
     private final Set<Class<? extends Record>> datagramMessageTypes;
 
@@ -163,6 +168,23 @@ public final class Client implements AutoCloseable {
         channelSlots.put(config.connectionType(), slot);
         eventLoop.registerWriteTarget(slot, channel);
 
+        // Allocate per-connection Context. No ConnectionId on the client side
+        // — use the slot index packed in the low 32 bits with generation 1.
+        java.net.InetSocketAddress peer = null;
+        try {
+            var remote = channel.getRemoteAddress();
+            if (remote instanceof java.net.InetSocketAddress isa) peer = isa;
+        } catch (IOException _) {}
+        final var connTypeFinal = config.connectionType();
+        long packedId = ((long) 1 << 32) | (slot & 0xFFFFFFFFL);
+        var ctx = new LayerContext(
+                packedId,
+                peer,
+                System.nanoTime(),
+                /* closeAfterFlush */ () -> closeConnection(connTypeFinal),
+                /* closeNow */        () -> closeConnection(connTypeFinal));
+        contextsByType.put(connTypeFinal, ctx);
+
         // Send handshake if we have a handshake instance
         var hsInstance = handshakeInstances.get(config.connectionType());
         if (hsInstance != null) {
@@ -202,20 +224,24 @@ public final class Client implements AutoCloseable {
         buf.flip();
 
         var wire = ByteBuffer.allocate(65536);
-        config.pipeline().encodeOutbound(buf, wire);
+        var ctx = contextsByType.get(config.connectionType());
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        config.pipeline().encodeOutbound(lc, buf, wire);
         wire.flip();
+        int written = wire.remaining();
 
         // Non-blocking channel: write may be partial — loop until fully sent or
         // the receiver stops accepting (deadline).
         long deadlineNs = System.nanoTime() + 5_000_000_000L;
         while (wire.hasRemaining()) {
-            int written;
-            try { written = channel.write(wire); } catch (IOException _) { return; }
-            if (written == 0) {
+            int w;
+            try { w = channel.write(wire); } catch (IOException _) { return; }
+            if (w == 0) {
                 if (System.nanoTime() > deadlineNs) return;
                 Thread.onSpinWait();
             }
         }
+        if (ctx != null) ctx.addBytesWritten(written);
     }
 
     private void connectUdp(ConnectionConfig config) throws IOException {
@@ -234,17 +260,21 @@ public final class Client implements AutoCloseable {
             return;
         }
         if (n > 0) {
+            // Update per-connection read counter before pipeline sees the bytes.
+            var ctx = contextsByType.get(config.connectionType());
+            if (ctx != null) ctx.addBytesRead(n);
             readBuf.flip();
             // Hot path: fused pipeline. Monomorphic invokevirtual on the
             // hidden class lets C2 inline the whole decode chain; the plain
             // Pipeline.decodeInbound loops over Layer[] via invokeinterface
             // which blocks inlining (CLAUDE.md rule 4).
             var fused = config.pipeline().fused();
-            var frame = fused.decodeInbound(readBuf);
+            Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+            var frame = fused.decodeInbound(lc, readBuf);
             while (frame != null) {
                 if (handshakePending.contains(config.connectionType())) {
                     processHandshakeResponse(frame, config);
-                    frame = fused.decodeInbound(readBuf);
+                    frame = fused.decodeInbound(lc, readBuf);
                     continue;
                 }
                 // Peek type id without consuming. If a push handler is
@@ -263,7 +293,7 @@ public final class Client implements AutoCloseable {
                 } else {
                     stashResponseFrame(frame);
                 }
-                frame = fused.decodeInbound(readBuf);
+                frame = fused.decodeInbound(lc, readBuf);
             }
             readBuf.compact();
         }
@@ -463,9 +493,13 @@ public final class Client implements AutoCloseable {
         // Hot path: fused pipeline (monomorphic invokevirtual → inlinable).
         // Plain Pipeline.encodeOutbound uses invokeinterface on Layer[] which
         // blocks C2 inlining and defeats EA on the record/wrapper chain.
-        config.pipeline().fused().encodeOutbound(encode, wire);
+        var ctx = contextsByType.get(connType);
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        config.pipeline().fused().encodeOutbound(lc, encode, wire);
         wire.flip();
-        return wire.remaining();
+        int sz = wire.remaining();
+        if (ctx != null) ctx.addBytesWritten(sz);
+        return sz;
     }
 
 
@@ -617,6 +651,7 @@ public final class Client implements AutoCloseable {
             // Drop cached message-type → channel entries pointing at this UDP.
             udpChannelByMsgType.values().removeIf(ch -> ch == udp);
         }
+        contextsByType.remove(connectionType);
     }
 
     @Override

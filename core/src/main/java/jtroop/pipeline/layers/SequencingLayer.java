@@ -21,13 +21,13 @@ public final class SequencingLayer implements Layer {
     private int lastReceivedSeq = -1;
 
     @Override
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         out.putInt(sendSeq++);
         out.put(payload);
     }
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         if (wire.remaining() < 4) return null;
         int seq = wire.getInt();
         if (seq <= lastReceivedSeq) {

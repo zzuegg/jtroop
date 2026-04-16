@@ -67,7 +67,7 @@ public final class HttpLayer implements Layer {
     private boolean lastWasHead = false;
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         int start = wire.position();
         int limit = wire.limit();
 
@@ -169,7 +169,7 @@ public final class HttpLayer implements Layer {
     }
 
     @Override
-    public void encodeOutbound(ByteBuffer frame, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer frame, ByteBuffer out) {
         int status = frame.getShort() & 0xFFFF;
         int reasonLen = frame.getShort() & 0xFFFF;
         int reasonStart = frame.position();

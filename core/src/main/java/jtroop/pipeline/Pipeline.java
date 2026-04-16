@@ -83,24 +83,34 @@ public final class Pipeline {
         return layers.clone();
     }
 
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer wire) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer wire) {
         var current = payload;
         for (int i = 0; i < layers.length; i++) {
             tempBuffers[i].clear();
-            layers[i].encodeOutbound(current, tempBuffers[i]);
+            layers[i].encodeOutbound(ctx, current, tempBuffers[i]);
             tempBuffers[i].flip();
             current = tempBuffers[i];
         }
         wire.put(current);
     }
 
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         var current = wire;
         for (int i = layers.length - 1; i >= 0; i--) {
-            current = layers[i].decodeInbound(current);
+            current = layers[i].decodeInbound(ctx, current);
             if (current == null) return null;
         }
         return current;
+    }
+
+    /** Convenience for cold paths / tests that don't have a Context. */
+    public void encodeOutbound(ByteBuffer payload, ByteBuffer wire) {
+        encodeOutbound(LayerContext.NOOP, payload, wire);
+    }
+
+    /** Convenience for cold paths / tests that don't have a Context. */
+    public ByteBuffer decodeInbound(ByteBuffer wire) {
+        return decodeInbound(LayerContext.NOOP, wire);
     }
 
     // ------------------------------------------------------------------

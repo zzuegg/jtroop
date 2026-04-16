@@ -59,7 +59,7 @@ public final class CompressionLayer implements Layer, AutoCloseable {
     }
 
     @Override
-    public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
+    public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         int len = payload.remaining();
         byte[] in = inputScratch;
         if (in.length < len) {
@@ -95,7 +95,7 @@ public final class CompressionLayer implements Layer, AutoCloseable {
     }
 
     @Override
-    public ByteBuffer decodeInbound(ByteBuffer wire) {
+    public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         if (wire.remaining() < 4) return null;
         int originalSize = wire.getInt();
         int compLen = wire.remaining();
