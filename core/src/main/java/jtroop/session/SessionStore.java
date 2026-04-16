@@ -115,6 +115,16 @@ public final class SessionStore {
         return count;
     }
 
+    /**
+     * Maximum number of concurrent sessions this store can hold. Fixed at
+     * construction; useful for sizing parallel per-slot arrays (e.g. a
+     * {@code SocketChannel[]} indexed by session slot for zero-lookup
+     * broadcast fan-out — see {@code Server.broadcastImpl}).
+     */
+    public int capacity() {
+        return capacity;
+    }
+
     public synchronized void forEachActive(Consumer<ConnectionId> consumer) {
         // Index loop + primitive-array reads. The ConnectionId record is
         // scalar-replaced by C2 at monomorphic callsites (CLAUDE.md rule #2).

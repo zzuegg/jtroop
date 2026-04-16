@@ -56,6 +56,18 @@ public final class Server implements AutoCloseable {
     private final Map<ConnectionId, SelectionKey> connectionToKey = new ConcurrentHashMap<>();
     private final Map<ConnectionId, SocketChannel> connectionChannels = new ConcurrentHashMap<>();
     private final Map<ConnectionId, ListenerConfig> connectionConfig = new ConcurrentHashMap<>();
+    // Flat per-slot channel table for zero-lookup broadcast fan-out. Indexed
+    // by session slot (ConnectionId.index); {@code null} means "slot not in
+    // use". Parallel to SessionStore's state arrays — populated on accept,
+    // cleared on disconnect. Replaces the per-recipient
+    //   ConnectionId.of(index, gen) + connectionChannels.get(id)
+    // sequence, which allocated a ConnectionId record that escaped into the
+    // non-inlined ConcurrentHashMap.get and defeated scalar replacement
+    // (CLAUDE.md rule #3). The array store is plain; publication is
+    // piggy-backed on SessionStore.allocate / release synchronized edges
+    // which flush the write before a fan-out observer can see active=true
+    // for the slot.
+    private final SocketChannel[] slotChannels;
     @SuppressWarnings("rawtypes")
     private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers;
     private final Set<ConnectionId> handshakePending = ConcurrentHashMap.newKeySet();
@@ -73,6 +85,7 @@ public final class Server implements AutoCloseable {
         this.handshakeHandlers = handshakeHandlers;
         this.executor = executor != null ? executor : Runnable::run;
         this.sessions = new SessionStore(4096);
+        this.slotChannels = new SocketChannel[sessions.capacity()];
         try {
             this.acceptLoop = new EventLoop("server-accept");
             this.workerGroup = new EventLoopGroup(workerCount);
@@ -150,10 +163,14 @@ public final class Server implements AutoCloseable {
 
         @Override
         public void visit(int index, int generation) {
-            // ConnectionId constructed on stack for the map lookup; the record
-            // is scalar-replaced at this monomorphic call site (CLAUDE.md #2).
-            var connId = ConnectionId.of(index, generation);
-            var channel = connectionChannels.get(connId);
+            // Zero-alloc lookup: plain aaload on a primitive-indexed array.
+            // Previously this did ConnectionId.of(index, generation) +
+            // ConcurrentHashMap.get — the record escaped into the non-inlined
+            // CHM.get and could not be scalar-replaced (CLAUDE.md rule #3),
+            // costing 24 B/recipient. `generation` is unused here:
+            // forEachActiveIndex only yields currently-active slots so the
+            // slot→channel mapping is already filtered by liveness.
+            var channel = slotChannels[index];
             if (channel == null || !channel.isConnected()) return;
 
             // Rewind the buffer without allocating a duplicate — we own it
@@ -345,6 +362,12 @@ public final class Server implements AutoCloseable {
 
         connectionChannels.put(connId, clientChannel);
         connectionConfig.put(connId, config);
+        // Publish to the flat per-slot table for zero-lookup broadcast fan-out.
+        // Happens-before a concurrent broadcast observer via SessionStore's
+        // synchronized methods: sessions.allocate released the active-bit
+        // write, and any subsequent forEachActiveIndex acquires the same
+        // monitor, flushing this store through the JMM read-of-monitor edge.
+        slotChannels[connId.index()] = clientChannel;
 
         // Assign to a worker loop (round-robin)
         var workerLoop = workerGroup.next();
@@ -453,6 +476,10 @@ public final class Server implements AutoCloseable {
         try { channel.close(); } catch (IOException _) {}
         key.cancel();
         handshakePending.remove(connId);
+        // Clear the flat slot BEFORE releasing the session — otherwise a
+        // concurrent allocate could reuse the slot and race the null-store,
+        // leaking a stale channel ref into fan-out.
+        slotChannels[connId.index()] = null;
         sessions.release(connId);
         keyToConnection.remove(key);
         connectionToKey.remove(connId);
@@ -564,6 +591,10 @@ public final class Server implements AutoCloseable {
         key.cancel();
         try { channel.close(); } catch (IOException _) {}
         serviceRegistry.dispatchDisconnect(connId);
+        // Clear the flat slot BEFORE releasing the session — otherwise a
+        // concurrent allocate could reuse the slot and race the null-store,
+        // leaking a stale channel ref into fan-out.
+        slotChannels[connId.index()] = null;
         sessions.release(connId);
         keyToConnection.remove(key);
         connectionToKey.remove(connId);
