@@ -83,6 +83,12 @@ public final class Server implements AutoCloseable {
     private final Set<ConnectionId> handshakePending = ConcurrentHashMap.newKeySet();
 
     private final java.util.concurrent.Executor executor;
+    // True when the executor is the default inline Runnable::run. When true,
+    // processInbound calls dispatch directly instead of going through
+    // executor.execute(() -> ...) — eliminating the per-frame lambda capture
+    // (~40 B) that C2 cannot scalar-replace because the lambda escapes into
+    // the non-inlined Executor.execute interface call (CLAUDE.md rule #4).
+    private final boolean inlineExecutor;
 
     @SuppressWarnings("rawtypes")
     private Server(List<ListenerConfig> listeners, ServiceRegistry serviceRegistry,
@@ -93,6 +99,7 @@ public final class Server implements AutoCloseable {
         this.serviceRegistry = serviceRegistry;
         this.codec = codec;
         this.handshakeHandlers = handshakeHandlers;
+        this.inlineExecutor = (executor == null);
         this.executor = executor != null ? executor : Runnable::run;
         this.sessions = new SessionStore(4096);
         this.slotChannels = new SocketChannel[sessions.capacity()];
@@ -669,13 +676,26 @@ public final class Server implements AutoCloseable {
                 var rb = new ReadBuffer(frame);
                 var message = codec.decode(rb);
 
-                // Dispatch to handler via executor (supports virtual threads)
-                executor.execute(() -> {
+                if (inlineExecutor) {
+                    // Fast path: default inline executor. Call dispatch directly
+                    // — no lambda capture, no invokeinterface on Executor. With
+                    // the full chain inlined (dispatch → handler → sendResponse)
+                    // C2 can scalar-replace the decoded Record AND the handler's
+                    // returned response Record (CLAUDE.md rules #3, #4, #7).
                     var result = serviceRegistry.dispatch(message, sender);
                     if (result instanceof Record response) {
                         sendResponse(response, config, channel, sender);
                     }
-                });
+                } else {
+                    // Slow path: user-provided executor (e.g. virtual threads).
+                    // Lambda capture is unavoidable here.
+                    executor.execute(() -> {
+                        var result = serviceRegistry.dispatch(message, sender);
+                        if (result instanceof Record response) {
+                            sendResponse(response, config, channel, sender);
+                        }
+                    });
+                }
             }
 
             frame = fused.decodeInbound(lc, wire);
@@ -687,8 +707,10 @@ public final class Server implements AutoCloseable {
         var encodeBuf = serverEncodeBuf.get();
         var wireBuf = serverWireBuf.get();
         encodeBuf.clear();
-        var wb = new WriteBuffer(encodeBuf);
-        codec.encode(response, wb);
+        // Use the direct ByteBuffer overload — avoids the per-call
+        // new WriteBuffer(buf) wrapper (16 B) that may not be EA'd when
+        // sendResponse is too large for C2 to inline end-to-end.
+        codec.encode(response, encodeBuf);
         encodeBuf.flip();
 
         wireBuf.clear();
