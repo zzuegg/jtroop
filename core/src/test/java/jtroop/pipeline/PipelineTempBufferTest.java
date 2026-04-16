@@ -79,4 +79,46 @@ class PipelineTempBufferTest {
         assertEquals(4, out2.getInt());
         assertEquals(222, out2.getInt());
     }
+
+    @Test
+    void fused_returnsHiddenClass_forMonomorphicDispatch() {
+        // Rule 4 regression guard: server/client hot paths call Pipeline.fused()
+        // to get a generated hidden class whose invokevirtual on concrete Layer
+        // types is monomorphic. If Pipeline.fused() regresses to the plain
+        // interface loop (invokeinterface), C2 stops inlining the layer chain
+        // and EA fails — allocation rate on send/recv spikes.
+        var pipeline = new Pipeline(new FramingLayer());
+        var fused = pipeline.fused();
+        assertNotNull(fused);
+        assertTrue(fused.getClass().isHidden(),
+                "Pipeline.fused() must return a hidden class; got " + fused.getClass());
+        assertFalse(java.lang.reflect.Proxy.isProxyClass(fused.getClass()),
+                "Pipeline.fused() must not be a java.lang.reflect.Proxy");
+        // Stable: the same pipeline returns the same fused instance (cached).
+        assertSame(fused, pipeline.fused());
+    }
+
+    @Test
+    void fused_roundtrip_matchesPlainPipeline() {
+        // Fused must produce byte-identical output to the plain loop — they
+        // represent the same pipeline chain, different dispatch mechanism.
+        var pipeline = new Pipeline(new FramingLayer());
+        var fused = pipeline.fused();
+
+        var payload1 = ByteBuffer.allocate(32);
+        payload1.putInt(0xDEADBEEF);
+        payload1.flip();
+        var plainOut = ByteBuffer.allocate(64);
+        pipeline.encodeOutbound(payload1, plainOut);
+        plainOut.flip();
+
+        var payload2 = ByteBuffer.allocate(32);
+        payload2.putInt(0xDEADBEEF);
+        payload2.flip();
+        var fusedOut = ByteBuffer.allocate(64);
+        fused.encodeOutbound(payload2, fusedOut);
+        fusedOut.flip();
+
+        assertEquals(plainOut, fusedOut);
+    }
 }

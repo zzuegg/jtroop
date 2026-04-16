@@ -178,17 +178,22 @@ public final class Client implements AutoCloseable {
         }
         if (n > 0) {
             readBuf.flip();
-            var frame = config.pipeline().decodeInbound(readBuf);
+            // Hot path: fused pipeline. Monomorphic invokevirtual on the
+            // hidden class lets C2 inline the whole decode chain; the plain
+            // Pipeline.decodeInbound loops over Layer[] via invokeinterface
+            // which blocks inlining (CLAUDE.md rule 4).
+            var fused = config.pipeline().fused();
+            var frame = fused.decodeInbound(readBuf);
             while (frame != null) {
                 if (handshakePending.contains(config.connectionType())) {
                     processHandshakeResponse(frame, config);
-                    frame = config.pipeline().decodeInbound(readBuf);
+                    frame = fused.decodeInbound(readBuf);
                     continue;
                 }
                 var rb = new ReadBuffer(frame);
                 var message = codec.decode(rb);
                 handleIncoming(message);
-                frame = config.pipeline().decodeInbound(readBuf);
+                frame = fused.decodeInbound(readBuf);
             }
             readBuf.compact();
         }
@@ -362,7 +367,10 @@ public final class Client implements AutoCloseable {
         encode.flip();
 
         wire.clear();
-        config.pipeline().encodeOutbound(encode, wire);
+        // Hot path: fused pipeline (monomorphic invokevirtual → inlinable).
+        // Plain Pipeline.encodeOutbound uses invokeinterface on Layer[] which
+        // blocks C2 inlining and defeats EA on the record/wrapper chain.
+        config.pipeline().fused().encodeOutbound(encode, wire);
         wire.flip();
         return wire.remaining();
     }

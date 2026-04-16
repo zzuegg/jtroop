@@ -312,7 +312,13 @@ public final class Server implements AutoCloseable {
 
     private void processInbound(ByteBuffer wire, ConnectionId sender, ListenerConfig config,
                                 SocketChannel channel) {
-        var frame = config.pipeline().decodeInbound(wire);
+        // Hot path: fused (hidden-class, monomorphic invokevirtual) so C2 can
+        // inline the whole layer decode chain and EA can scalar-replace
+        // transient objects across it. Plain Pipeline.decodeInbound dispatches
+        // each Layer call via invokeinterface on Layer[], which blocks
+        // inlining (CLAUDE.md rule 4).
+        var fused = config.pipeline().fused();
+        var frame = fused.decodeInbound(wire);
         while (frame != null) {
             var rb = new ReadBuffer(frame);
             var message = codec.decode(rb);
@@ -325,7 +331,7 @@ public final class Server implements AutoCloseable {
                 }
             });
 
-            frame = config.pipeline().decodeInbound(wire);
+            frame = fused.decodeInbound(wire);
         }
     }
 
@@ -338,7 +344,8 @@ public final class Server implements AutoCloseable {
         encodeBuf.flip();
 
         wireBuf.clear();
-        config.pipeline().encodeOutbound(encodeBuf, wireBuf);
+        // Hot path: fused pipeline (monomorphic invokevirtual) — see processInbound.
+        config.pipeline().fused().encodeOutbound(encodeBuf, wireBuf);
         wireBuf.flip();
 
         // Multiple threads (worker loops + executor) may send to the same channel
