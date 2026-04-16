@@ -242,6 +242,27 @@ Server.builder()
     .listen(...)
 ```
 
+### Early Filters (rate limit, allow-list, slowloris guard)
+
+Layers receive a per-connection `Layer.Context` on every call: peer address, cumulative byte counters, connection timestamp, and graceful/abrupt close hooks. Put a filter layer at the **front** of the pipeline to reject bad peers before the framing/codec layers ever see their bytes.
+
+```java
+var allowList = new AllowListLayer(Set.of(
+        InetAddress.getByName("10.0.0.0/8"),
+        InetAddress.getByName("127.0.0.1")));
+
+var rateLimit = new RateLimitLayer(/* bytes/sec */ 1_000_000);
+
+Server.builder()
+    .listen(GameConn.class, Transport.tcp(8080),
+            allowList,          // ← checked first, closes connection on non-allowed peer
+            rateLimit,          // ← closes on byte budget overrun
+            new FramingLayer(), // ← never sees blocked peers' bytes
+            new HttpLayer());
+```
+
+`Layer.Context` accessors: `connectionId()`, `remoteAddress()`, `bytesRead()`, `bytesWritten()`, `connectedAtNanos()`, `closeAfterFlush()`, `closeNow()`. Writing your own filter is a ~20-line layer (see `AllowListLayer.java`, `RateLimitLayer.java` for templates).
+
 ### Runtime Pipeline Mutation (HTTP → WebSocket, STARTTLS, ALPN)
 
 The pipeline shape is normally fixed per connection-type so the fused hidden class can inline every layer call. For protocols that need to swap the parser mid-stream — HTTP→WebSocket upgrade, STARTTLS, HTTP/2 ALPN, PROXY-protocol strip, multi-protocol port sniffing — use `switchPipeline` with an `addFirst`/`remove`/`replace` edit:
@@ -291,6 +312,8 @@ forwarder.start();
 | Fused pipeline generation (hidden classes) | Done |
 | Runtime pipeline mutation (shape-cached fused class, safe swap) | Done |
 | HTTP → WebSocket upgrade e2e | Done |
+| Per-connection Layer.Context (peer addr, byte counters, close hooks) | Done |
+| Early-filter layers (AllowListLayer, RateLimitLayer) | Done |
 | MPSC ring buffer (lock-free, zero-alloc) | Done |
 | JMH benchmark suite (vs Netty 4.2, vs SpiderMonkey 3.7) | Done |
 
