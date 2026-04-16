@@ -209,6 +209,10 @@ public final class Server implements AutoCloseable {
         });
     }
 
+    // Dedicated UDP threads for connected-mode listeners (opt-in fast path).
+    // Kept here so {@link #close()} can signal shutdown via interrupt.
+    private final List<Thread> udpConnectedThreads = new ArrayList<>();
+
     private void startUdpListener(ListenerConfig config) throws IOException {
         var channel = java.nio.channels.DatagramChannel.open();
         channel.bind(config.transport().address());
@@ -216,6 +220,77 @@ public final class Server implements AutoCloseable {
         boundUdpPorts.put(config.connectionType(), port);
         udpChannels.put(config.connectionType(), channel);
 
+        // "Connected UDP" opt-in: when the transport is flagged connected, we
+        // skip the shared {@link Selector}-driven event loop and run a
+        // dedicated blocking thread that calls {@code channel.read(buf)}
+        // directly. The shared selector path allocates a {@code HashMap$KeyIterator}
+        // plus a {@code HashMap$Node} per packet (JDK selector internals —
+        // {@code SelectorImpl.processReadyEvents} + {@code HashSet.iterator});
+        // a dedicated thread with a blocking receive avoids both.
+        //
+        // Multi-peer ({@code Transport.udp(...)}) still uses the shared
+        // selector and pays the 32 B/op overhead — needed for the common case
+        // where the server must route datagrams from many clients on one port.
+        boolean connectedMode = ((jtroop.transport.UdpTransport) config.transport()).connected();
+
+        if (connectedMode) {
+            startConnectedUdpListener(channel, config);
+        } else {
+            startMultiPeerUdpListener(channel, config);
+        }
+    }
+
+    // Stable ConnectionId used for every packet on a connected-mode channel.
+    // With the channel pinned to a single peer, sender identity is implicit,
+    // so a constant id avoids ConnectionId construction AND address hashing.
+    private static final ConnectionId UDP_CONNECTED_SENDER = ConnectionId.of(1, 1);
+
+    private void startConnectedUdpListener(java.nio.channels.DatagramChannel channel,
+                                           ListenerConfig config) throws IOException {
+        // Blocking channel: read() parks the thread in the kernel — no JDK
+        // selector, no HashMap iterator allocation per packet.
+        channel.configureBlocking(true);
+
+        var thread = new Thread(() -> runConnectedUdpLoop(channel, config),
+                "server-udp-connected-" + config.connectionType().getSimpleName());
+        thread.setDaemon(true);
+        udpConnectedThreads.add(thread);
+        thread.start();
+    }
+
+    private void runConnectedUdpLoop(java.nio.channels.DatagramChannel channel,
+                                      ListenerConfig config) {
+        var readBuf = ByteBuffer.allocate(65536);
+        // First-packet setup: receive() returns the sender so we can pin the
+        // channel via connect(). Subsequent packets use read(), which avoids
+        // the per-packet {@link InetSocketAddress} allocation inside receive().
+        try {
+            while (!Thread.currentThread().isInterrupted() && acceptLoop.isRunning()) {
+                readBuf.clear();
+                if (!channel.isConnected()) {
+                    var remoteAddr = channel.receive(readBuf);
+                    if (remoteAddr == null) continue;
+                    try { channel.connect(remoteAddr); } catch (IOException _) {}
+                } else {
+                    int n = channel.read(readBuf);
+                    if (n <= 0) continue;
+                }
+                readBuf.flip();
+                if (readBuf.remaining() >= 2) {
+                    var rb = new ReadBuffer(readBuf);
+                    var message = codec.decode(rb);
+                    serviceRegistry.dispatch(message, UDP_CONNECTED_SENDER);
+                }
+            }
+        } catch (ClosedChannelException _) {
+            // Normal shutdown (includes AsynchronousCloseException)
+        } catch (Throwable t) {
+            System.err.println("Server: connected-UDP loop error: " + t);
+        }
+    }
+
+    private void startMultiPeerUdpListener(java.nio.channels.DatagramChannel channel,
+                                           ListenerConfig config) {
         var udpLoop = workerGroup.next();
         udpLoop.submit(() -> {
             try {
@@ -238,14 +313,14 @@ public final class Server implements AutoCloseable {
         readBuf.clear();
         // {@link DatagramChannel#receive} returns a fresh {@link
         // InetSocketAddress} per packet for unconnected channels (~32 B/op).
-        // This is the server's bottleneck for zero-alloc UDP — accepting it
-        // for now since multi-peer semantics require knowing the source.
+        // Unavoidable for multi-peer — required to route the response. Use
+        // {@link Transport#udpConnected(int)} for the zero-alloc 1:1 fast path.
         var remoteAddr = channel.receive(readBuf);
         if (remoteAddr == null) return;
         readBuf.flip();
 
-        // For UDP, use a synthetic ConnectionId based on remote address hash
-        // (simplified — real impl would track UDP sessions)
+        // Synthetic ConnectionId based on remote address hash (simplified —
+        // real impl would track UDP sessions).
         var connId = ConnectionId.of(remoteAddr.hashCode() & 0x7FFFFFFF % 4096, 1);
 
         // Decode message directly (no framing needed for UDP — datagrams are self-delimiting)
@@ -504,6 +579,15 @@ public final class Server implements AutoCloseable {
     public void close() {
         acceptLoop.close();
         workerGroup.close();
+        // Shut down the connected-UDP dedicated threads. Closing the channel
+        // unblocks the blocking read() with AsynchronousCloseException.
+        for (var ch : udpChannels.values()) {
+            try { ch.close(); } catch (IOException _) {}
+        }
+        for (var t : udpConnectedThreads) {
+            t.interrupt();
+            try { t.join(500); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
+        }
     }
 
     public static Builder builder() {

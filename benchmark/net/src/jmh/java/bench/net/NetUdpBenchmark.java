@@ -75,15 +75,18 @@ public class NetUdpBenchmark {
     @Setup(Level.Trial)
     public void setup() throws Exception {
         var handler = new GameHandler();
+        // Single-peer benchmark: use connected-UDP transport. Server promotes
+        // its DatagramChannel to connected on first packet → subsequent reads
+        // skip the per-packet InetSocketAddress allocation (~32 B/op).
         server = Server.builder()
-                .listen(BenchConn.class, Transport.udp(0))
+                .listen(BenchConn.class, Transport.udpConnected(0))
                 .addService(handler, BenchConn.class)
                 .build();
         server.start();
         int port = server.udpPort(BenchConn.class);
 
         client = Client.builder()
-                .connect(BenchConn.class, Transport.udp("localhost", port))
+                .connect(BenchConn.class, Transport.udpConnected("localhost", port))
                 .addService(GameService.class, BenchConn.class)
                 .build();
         client.start();
