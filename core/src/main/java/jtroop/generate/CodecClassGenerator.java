@@ -26,6 +26,7 @@ public final class CodecClassGenerator {
     private static final ClassDesc CD_Record = ClassDesc.of("java.lang.Record");
     private static final ClassDesc CD_ByteBuffer = ClassDesc.of("java.nio.ByteBuffer");
     private static final ClassDesc CD_String = ClassDesc.of("java.lang.String");
+    private static final ClassDesc CD_CharSequence = ClassDesc.of("java.lang.CharSequence");
     private static final ClassDesc CD_GeneratedCodec = ClassDesc.of(
             "jtroop.generate.CodecClassGenerator$GeneratedCodec");
 
@@ -73,9 +74,14 @@ public final class CodecClassGenerator {
                             var accessorDesc = MethodTypeDesc.of(classDescFor(rc.getType()));
                             b.invokevirtual(recordDesc, rc.getName(), accessorDesc);
 
-                            // Call ByteBuffer.putXxx
+                            // Call ByteBuffer.putXxx or static helper
                             emitPut(b, rc.getType());
-                            b.pop(); // discard ByteBuffer return
+                            // putXxx returns ByteBuffer; static helpers return void.
+                            if (rc.getType() != String.class
+                                    && rc.getType() != CharSequence.class
+                                    && rc.getType() != boolean.class) {
+                                b.pop(); // discard ByteBuffer return
+                            }
                         }
                         b.return_();
                     });
@@ -158,6 +164,10 @@ public final class CodecClassGenerator {
             b.invokestatic(ClassDesc.of("jtroop.generate.CodecClassGenerator"),
                     "writeString",
                     MethodTypeDesc.of(ConstantDescs.CD_void, CD_ByteBuffer, CD_String));
+        } else if (type == CharSequence.class) {
+            b.invokestatic(ClassDesc.of("jtroop.generate.CodecClassGenerator"),
+                    "writeCharSequence",
+                    MethodTypeDesc.of(ConstantDescs.CD_void, CD_ByteBuffer, CD_CharSequence));
         }
     }
 
@@ -188,6 +198,10 @@ public final class CodecClassGenerator {
             b.invokestatic(ClassDesc.of("jtroop.generate.CodecClassGenerator"),
                     "readString",
                     MethodTypeDesc.of(CD_String, CD_ByteBuffer));
+        } else if (type == CharSequence.class) {
+            b.invokestatic(ClassDesc.of("jtroop.generate.CodecClassGenerator"),
+                    "readCharSequence",
+                    MethodTypeDesc.of(CD_CharSequence, CD_ByteBuffer));
         }
     }
 
@@ -200,6 +214,7 @@ public final class CodecClassGenerator {
         if (type == short.class) return ConstantDescs.CD_short;
         if (type == boolean.class) return ConstantDescs.CD_boolean;
         if (type == String.class) return CD_String;
+        if (type == CharSequence.class) return CD_CharSequence;
         return ClassDesc.of(type.getName());
     }
 
@@ -215,5 +230,13 @@ public final class CodecClassGenerator {
 
     public static String readString(ByteBuffer buf) {
         return jtroop.core.ReadBuffer.readUtf8(buf);
+    }
+
+    public static void writeCharSequence(ByteBuffer buf, CharSequence value) {
+        jtroop.core.WriteBuffer.writeUtf8CharSequence(buf, value);
+    }
+
+    public static CharSequence readCharSequence(ByteBuffer buf) {
+        return jtroop.core.ReadBuffer.readUtf8CharSequence(buf);
     }
 }

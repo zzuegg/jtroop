@@ -14,6 +14,7 @@ class GeneratedCodecTest {
     public record FloatMsg(float a, float b, float c) {}
     public record MixedMsg(int id, float value, long timestamp) {}
     public record StringMsg(String text, int code) {}
+    public record CharSeqMsg(CharSequence text, int code) {}
 
     @Test
     void generatedCodec_encodeDecode_simpleMsg() {
@@ -65,6 +66,52 @@ class GeneratedCodecTest {
         buf.flip();
         var decoded = codec.decode(new ReadBuffer(buf));
         assertEquals(msg, decoded);
+    }
+
+    @Test
+    void generatedCodec_encodeDecode_charSequenceMsg() {
+        var codec = new CodecRegistry();
+        codec.register(CharSeqMsg.class);
+
+        var buf = ByteBuffer.allocate(256);
+        var msg = new CharSeqMsg("hello world", 200);
+        codec.encode(msg, new WriteBuffer(buf));
+        buf.flip();
+        var decoded = (CharSeqMsg) codec.decode(new ReadBuffer(buf));
+        assertEquals("hello world", decoded.text().toString());
+        assertEquals(200, decoded.code());
+    }
+
+    @Test
+    void generatedCodec_charSequenceMsg_usesBufferCharSequence() {
+        var codec = new CodecRegistry();
+        codec.register(CharSeqMsg.class);
+
+        var buf = ByteBuffer.allocate(256);
+        var msg = new CharSeqMsg("test", 1);
+        codec.encode(msg, new WriteBuffer(buf));
+        buf.flip();
+        var decoded = (CharSeqMsg) codec.decode(new ReadBuffer(buf));
+        assertInstanceOf(jtroop.core.BufferCharSequence.class, decoded.text());
+    }
+
+    @Test
+    void generatedCodec_charSequenceMsg_reencodes() {
+        var codec = new CodecRegistry();
+        codec.register(CharSeqMsg.class);
+
+        // Encode with String, decode to CharSequence, re-encode, re-decode
+        var buf = ByteBuffer.allocate(256);
+        codec.encode(new CharSeqMsg("round trip", 42), new WriteBuffer(buf));
+        buf.flip();
+        var first = (CharSeqMsg) codec.decode(new ReadBuffer(buf));
+
+        buf.clear();
+        codec.encode(first, new WriteBuffer(buf));
+        buf.flip();
+        var second = (CharSeqMsg) codec.decode(new ReadBuffer(buf));
+        assertEquals("round trip", second.text().toString());
+        assertEquals(42, second.code());
     }
 
     @Test

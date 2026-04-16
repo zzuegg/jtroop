@@ -39,6 +39,17 @@ public final class ReadBuffer {
         return readUtf8(buf);
     }
 
+    /**
+     * Reads a length-prefixed UTF-8 string as a zero-allocation {@link CharSequence}.
+     * The returned {@link BufferCharSequence} wraps a per-thread scratch buffer
+     * (or the heap-backed ByteBuffer's array directly) — no {@code String} or
+     * {@code byte[]} is allocated. If the caller needs a {@code String}, call
+     * {@link CharSequence#toString()} which materializes it once.
+     */
+    public CharSequence readCharSequence() {
+        return readUtf8CharSequence(buf);
+    }
+
     public byte[] readBytes(int length) {
         var bytes = new byte[length];
         buf.get(bytes);
@@ -91,5 +102,30 @@ public final class ReadBuffer {
         }
         buf.get(scratch, 0, len);
         return new String(scratch, 0, len, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Reads a length-prefixed UTF-8 string as a zero-allocation {@link BufferCharSequence}.
+     * For heap-backed ByteBuffers, wraps the backing array directly — no copy at all.
+     * For direct ByteBuffers, copies into a per-thread scratch and wraps that.
+     * No {@code String} or internal {@code byte[]} is ever allocated on this path.
+     */
+    public static CharSequence readUtf8CharSequence(ByteBuffer buf) {
+        int len = buf.getShort() & 0xFFFF;
+        if (len == 0) return "";
+        if (buf.hasArray()) {
+            byte[] arr = buf.array();
+            int off = buf.arrayOffset() + buf.position();
+            buf.position(buf.position() + len);
+            return new BufferCharSequence(arr, off, len);
+        }
+        byte[] scratch = SCRATCH.get();
+        if (scratch.length < len) {
+            int newCap = Integer.highestOneBit(len - 1) << 1;
+            scratch = new byte[newCap];
+            SCRATCH.set(scratch);
+        }
+        buf.get(scratch, 0, len);
+        return new BufferCharSequence(scratch, 0, len);
     }
 }

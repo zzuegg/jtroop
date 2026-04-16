@@ -33,7 +33,7 @@ public class NetGameBenchmark {
 
     // Message records
     public record PositionUpdate(float x, float y, float z, float yaw) {}
-    public record ChatMessage(String text, int room) {}
+    public record ChatMessage(CharSequence text, int room) {}
     /** Same wire shape as ChatMessage but a distinct type id so a zero-alloc
      *  handler can be registered alongside the record-path handler without
      *  colliding. Identical payload keeps the comparison honest. */

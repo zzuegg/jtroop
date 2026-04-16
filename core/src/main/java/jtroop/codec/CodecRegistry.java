@@ -82,6 +82,13 @@ public final class CodecRegistry {
         @Override public Object decode(ReadBuffer rb) { return rb.readString(); }
     }
 
+    private record CharSequenceCodec() implements ComponentCodec {
+        @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
+            WriteBuffer.writeUtf8CharSequence(buf, (CharSequence) accessor.invoke(msg));
+        }
+        @Override public Object decode(ReadBuffer rb) { return rb.readCharSequence(); }
+    }
+
     private record BooleanCodec() implements ComponentCodec {
         @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
             buf.put((byte) ((boolean) accessor.invoke(msg) ? 1 : 0));
@@ -218,6 +225,7 @@ public final class CodecRegistry {
         if (type == short.class || type == Short.class) return new ShortCodec();
         if (type == boolean.class || type == Boolean.class) return new BooleanCodec();
         if (type == String.class) return new StringCodec();
+        if (type == CharSequence.class) return new CharSequenceCodec();
         throw new IllegalArgumentException("Unsupported component type: " + type.getName());
     }
 

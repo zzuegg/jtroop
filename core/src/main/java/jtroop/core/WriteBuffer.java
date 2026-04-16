@@ -38,6 +38,10 @@ public final class WriteBuffer {
         writeUtf8(buf, value);
     }
 
+    public void writeCharSequence(CharSequence value) {
+        writeUtf8CharSequence(buf, value);
+    }
+
     public void writeBytes(byte[] bytes) {
         buf.put(bytes);
     }
@@ -137,5 +141,58 @@ public final class WriteBuffer {
             int byteLen = buf.position() - startPos;
             buf.putShort(lenPos, (short) byteLen);
         }
+    }
+
+    /**
+     * Writes a length-prefixed UTF-8 {@link CharSequence} directly into the ByteBuffer.
+     * If the value is a {@link String}, delegates to {@link #writeUtf8(ByteBuffer, String)}.
+     * If it is a {@link BufferCharSequence}, copies the raw UTF-8 bytes directly — zero
+     * decode/re-encode overhead.
+     * Otherwise, iterates chars and encodes UTF-8 inline.
+     */
+    public static void writeUtf8CharSequence(ByteBuffer buf, CharSequence value) {
+        if (value instanceof String s) {
+            writeUtf8(buf, s);
+            return;
+        }
+        if (value instanceof BufferCharSequence bcs) {
+            // Fast path: copy raw UTF-8 bytes directly — no char decode needed.
+            buf.putShort((short) bcs.byteLength());
+            // BufferCharSequence wraps a byte[] region; copy it out.
+            buf.put(bcs.backingArray(), bcs.backingOffset(), bcs.byteLength());
+            return;
+        }
+        // Generic CharSequence path: encode char-by-char
+        int lenPos = buf.position();
+        int startPos = lenPos + 2;
+        buf.position(startPos);
+        int n = value.length();
+        int i = 0;
+        while (i < n) {
+            char c = value.charAt(i);
+            if (c < 0x80) {
+                buf.put((byte) c);
+                i++;
+            } else if (c < 0x800) {
+                buf.put((byte) (0xC0 | (c >> 6)));
+                buf.put((byte) (0x80 | (c & 0x3F)));
+                i++;
+            } else if (Character.isHighSurrogate(c) && i + 1 < n
+                    && Character.isLowSurrogate(value.charAt(i + 1))) {
+                int cp = Character.toCodePoint(c, value.charAt(i + 1));
+                buf.put((byte) (0xF0 | (cp >> 18)));
+                buf.put((byte) (0x80 | ((cp >> 12) & 0x3F)));
+                buf.put((byte) (0x80 | ((cp >> 6) & 0x3F)));
+                buf.put((byte) (0x80 | (cp & 0x3F)));
+                i += 2;
+            } else {
+                buf.put((byte) (0xE0 | (c >> 12)));
+                buf.put((byte) (0x80 | ((c >> 6) & 0x3F)));
+                buf.put((byte) (0x80 | (c & 0x3F)));
+                i++;
+            }
+        }
+        int byteLen = buf.position() - startPos;
+        buf.putShort(lenPos, (short) byteLen);
     }
 }
