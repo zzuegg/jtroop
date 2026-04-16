@@ -10,6 +10,8 @@ import jtroop.service.ServiceRegistry;
 import jtroop.transport.Transport;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
@@ -18,6 +20,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 public final class Client implements AutoCloseable {
 
@@ -57,7 +60,29 @@ public final class Client implements AutoCloseable {
     private final Map<Class<? extends Record>, ConnectionConfig> udpConfigByType = new HashMap<>();
     private final java.util.concurrent.Executor executor;
     private final Set<Class<? extends Record>> datagramMessageTypes;
-    private final Map<Integer, CompletableFuture<Record>> pendingRequests = new ConcurrentHashMap<>();
+
+    // Slot-based pending request ring. Zero-allocation request/response:
+    //  - request(): atomic-claim a slot, publish thread, park.
+    //  - reader thread: scan for first pending slot, deposit response, unpark.
+    // No CompletableFuture per call, no Integer boxing, no HashMap entry.
+    // 256 slots supports up to 256 in-flight requests per Client (typical: 1-4).
+    private static final int REQ_SLOTS = 256;
+    private static final int REQ_MASK = REQ_SLOTS - 1;
+    private static final VarHandle REQ_WAITER;
+    private static final VarHandle REQ_RESPONSE;
+    static {
+        try {
+            REQ_WAITER = MethodHandles.arrayElementVarHandle(Thread[].class);
+            REQ_RESPONSE = MethodHandles.arrayElementVarHandle(Record[].class);
+        } catch (Throwable t) {
+            throw new ExceptionInInitializerError(t);
+        }
+    }
+    final Thread[] reqWaiters = new Thread[REQ_SLOTS];
+    final Record[] reqResponses = new Record[REQ_SLOTS];
+    // Reader drain cursor: only mutated on the event-loop thread. Scanning
+    // from here preserves FIFO response-to-waiter matching (legacy behaviour).
+    private int reqDrainCursor = 0;
     private final Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers;
     private final Map<Class<? extends Record>, Record> handshakeInstances;
     private final Map<Class<? extends Record>, CompletableFuture<Record>> handshakeResults = new ConcurrentHashMap<>();
@@ -238,12 +263,22 @@ public final class Client implements AutoCloseable {
             handler.accept(message);
             return;
         }
-        // Then: check if this is a response to a pending request
-        for (var entry : pendingRequests.entrySet()) {
-            var future = entry.getValue();
-            if (!future.isDone()) {
-                future.complete(message);
-                pendingRequests.remove(entry.getKey());
+        // Then: match against pending request slots. We scan from reqDrainCursor
+        // forward (FIFO) and deliver to the first pending waiter. This preserves
+        // the legacy "first pending wins" semantics without a HashMap scan,
+        // without per-call CompletableFuture allocation, and without Integer
+        // boxing of request ids. Hot path is an array walk + varhandle swap.
+        int start = reqDrainCursor;
+        for (int i = 0; i < REQ_SLOTS; i++) {
+            int slot = (start + i) & REQ_MASK;
+            var waiter = (Thread) REQ_WAITER.getAcquire(reqWaiters, slot);
+            if (waiter != null) {
+                REQ_RESPONSE.setRelease(reqResponses, slot, message);
+                // Clear waiter marker *before* unparking so a re-use of the slot
+                // by the same thread can't race with a stale unpark.
+                REQ_WAITER.setRelease(reqWaiters, slot, (Thread) null);
+                LockSupport.unpark(waiter);
+                reqDrainCursor = (slot + 1) & REQ_MASK;
                 return;
             }
         }
@@ -378,16 +413,31 @@ public final class Client implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public <T extends Record> T request(Record message, Class<T> responseType) {
-        var future = new CompletableFuture<Record>();
-        int reqId = requestIdCounter.getAndIncrement();
-        pendingRequests.put(reqId, future);
+        // Zero-alloc request: claim a slot in the flat ring, publish our
+        // thread, send, park until reader deposits response + unparks.
+        // No CompletableFuture (waiter list allocation), no Map entry, no
+        // Integer boxing. The slot index stays as an int local → EA-friendly.
+        int slot = requestIdCounter.getAndIncrement() & REQ_MASK;
+        Thread self = Thread.currentThread();
+        // Publish waiter *before* send so the reader can't see a response
+        // without also seeing the thread to unpark.
+        REQ_WAITER.setRelease(reqWaiters, slot, self);
         send(message);
-        try {
-            return (T) future.get(5, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            pendingRequests.remove(reqId);
-            throw new RuntimeException("Request failed", e);
+        long deadlineNs = System.nanoTime() + 5_000_000_000L;
+        Record response;
+        while ((response = (Record) REQ_RESPONSE.getAcquire(reqResponses, slot)) == null) {
+            long remaining = deadlineNs - System.nanoTime();
+            if (remaining <= 0) {
+                // Timed out — clear slot so reader doesn't fire a stale unpark.
+                REQ_WAITER.setRelease(reqWaiters, slot, (Thread) null);
+                throw new RuntimeException("Request failed: timeout");
+            }
+            LockSupport.parkNanos(remaining);
         }
+        // Clear response slot for reuse. The waiter slot was cleared by the
+        // reader when it deposited the response.
+        REQ_RESPONSE.setRelease(reqResponses, slot, (Record) null);
+        return (T) response;
     }
 
     @SuppressWarnings("unchecked")
@@ -402,28 +452,23 @@ public final class Client implements AutoCloseable {
     }
 
     private final Map<Class<?>, Object> proxyCache = new HashMap<>();
+    // Stable Consumer/BiFunction instances bound once; hands off to generated
+    // service proxies. Allocated once per Client → no per-call lambda capture.
+    private final java.util.function.Consumer<Record> sendFn = this::send;
+    private final java.util.function.BiFunction<Record, Class<?>, Record> requestFn =
+            (msg, rt) -> request(msg, (Class<? extends Record>) rt);
 
     @SuppressWarnings("unchecked")
     public <T> T service(Class<T> serviceInterface) {
-        return (T) proxyCache.computeIfAbsent(serviceInterface, iface ->
-                java.lang.reflect.Proxy.newProxyInstance(
-                        iface.getClassLoader(),
-                        new Class<?>[]{iface},
-                        (proxy, method, args) -> {
-                            if (method.getDeclaringClass() == Object.class) {
-                                return method.invoke(this, args);
-                            }
-                            if (args == null || args.length == 0) return null;
-                            var message = (Record) args[0];
-                            if (method.getReturnType() == void.class) {
-                                send(message);
-                                return null;
-                            } else {
-                                @SuppressWarnings("unchecked")
-                                var returnType = (Class<? extends Record>) method.getReturnType();
-                                return request(message, returnType);
-                            }
-                        }));
+        var existing = proxyCache.get(serviceInterface);
+        if (existing != null) return (T) existing;
+        // Typed hidden-class proxy: each service method becomes a concrete
+        // bytecode stub that forwards to sendFn / requestFn. No JDK Proxy,
+        // no per-call Object[] args, no reflective dispatch.
+        T proxy = jtroop.generate.ServiceProxyGenerator.generate(
+                serviceInterface, sendFn, requestFn);
+        proxyCache.put(serviceInterface, proxy);
+        return proxy;
     }
 
     /** Flush pending writes immediately. Call after send() for low-latency. */

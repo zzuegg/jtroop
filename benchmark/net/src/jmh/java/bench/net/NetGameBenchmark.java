@@ -35,11 +35,17 @@ public class NetGameBenchmark {
     public record PositionUpdate(float x, float y, float z, float yaw) {}
     public record ChatMessage(String text, int room) {}
     public record MoveAck(int ok) {}
+    public record EchoMsg(int seq) {}
+    public record EchoAck(int seq) {}
 
     // Service contract
     public interface GameService {
         void position(PositionUpdate pos);
         void chat(ChatMessage msg);
+    }
+
+    public interface EchoService {
+        EchoAck echo(EchoMsg msg);
     }
 
     // Handler
@@ -54,10 +60,18 @@ public class NetGameBenchmark {
         }
     }
 
+    @Handles(EchoService.class)
+    public static class EchoHandler {
+        @OnMessage EchoAck echo(EchoMsg msg, ConnectionId sender) {
+            return new EchoAck(msg.seq());
+        }
+    }
+
     record BenchConn(int v) {}
 
     private Server server;
     private Client client;
+    private EchoService echo;
 
     // --- sessionIteration state ---
     // N=100 active connections sparsely distributed in a 4096-slot store,
@@ -76,9 +90,11 @@ public class NetGameBenchmark {
     @Setup(Level.Trial)
     public void setup() throws Exception {
         var handler = new GameHandler();
+        var echoHandler = new EchoHandler();
         server = Server.builder()
                 .listen(BenchConn.class, Transport.tcp(0), new FramingLayer())
                 .addService(handler, BenchConn.class)
+                .addService(echoHandler, BenchConn.class)
                 .build();
         server.start();
         int port = server.port(BenchConn.class);
@@ -86,9 +102,14 @@ public class NetGameBenchmark {
         client = Client.builder()
                 .connect(BenchConn.class, Transport.tcp("localhost", port), new FramingLayer())
                 .addService(GameService.class, BenchConn.class)
+                .addService(EchoService.class, BenchConn.class)
                 .build();
         client.start();
         Thread.sleep(500); // wait for connection
+
+        echo = client.service(EchoService.class);
+        // warm up request/response path
+        for (int i = 0; i < 100; i++) echo.echo(new EchoMsg(i));
 
         // --- Build a sparse N=100 active session set for sessionIteration.
         sessionStore = new SessionStore(SESSION_CAPACITY);
@@ -152,6 +173,11 @@ public class NetGameBenchmark {
     @Benchmark
     public void chatMessage_blocking() {
         client.sendBlocking(new ChatMessage(GameMessages.CHAT_TEXT, 1));
+    }
+
+    @Benchmark
+    public EchoAck requestResponse() {
+        return echo.echo(new EchoMsg(1));
     }
 
     @Benchmark
