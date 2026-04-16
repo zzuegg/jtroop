@@ -14,21 +14,19 @@ All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. J
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|----------------|-----------|------------------|
-| positionUpdate | 27,506 | 4,762 | 12,624 | 625 |
-| chatMessage (record) | 13,516 | 4,067 | 13,314 | 609 |
-| chatMessage (@ZeroAlloc) | **13,713** | — | — | — |
-| mixedTraffic (10 msg) | 2,047 | — | 1,277 | 61 |
+| positionUpdate | **45,038** | 4,762 | 12,624 | 625 |
+| chatMessage (CharSequence) | **20,820** | 4,067 | 13,314 | 609 |
+| mixedTraffic (10 msg) | **3,772** | — | 1,277 | 61 |
 | requestResponse (RPC) | 945 | — | — | — |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|----------------|-----------|------------------|
-| positionUpdate | **~10⁻⁴** | **0.001** | 1,110 | 449 |
-| chatMessage (record) | 384 | 384 | 1,577 | 840 |
-| chatMessage (@ZeroAlloc) | **24** | — | — | — |
-| mixedTraffic (10 msg) | 1,440 | — | 12,272 | 6,391 |
-| requestResponse (RPC) | **88** | — | — | — |
+| positionUpdate | **0.022** | **0.001** | 1,110 | 449 |
+| chatMessage (CharSequence) | **0.048** | — | 1,577 | 840 |
+| mixedTraffic (10 msg) | **304** | — | 12,272 | 6,391 |
+| requestResponse (RPC) | 88 | — | — | — |
 
 ### Layer overhead (B/op)
 
@@ -51,15 +49,15 @@ External load generator, "Hello, World!" responses through the full HTTP pipelin
 
 ### Notes
 
-- **jtroop fire-and-forget** `positionUpdate`: stages encoded bytes into a pre-allocated direct ByteBuffer. Under broadcast-connection load the selector-Consumer form of EventLoop dispatch drove residual allocation from 0.019 → ~10⁻⁴ B/op (below any reliable measurement).
-- **jtroop blocking** `positionUpdate_blocking`: direct-write fast path under the per-slot buffer lock when nothing is staged — bypasses the selector wakeup. Dropped from 16 B/op → 0.001 B/op across two optimisation rounds; 987 → 4,762 ops/ms.
-- **`chatMessage (@ZeroAlloc)`**: opt-in handler dispatch via `@ZeroAlloc(ChatMessage.class)` routes the inbound frame straight to a hidden-class `RawHandlerInvoker` taking `(ByteBuffer, ConnectionId, Broadcast, Unicast)`. Skips codec-decode entirely; 24 B/op is just the ChatMessage record the legacy handler still constructs for the server-side work. Legacy record-parameter handler continues to work (back-compat).
-- **`requestResponse`**: the response decode now happens on the **waiter's stack** (not the EventLoop thread) — the waiter's scratch ByteBuffer is filled with raw bytes, parked/unparked, and then decoded locally, keeping the record EA-eligible. 184 → 88 B/op.
+- **positionUpdate 45K ops/ms**: per-message-type cached `TcpSendCtx` reduces 5-7 map lookups per send to 1. For fixed-size primitive records with a single FramingLayer, a single-buffer shortcut writes the 4-byte length prefix + codec.encode directly into wireBuf — skipping the intermediate encodeBuf and the fused pipeline entirely. 64KB write buffers prevent back-pressure stalls at high throughput.
+- **chatMessage 0.048 B/op**: round 4 discovered and fixed a **bytecode-generation bug** in `CodecClassGenerator.emitPut` — String fields emitted a `POP` after `invokestatic` (which returns void), causing stack underflow → silent fallback to reflective decode with `Object[]` + boxing (~312 B/op). The 384 B/op we chased for three rounds was mostly this bug. Combined with `BufferCharSequence` (zero-copy `CharSequence` backed by the wire buffer's heap array), chatMessage allocation dropped from 384 → 0.048 B/op and throughput rose from 13.5K → 20.8K ops/ms.
+- **`FusedReceiverGenerator`**: generates a single hidden class per (pipeline-shape × handler-set) that fuses framing → typeId switch → inline field decode → monomorphic handler call in one method. No intermediate ByteBuffer, no Record, no ReadBuffer. Server read loop is +60% vs the 3-stage path.
 - **Netty**: jtroop beats Netty 4.2 on every JMH benchmark and on HTTP at ≥ 8 wrk threads:
-  - 2.2× throughput, ~11,000,000× less allocation on `positionUpdate`
+  - 3.6× throughput, ~50,000× less allocation on `positionUpdate`
   - 27× throughput on `positionUpdate_blocking`
-  - Throughput parity, 4× less allocation on `chatMessage` (record); 17× less alloc with `@ZeroAlloc`
-  - 18–25% more HTTP req/s at `-t8/-t16/-t32 -c400`
+  - 1.6× throughput, ~33,000× less allocation on `chatMessage`
+  - 3× throughput, 40× less allocation on `mixedTraffic`
+  - 18–33% more HTTP req/s at `-t8/-t16/-t32 -c400`
 - **SpiderMonkey**: stable but throughput limited by thread-per-kernel model and reflection-based serialization.
 - All JMH benchmarks encode/decode through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
 - The `-t4 -c100` HTTP regression is real: at low concurrency jtroop's SO_REUSEPORT fan-out leaves some workers idle (wrk's threads can't saturate N loops), so per-connection overhead dominates and Netty's queue batching wins narrowly. Past `-t8` the fan-out pays off.
@@ -347,6 +345,7 @@ jtroop/
 | Agent sweep (9 worktrees) | 0.03 | 27,963 | SoA session store, flat codec table, hidden-class service dispatch, cached framing view, zero-alloc UDP dup filter, back-pressure correctness, large-message path, malformed-input hardening, HTTP/1.1 robustness |
 | Agent sweep II (11 worktrees) | 0.019 | 29,722 | Zero-alloc UTF-8 String codec, MPSC setup queue, blocking-send direct-write fast path, zero-alloc RPC ring + typed proxy, broadcast encode-once fan-out, UDP JMH bench + AckLayer SoA, fused-pipeline wired onto hot paths, primitive-long session iteration |
 | Agent sweep III (10 worktrees) | ~10⁻⁴ | 27,506 | `@ZeroAlloc` handler opt-in (24 B/op chat), Deflater/Cipher pooling, connected-UDP mode (0.004 B/op), flat slot→channel array for broadcast, select(Consumer) eliminates HashIterator, adaptive selectNow, HTTP SO_REUSEPORT, waiter-side RPC decode |
+| Agent sweep IV (20 worktrees) | 0.022 | 45,038 | **CodecClassGenerator bug fix** (String fields silently fell back to reflective decode), BufferCharSequence zero-copy, TcpSendCtx cache (5-7 lookups → 1), single-buffer framing shortcut, 64KB write buffers, FusedReceiverGenerator (pipeline+decode+dispatch in one hidden class), inline executor dispatch, latency profiling |
 
 See [docs/performance-journey.md](docs/performance-journey.md) for details.
 
