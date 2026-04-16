@@ -76,10 +76,8 @@ public final class CodecRegistry {
 
     private record StringCodec() implements ComponentCodec {
         @Override public void encodeDirect(MethodHandle accessor, Record msg, ByteBuffer buf) throws Throwable {
-            var value = (String) accessor.invoke(msg);
-            var bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            buf.putShort((short) bytes.length);
-            buf.put(bytes);
+            // Allocation-free: no intermediate byte[] from String.getBytes(UTF_8).
+            WriteBuffer.writeUtf8(buf, (String) accessor.invoke(msg));
         }
         @Override public Object decode(ReadBuffer rb) { return rb.readString(); }
     }

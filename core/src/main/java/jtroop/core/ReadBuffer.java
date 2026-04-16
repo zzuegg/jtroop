@@ -36,10 +36,7 @@ public final class ReadBuffer {
     }
 
     public String readString() {
-        int len = buf.getShort() & 0xFFFF;
-        var bytes = new byte[len];
-        buf.get(bytes);
-        return new String(bytes, StandardCharsets.UTF_8);
+        return readUtf8(buf);
     }
 
     public byte[] readBytes(int length) {
@@ -58,5 +55,41 @@ public final class ReadBuffer {
 
     public ByteBuffer buffer() {
         return buf;
+    }
+
+    // Per-thread scratch for the direct-buffer decode path: used only between
+    // `buf.get(scratch, ...)` and the `new String(scratch, ...)` call; never
+    // escapes. Heap-backed buffers skip this entirely and hand `buf.array()`
+    // directly to the String constructor.
+    private static final ThreadLocal<byte[]> SCRATCH =
+            ThreadLocal.withInitial(() -> new byte[256]);
+
+    /**
+     * Reads a length-prefixed UTF-8 string. The returned {@code String} and its
+     * internal backing array are the only unavoidable allocations:
+     *  - Heap-backed ByteBuffer: hands {@code buf.array()} straight to the
+     *    {@code String} constructor — no intermediate byte[] copy.
+     *  - Direct ByteBuffer: copies into a per-thread scratch byte[] that is
+     *    grown lazily, then hands that scratch to the {@code String}
+     *    constructor. The scratch is reused across calls.
+     */
+    public static String readUtf8(ByteBuffer buf) {
+        int len = buf.getShort() & 0xFFFF;
+        if (len == 0) return "";
+        if (buf.hasArray()) {
+            byte[] arr = buf.array();
+            int off = buf.arrayOffset() + buf.position();
+            buf.position(buf.position() + len);
+            return new String(arr, off, len, StandardCharsets.UTF_8);
+        }
+        byte[] scratch = SCRATCH.get();
+        if (scratch.length < len) {
+            // Grow to next power of two >= len. Rare path; afterwards reused.
+            int newCap = Integer.highestOneBit(len - 1) << 1;
+            scratch = new byte[newCap];
+            SCRATCH.set(scratch);
+        }
+        buf.get(scratch, 0, len);
+        return new String(scratch, 0, len, StandardCharsets.UTF_8);
     }
 }
