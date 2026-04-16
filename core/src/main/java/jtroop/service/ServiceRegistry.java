@@ -57,6 +57,7 @@ public final class ServiceRegistry {
         if (handles == null) {
             throw new IllegalArgumentException(handlerClass.getName() + " missing @Handles annotation");
         }
+        handlerInstanceList.add(handlerInstance);
         var serviceInterface = handles.value();
         handlerToInterface.put(handlerClass, serviceInterface);
         var messageTypes = interfaceToMessageTypes.computeIfAbsent(serviceInterface, _ -> new HashSet<>());
@@ -253,4 +254,16 @@ public final class ServiceRegistry {
     public CodecRegistry codec() {
         return codec;
     }
+
+    /** Returns all registered handler instances (distinct). Used by the fused
+     *  receiver generator to collect @OnMessage bindings at build time. */
+    public List<Object> handlerInstances() {
+        // Collect unique handler instances from the generated invokers.
+        // Each HandlerInvoker wraps a single handler instance — we need the
+        // originals for reflection scanning.
+        return List.copyOf(handlerInstanceList);
+    }
+
+    // Maintained alongside handlers map during register(Object).
+    private final List<Object> handlerInstanceList = new ArrayList<>();
 }

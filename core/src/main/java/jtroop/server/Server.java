@@ -6,10 +6,14 @@ import jtroop.core.EventLoopGroup;
 import jtroop.core.Handshake;
 import jtroop.core.ReadBuffer;
 import jtroop.core.WriteBuffer;
+import jtroop.generate.FusedReceiverGenerator;
+import jtroop.generate.FusedReceiverGenerator.FusedReceiver;
 import jtroop.pipeline.Layer;
 import jtroop.pipeline.LayerContext;
 import jtroop.pipeline.Pipeline;
+import jtroop.service.Broadcast;
 import jtroop.service.ServiceRegistry;
+import jtroop.service.Unicast;
 import jtroop.session.ConnectionId;
 import jtroop.session.SessionStore;
 import jtroop.transport.Transport;
@@ -89,6 +93,9 @@ public final class Server implements AutoCloseable {
     // (~40 B) that C2 cannot scalar-replace because the lambda escapes into
     // the non-inlined Executor.execute interface call (CLAUDE.md rule #4).
     private final boolean inlineExecutor;
+    // Fused receiver: single hidden class that does framing -> decode -> dispatch
+    // in one method. Null if no eligible handlers (e.g. all @ZeroAlloc or no handlers).
+    private volatile FusedReceiver fusedReceiver;
 
     @SuppressWarnings("rawtypes")
     private Server(List<ListenerConfig> listeners, ServiceRegistry serviceRegistry,
@@ -112,6 +119,26 @@ public final class Server implements AutoCloseable {
         // Wire broadcast and unicast
         serviceRegistry.setBroadcast(this::broadcastImpl);
         serviceRegistry.setUnicast(this::unicastImpl);
+
+        // Generate fused receiver after broadcast/unicast are wired so the
+        // generated hidden class captures the real implementations.
+        try {
+            var allBindings = new java.util.ArrayList<FusedReceiverGenerator.HandlerBinding>();
+            for (var handler : serviceRegistry.handlerInstances()) {
+                allBindings.addAll(
+                        FusedReceiverGenerator.collectBindings(handler, codec));
+            }
+            if (!allBindings.isEmpty() && !listeners.isEmpty()) {
+                var layers = listeners.getFirst().pipeline().layers();
+                this.fusedReceiver = FusedReceiverGenerator.generate(
+                        layers, allBindings,
+                        (Broadcast) this::broadcastImpl,
+                        (Unicast) this::unicastImpl);
+            }
+        } catch (Exception e) {
+            // Fall back to the 3-stage path if generation fails
+            System.err.println("FusedReceiver generation failed, using fallback: " + e);
+        }
     }
 
     // Reusable fan-out walker. broadcastImpl is serialized by broadcastLock
@@ -651,27 +678,46 @@ public final class Server implements AutoCloseable {
 
     private void processInbound(ByteBuffer wire, ConnectionId sender, ListenerConfig config,
                                 SocketChannel channel, LayerContext ctx) {
-        // Hot path: fused (hidden-class, monomorphic invokevirtual) so C2 can
-        // inline the whole layer decode chain and EA can scalar-replace
-        // transient objects across it. Plain Pipeline.decodeInbound dispatches
-        // each Layer call via invokeinterface on Layer[], which blocks
-        // inlining (CLAUDE.md rule 4).
-        var fused = config.pipeline().fused();
         Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+
+        // Fastest path: fused receiver does framing + decode + dispatch in one
+        // generated method. No intermediate Record, no ReadBuffer. The Record
+        // is constructed inline and scalar-replaced by C2 because the entire
+        // chain is in one method body.
+        //
+        // The fused receiver returns -1 when it encounters a type id it doesn't
+        // handle (e.g. response-returning handlers, @ZeroAlloc handlers). On -1,
+        // we fall through to the legacy per-frame path for one frame, then try
+        // the fused path again for subsequent frames.
+        if (fusedReceiver != null) {
+            while (true) {
+                int result = fusedReceiver.processInbound(lc, wire, sender);
+                if (result >= 0) {
+                    // Fused path handled all remaining frames (or none were available)
+                    return;
+                }
+                // result == -1: fused path rewound the frame for fallback.
+                // The frame is already decoded by the pipeline layers inside the
+                // fused receiver, and the ByteBuffer position is at the frame
+                // start (before typeId). We need to decode it via the standard path.
+                processOneFallbackFrame(wire, sender, config, channel, lc);
+            }
+        }
+
+        processInboundLegacy(wire, sender, config, channel, lc);
+    }
+
+    /** Standard 3-stage path: fused pipeline decode -> codec decode -> dispatch. */
+    private void processInboundLegacy(ByteBuffer wire, ConnectionId sender,
+                                       ListenerConfig config, SocketChannel channel,
+                                       Layer.Context lc) {
+        var fused = config.pipeline().fused();
         var frame = fused.decodeInbound(lc, wire);
         while (frame != null) {
-            // Peek the 2-byte type id before allocating anything. @ZeroAlloc
-            // handlers skip codec.decode entirely — no Record, no String, no
-            // byte[] — and run inline on this thread so the reused frame view
-            // stays valid.
             int typeId = frame.getShort() & 0xFFFF;
             if (serviceRegistry.hasRawHandler(typeId)) {
-                // No lambda capture, no executor handoff — monomorphic
-                // invokevirtual on the hidden-class RawHandlerInvoker.
                 serviceRegistry.dispatchRaw(typeId, frame, sender);
             } else {
-                // Fallback: rewind over the type id so codec.decode sees the
-                // full frame, decode Record, dispatch via executor as before.
                 frame.position(frame.position() - 2);
                 var rb = new ReadBuffer(frame);
                 var message = codec.decode(rb);
@@ -699,6 +745,34 @@ public final class Server implements AutoCloseable {
             }
 
             frame = fused.decodeInbound(lc, wire);
+        }
+    }
+
+    /** Process one frame via the legacy path when fusedReceiver returns -1.
+     *  The fused receiver rewound wire to before the frame it couldn't handle,
+     *  so the legacy path can re-decode it normally. We process exactly one
+     *  frame then return so the fused receiver can try again. */
+    private void processOneFallbackFrame(ByteBuffer wire, ConnectionId sender,
+                                          ListenerConfig config, SocketChannel channel,
+                                          Layer.Context lc) {
+        var fused = config.pipeline().fused();
+        var frame = fused.decodeInbound(lc, wire);
+        if (frame == null) return;
+
+        int typeId = frame.getShort() & 0xFFFF;
+        if (serviceRegistry.hasRawHandler(typeId)) {
+            serviceRegistry.dispatchRaw(typeId, frame, sender);
+        } else {
+            frame.position(frame.position() - 2);
+            var rb = new ReadBuffer(frame);
+            var message = codec.decode(rb);
+
+            executor.execute(() -> {
+                var result = serviceRegistry.dispatch(message, sender);
+                if (result instanceof Record response) {
+                    sendResponse(response, config, channel, sender);
+                }
+            });
         }
     }
 

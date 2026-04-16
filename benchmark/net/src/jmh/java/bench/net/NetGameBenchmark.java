@@ -5,6 +5,8 @@ import jtroop.client.Client;
 import jtroop.codec.CodecRegistry;
 import jtroop.core.ReadBuffer;
 import jtroop.core.WriteBuffer;
+import jtroop.generate.FusedReceiverGenerator;
+import jtroop.generate.FusedReceiverGenerator.FusedReceiver;
 import jtroop.pipeline.layers.FramingLayer;
 import jtroop.server.Server;
 import jtroop.service.*;
@@ -439,6 +441,90 @@ public class NetGameBenchmark {
     @Benchmark
     public int readLoop_serverExecutor(ReadLoopState s) {
         return s.drainOnceExecutor();
+    }
+
+    // --- Fused receiver read-loop microbenchmarks ----------------------------
+    //
+    // Exercises the FusedReceiverGenerator path: one generated hidden class does
+    // framing → decode → dispatch. No intermediate Record, ReadBuffer, or
+    // codec.decode call. The handler gets a freshly-constructed Record whose
+    // fields were read directly from the wire. EA scalar-replaces the Record
+    // because the entire chain is inlined by C2.
+
+    @State(Scope.Benchmark)
+    public static class FusedReadLoopState {
+        static final int FRAMES_PER_INVOCATION = 8;
+
+        ByteBuffer readBuf;
+        ByteBuffer sourceBuf;
+        CodecRegistry codec;
+        jtroop.pipeline.Pipeline pipeline;
+        FusedReceiver fusedReceiver;
+        final ConnectionId sender = ConnectionId.of(1, 1);
+
+        @Setup(Level.Trial)
+        public void setup() {
+            codec = new CodecRegistry();
+            codec.register(PositionUpdate.class);
+            codec.register(ChatMessage.class);
+
+            pipeline = new jtroop.pipeline.Pipeline(new FramingLayer());
+
+            // Build handler and collect bindings
+            var handler = new GameHandler();
+            var bindings = FusedReceiverGenerator.collectBindings(handler, codec);
+            var layers = pipeline.layers();
+            fusedReceiver = FusedReceiverGenerator.generate(
+                    layers, bindings, Broadcast.NO_OP, Unicast.NO_OP);
+
+            // Pre-encode frames
+            var encode = ByteBuffer.allocate(64);
+            var wire = ByteBuffer.allocate(256);
+            sourceBuf = ByteBuffer.allocate(FRAMES_PER_INVOCATION * 64);
+
+            for (int i = 0; i < FRAMES_PER_INVOCATION; i++) {
+                encode.clear();
+                codec.encode(new PositionUpdate(i, i, i, i), new jtroop.core.WriteBuffer(encode));
+                encode.flip();
+
+                wire.clear();
+                pipeline.encodeOutbound(encode, wire);
+                wire.flip();
+
+                sourceBuf.put(wire);
+            }
+            sourceBuf.flip();
+
+            readBuf = ByteBuffer.allocate(65536);
+
+            // Pre-warm
+            for (int i = 0; i < 20_000; i++) drainFused();
+        }
+
+        void refillReadBuf() {
+            readBuf.clear();
+            int pos = sourceBuf.position();
+            int lim = sourceBuf.limit();
+            readBuf.put(sourceBuf);
+            sourceBuf.position(pos);
+            sourceBuf.limit(lim);
+        }
+
+        int drainFused() {
+            refillReadBuf();
+            readBuf.flip();
+            int result = fusedReceiver.processInbound(
+                    jtroop.pipeline.LayerContext.NOOP, readBuf, sender);
+            readBuf.compact();
+            return result;
+        }
+    }
+
+    /** Fused receiver: framing + decode + dispatch in one generated method.
+     *  Target: > 35K ops/ms position updates, 0 B/op. */
+    @Benchmark
+    public int readLoop_fusedReceiver(FusedReadLoopState s) {
+        return s.drainFused();
     }
 
     // --- Direct dispatch microbenchmarks -------------------------------------
