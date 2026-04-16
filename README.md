@@ -242,6 +242,18 @@ Server.builder()
     .listen(...)
 ```
 
+### Runtime Pipeline Mutation (HTTP → WebSocket, STARTTLS, ALPN)
+
+The pipeline shape is normally fixed per connection-type so the fused hidden class can inline every layer call. For protocols that need to swap the parser mid-stream — HTTP→WebSocket upgrade, STARTTLS, HTTP/2 ALPN, PROXY-protocol strip, multi-protocol port sniffing — use `switchPipeline` with an `addFirst`/`remove`/`replace` edit:
+
+```java
+// Inside the HTTP handler, right after writing the 101 response:
+var wsPipeline = httpPipeline.replace(HttpLayer.class, new WebSocketLayer());
+server.switchPipeline(connId, wsPipeline);
+```
+
+The new pipeline's fused hidden class is looked up in a shape-indexed cache (generated on first sighting, reused thereafter) — each unique shape costs one-time codegen, subsequent swaps to the same shape are a pointer write. The swap itself runs on the connection's owning EventLoop so it's race-free with in-flight reads, and is frame-aligned (call from `@OnMessage` or a handshake callback so you're already between frames).
+
 ### Test Forwarder
 
 ```java
@@ -277,6 +289,8 @@ forwarder.start();
 | Protocol upgrade (server.switchPipeline()) | Done |
 | Bytecode-generated codecs (java.lang.classfile + hidden classes) | Done |
 | Fused pipeline generation (hidden classes) | Done |
+| Runtime pipeline mutation (shape-cached fused class, safe swap) | Done |
+| HTTP → WebSocket upgrade e2e | Done |
 | MPSC ring buffer (lock-free, zero-alloc) | Done |
 | JMH benchmark suite (vs Netty 4.2, vs SpiderMonkey 3.7) | Done |
 
