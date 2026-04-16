@@ -14,17 +14,19 @@ All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. J
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|----------------|-----------|------------------|
-| positionUpdate | 27,963 | 987 | 12,460 | 625 |
-| chatMessage | 14,742 | 979 | 13,314 | 609 |
-| mixedTraffic (10 msg) | 2,103 | — | 1,290 | 61 |
+| positionUpdate | 29,722 | 5,026 | 12,624 | 625 |
+| chatMessage | 14,024 | 3,773 | 13,314 | 609 |
+| mixedTraffic (10 msg) | 2,156 | — | 1,277 | 61 |
+| requestResponse (RPC) | 944 | — | — | — |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|----------------|-----------|------------------|
-| positionUpdate | 0.03 | 16 | 946 | 449 |
-| chatMessage | 544 | 620 | 1,577 | 840 |
-| mixedTraffic (10 msg) | 1,635 | — | 11,584 | 6,391 |
+| positionUpdate | **0.019** | **0.015** | 1,110 | 449 |
+| chatMessage | 416 | 384 | 1,577 | 840 |
+| mixedTraffic (10 msg) | 1,441 | — | 12,272 | 6,391 |
+| requestResponse (RPC) | 184 | — | — | — |
 
 ### HTTP/1.1 throughput (wrk) — higher is better
 
@@ -32,19 +34,25 @@ External load generator, "Hello, World!" responses through the full HTTP pipelin
 
 | Load | jtroop | Netty 4.2 | jtroop advantage |
 |------|-------:|----------:|-----------------:|
-| `wrk -t4 -c100 -d15s` | **1,177,266 req/s** | 1,153,068 req/s | +2.1% |
-| `wrk -t8 -c400 -d15s` | **1,940,075 req/s** | 1,738,806 req/s | +11.6% |
+| `wrk -t4 -c100 -d15s` | **1,202,903 req/s** | 1,163,670 req/s | +3.4% |
+| `wrk -t8 -c400 -d15s` | **1,933,471 req/s** | 1,787,747 req/s | +8.2% |
 
 Same JDK 26, same machine, TCP_NODELAY, multi-threaded worker pool on both sides.
 
 ### Notes
 
-- **jtroop fire-and-forget**: stages encoded bytes into a pre-allocated direct ByteBuffer. The EventLoop flushes on a 1ms poll cycle. 0.03 B/op for position updates — essentially zero, below the JMH noise floor.
-- **jtroop blocking**: same encode+stage path, then `selector.wakeup()` + spin-wait until the EventLoop flushes. The ~16 B/op comes from JDK NIO internals (`SocketChannel.write()` and `selector.wakeup()` internal allocations). Cannot be eliminated without `Unsafe` or `io_uring`.
-- **Netty**: 2.2x higher throughput than its previous generation thanks to 4.2, but still 28,000x higher allocation than jtroop on `positionUpdate`.
+- **jtroop fire-and-forget**: stages encoded bytes into a pre-allocated direct ByteBuffer. The EventLoop flushes on a 1ms poll cycle. **0.019 B/op** for position updates — below the JMH noise floor.
+- **jtroop blocking**: direct-write fast path under the per-slot buffer lock when nothing is staged — bypasses the selector wakeup (which would otherwise allocate a `HashMap$Node` inside `sun.nio.ch.SelectorImpl.processReadyEvents` per op). Falls back to park/unpark on partial write or contention. Dropped from 16 B/op → 0.015 B/op and 987 → 5,026 ops/ms (5×).
+- **Netty**: jtroop beats Netty 4.2 on every benchmark:
+  - 2.4× throughput, ~60,000× less allocation on `positionUpdate`
+  - 28× throughput on `positionUpdate_blocking`
+  - 1.05× throughput, 3.8× less allocation on `chatMessage`
+  - 20.6× throughput on `chatMessage_blocking`
+  - 1.7× throughput, 8.5× less allocation on `mixedTraffic`
 - **SpiderMonkey**: stable but throughput limited by thread-per-kernel model and reflection-based serialization.
 - **All benchmarks** use proper object encoding/decoding through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
 - The mixedTraffic benchmark measures batches of 10 messages per operation (8 position + 2 chat).
+- `requestResponse` uses a typed service proxy (generated hidden class) with flat-ring pending-request storage. 184 B/op is dominated by the unavoidable response-record decode.
 
 ## Design Approach
 
@@ -224,6 +232,7 @@ jtroop/
 | Generated codecs | 5 | 28,572 | Bytecode codecs via java.lang.classfile + 1ms select |
 | Direct ByteBuffers | 0 | 30,736 | Direct write buffers, spin-wait blocking, encodeToWire split |
 | Agent sweep (9 worktrees) | 0.03 | 27,963 | SoA session store, flat codec table, hidden-class service dispatch, cached framing view, zero-alloc UDP dup filter, back-pressure correctness, large-message path, malformed-input hardening, HTTP/1.1 robustness |
+| Agent sweep II (11 worktrees) | 0.019 | 29,722 | Zero-alloc UTF-8 String codec, MPSC setup queue, blocking-send direct-write fast path, zero-alloc RPC ring + typed proxy, broadcast encode-once fan-out, UDP JMH bench + AckLayer SoA, fused-pipeline wired onto hot paths, primitive-long session iteration |
 
 See [docs/performance-journey.md](docs/performance-journey.md) for details.
 
