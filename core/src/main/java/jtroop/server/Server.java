@@ -469,16 +469,30 @@ public final class Server implements AutoCloseable {
         var fused = config.pipeline().fused();
         var frame = fused.decodeInbound(wire);
         while (frame != null) {
-            var rb = new ReadBuffer(frame);
-            var message = codec.decode(rb);
+            // Peek the 2-byte type id before allocating anything. @ZeroAlloc
+            // handlers skip codec.decode entirely — no Record, no String, no
+            // byte[] — and run inline on this thread so the reused frame view
+            // stays valid.
+            int typeId = frame.getShort() & 0xFFFF;
+            if (serviceRegistry.hasRawHandler(typeId)) {
+                // No lambda capture, no executor handoff — monomorphic
+                // invokevirtual on the hidden-class RawHandlerInvoker.
+                serviceRegistry.dispatchRaw(typeId, frame, sender);
+            } else {
+                // Fallback: rewind over the type id so codec.decode sees the
+                // full frame, decode Record, dispatch via executor as before.
+                frame.position(frame.position() - 2);
+                var rb = new ReadBuffer(frame);
+                var message = codec.decode(rb);
 
-            // Dispatch to handler via executor (supports virtual threads)
-            executor.execute(() -> {
-                var result = serviceRegistry.dispatch(message, sender);
-                if (result instanceof Record response) {
-                    sendResponse(response, config, channel);
-                }
-            });
+                // Dispatch to handler via executor (supports virtual threads)
+                executor.execute(() -> {
+                    var result = serviceRegistry.dispatch(message, sender);
+                    if (result instanceof Record response) {
+                        sendResponse(response, config, channel);
+                    }
+                });
+            }
 
             frame = fused.decodeInbound(wire);
         }

@@ -34,6 +34,10 @@ public class NetGameBenchmark {
     // Message records
     public record PositionUpdate(float x, float y, float z, float yaw) {}
     public record ChatMessage(String text, int room) {}
+    /** Same wire shape as ChatMessage but a distinct type id so a zero-alloc
+     *  handler can be registered alongside the record-path handler without
+     *  colliding. Identical payload keeps the comparison honest. */
+    public record ChatMessageZ(String text, int room) {}
     public record MoveAck(int ok) {}
     public record EchoMsg(int seq) {}
     public record EchoAck(int seq) {}
@@ -42,6 +46,7 @@ public class NetGameBenchmark {
     public interface GameService {
         void position(PositionUpdate pos);
         void chat(ChatMessage msg);
+        void chatZ(ChatMessageZ msg);
     }
 
     public interface EchoService {
@@ -57,6 +62,31 @@ public class NetGameBenchmark {
 
         @OnMessage void chat(ChatMessage msg, ConnectionId sender) {
             // Process chat — in real game: broadcast
+        }
+
+        /**
+         * Zero-alloc chat handler. Framework skips codec.decode entirely —
+         * no ChatMessageZ record, no {@code new String(byte[], UTF_8)}, no
+         * intermediate byte[] — and hands us the payload view directly.
+         * Buffer position is at the start of the message body (after the
+         * 2-byte type id, which Server already consumed).
+         *
+         * Wire layout (matches StringCodec + IntCodec):
+         *   u16 textLen  |  textLen UTF-8 bytes  |  s32 room
+         *
+         * A real handler would either skip the bytes (as here), decode
+         * incrementally into reusable scratch, or forward the raw bytes
+         * straight to a broadcast encoder — all zero-alloc.
+         */
+        @OnMessage @ZeroAlloc(ChatMessageZ.class)
+        void chatZ(java.nio.ByteBuffer payload, ConnectionId sender) {
+            int textLen = payload.getShort() & 0xFFFF;
+            // Skip the UTF-8 text bytes — a real handler could checksum them
+            // or copy into reusable scratch; either way, zero alloc.
+            payload.position(payload.position() + textLen);
+            int room = payload.getInt();
+            // Touch `room` so the read isn't dead-code eliminated.
+            if (room == Integer.MIN_VALUE) throw new AssertionError("unreachable");
         }
     }
 
@@ -173,6 +203,19 @@ public class NetGameBenchmark {
     @Benchmark
     public void chatMessage_blocking() {
         client.sendBlocking(new ChatMessage(GameMessages.CHAT_TEXT, 1));
+    }
+
+    /**
+     * Opt-in zero-alloc path: same wire payload as {@link #chatMessage} but
+     * the server handler is declared {@code @ZeroAlloc(ChatMessageZ.class)} and
+     * takes a raw {@link java.nio.ByteBuffer} instead of the decoded record.
+     * Expected: no {@code new String(byte[], UTF_8)} on receive → receive-side
+     * B/op collapses (target ≤ 50 B/op total, vs the ~416 B/op the legacy
+     * record path costs).
+     */
+    @Benchmark
+    public void chatMessage_zeroAlloc() {
+        client.send(new ChatMessageZ(GameMessages.CHAT_TEXT, 1));
     }
 
     @Benchmark
