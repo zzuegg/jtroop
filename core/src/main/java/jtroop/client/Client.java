@@ -141,7 +141,17 @@ public final class Client implements AutoCloseable {
         config.pipeline().encodeOutbound(buf, wire);
         wire.flip();
 
-        try { channel.write(wire); } catch (IOException _) {}
+        // Non-blocking channel: write may be partial — loop until fully sent or
+        // the receiver stops accepting (deadline).
+        long deadlineNs = System.nanoTime() + 5_000_000_000L;
+        while (wire.hasRemaining()) {
+            int written;
+            try { written = channel.write(wire); } catch (IOException _) { return; }
+            if (written == 0) {
+                if (System.nanoTime() > deadlineNs) return;
+                Thread.onSpinWait();
+            }
+        }
     }
 
     private void connectUdp(ConnectionConfig config) throws IOException {

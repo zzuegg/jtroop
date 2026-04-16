@@ -12,7 +12,8 @@ public final class EventLoop implements Runnable, AutoCloseable {
 
     // VarHandles for release/acquire access to array slots so that writes
     // made by external threads are seen by the loop thread (and vice-versa)
-    // without resorting to full-volatile reads on every iteration.
+    // without full-volatile reads on every iteration. Also prevents the JIT
+    // from hoisting the stageWriteAndFlush spin-wait read out of its loop.
     private static final VarHandle PENDING_WRITE;
     private static final VarHandle WRITE_TARGETS;
     static {
@@ -30,11 +31,10 @@ public final class EventLoop implements Runnable, AutoCloseable {
 
     private final Queue<Runnable> setupQueue = new ConcurrentLinkedQueue<>();
 
-    // Hot path: per-slot write buffers with lightweight spin-lock
-    // Writer copies bytes in, sets dirty flag. EventLoop drains on each cycle.
     private final ByteBuffer[] writeBuffers;
     private final boolean[] pendingWrite;
     private final SocketChannel[] writeTargets;
+    private final Thread[] waitingThreads;
     private final int maxConnections;
     private volatile int activeSlots = 0;
 
@@ -68,38 +68,62 @@ public final class EventLoop implements Runnable, AutoCloseable {
 
     /**
      * Hot path: stage bytes for writing. Uses synchronized on the per-slot buffer
-     * (biased locking makes uncontended case ~6ns). EventLoop flushes on each cycle.
+     * (biased locking ~6ns uncontended).
+     *
+     * Back-pressure: if the staging buffer cannot hold the new data, we drain
+     * what the socket accepts (compact — no data loss), then wake the EventLoop
+     * so it can continue draining. If room is still unavailable, spin-yield up
+     * to 5s. No bytes are silently dropped.
      */
     public void stageWrite(int slot, ByteBuffer data) {
         var buf = writeBuffers[slot];
         var channel = (SocketChannel) WRITE_TARGETS.getAcquire(writeTargets, slot);
+        int need = data.remaining();
+        // Fast path: enough room, just put.
         synchronized (buf) {
-            if (buf.remaining() < data.remaining() && channel != null) {
-                buf.flip();
-                try { channel.write(buf); } catch (IOException _) {}
-                buf.clear();
+            if (buf.remaining() >= need) {
+                buf.put(data);
+                PENDING_WRITE.setRelease(pendingWrite, slot, true);
+                return;
             }
-            buf.put(data);
-            // Release ordering: ensures the buffer contents are visible to
-            // the loop thread before it observes pendingWrite == true.
-            PENDING_WRITE.setRelease(pendingWrite, slot, true);
+        }
+        // Slow path: buffer full — drain what fits, spin until room is available.
+        long deadlineNs = System.nanoTime() + 5_000_000_000L;
+        while (true) {
+            boolean roomAvailable;
+            synchronized (buf) {
+                if (channel != null && channel.isConnected()) {
+                    buf.flip();
+                    try { channel.write(buf); } catch (IOException _) {}
+                    buf.compact();
+                    if (buf.position() > 0) {
+                        PENDING_WRITE.setRelease(pendingWrite, slot, true);
+                    }
+                }
+                roomAvailable = buf.remaining() >= need;
+                if (roomAvailable) {
+                    buf.put(data);
+                    PENDING_WRITE.setRelease(pendingWrite, slot, true);
+                    return;
+                }
+            }
+            selector.wakeup();
+            if (System.nanoTime() > deadlineNs) {
+                throw new IllegalStateException(
+                        "stageWrite back-pressure timeout on slot " + slot +
+                        " — receiver consuming too slowly (needed " + need + " bytes)");
+            }
+            Thread.onSpinWait();
         }
     }
 
-    // Per-slot thread to unpark after flush (for blocking send)
-    private final Thread[] waitingThreads;
-
     /**
      * Stage bytes and block until the EventLoop has flushed them to the socket.
-     * Goes through the full EventLoop path: stage → wake selector → EventLoop flushes → unpark caller.
-     * Zero allocation — uses LockSupport.park/unpark.
      */
     public void stageWriteAndFlush(int slot, ByteBuffer data) {
+        waitingThreads[slot] = Thread.currentThread();
         stageWrite(slot, data);
         selector.wakeup();
-        // Acquire-read so we observe the flush that the loop thread performed
-        // with setRelease. A plain array read could be hoisted by the JIT and
-        // spin forever.
         while ((boolean) PENDING_WRITE.getAcquire(pendingWrite, slot)) {
             Thread.onSpinWait();
         }
@@ -110,8 +134,6 @@ public final class EventLoop implements Runnable, AutoCloseable {
     }
 
     public void registerWriteTarget(int slot, SocketChannel channel) {
-        // Release-store: ensures other threads that acquire-read this slot
-        // also see the channel's constructor-published state.
         WRITE_TARGETS.setRelease(writeTargets, slot, channel);
         if (slot >= activeSlots) activeSlots = slot + 1;
     }
@@ -139,9 +161,9 @@ public final class EventLoop implements Runnable, AutoCloseable {
             try {
                 task.run();
             } catch (Throwable t) {
-                // Setup tasks often register channels that may have been
-                // closed by another thread (Client.close() during start()).
-                // A single failing task must not kill the loop.
+                // Setup tasks often register channels that may have been closed
+                // by another thread (Client.close() during start()). One failing
+                // task must not kill the loop.
                 System.err.println("EventLoop: setup task failed: " + t);
             }
         }
@@ -159,35 +181,39 @@ public final class EventLoop implements Runnable, AutoCloseable {
             if ((boolean) PENDING_WRITE.getAcquire(pendingWrite, i)) {
                 var buf = writeBuffers[i];
                 var channel = (SocketChannel) WRITE_TARGETS.getAcquire(writeTargets, i);
-                // Guard the write: the channel may race-close between the
-                // isConnected() check and the write() call (e.g. server
-                // force-disconnect, peer RST). A ClosedChannelException must
-                // NOT take down the loop — it serves many connections.
+                boolean fullyDrained = false;
                 synchronized (buf) {
                     try {
                         if (channel != null && channel.isConnected()) {
                             buf.flip();
+                            // Non-blocking write may return a partial count when
+                            // the receiver's socket buffer fills (TCP back-pressure).
+                            // Keep the remainder for the next cycle — never drop.
                             channel.write(buf);
+                            boolean empty = !buf.hasRemaining();
                             buf.compact();
+                            if (empty) {
+                                PENDING_WRITE.setRelease(pendingWrite, i, false);
+                                fullyDrained = true;
+                            }
+                            // else: pendingWrite stays true, next cycle retries
                         } else {
-                            // Channel gone — drop pending bytes so we don't
-                            // spin forever on a dead slot.
+                            // Channel gone — drop the buffer so we don't spin on a dead slot.
                             buf.clear();
+                            PENDING_WRITE.setRelease(pendingWrite, i, false);
                         }
                     } catch (IOException _) {
-                        // Peer closed / reset under us — drop the buffer and
-                        // clear the pending flag; the read side will notice
-                        // and tear the connection down properly.
+                        // Peer closed / reset — drop bytes; the read side will
+                        // notice and tear the connection down.
                         buf.clear();
+                        PENDING_WRITE.setRelease(pendingWrite, i, false);
                     }
-                    // Release-store so stageWriteAndFlush's acquire-read
-                    // observes the flushed/abandoned state with proper happens-before.
-                    PENDING_WRITE.setRelease(pendingWrite, i, false);
                 }
-                // Unpark any thread waiting for this slot's flush
-                var waiter = waitingThreads[i];
-                if (waiter != null) {
-                    java.util.concurrent.locks.LockSupport.unpark(waiter);
+                if (fullyDrained) {
+                    var waiter = waitingThreads[i];
+                    if (waiter != null) {
+                        java.util.concurrent.locks.LockSupport.unpark(waiter);
+                    }
                 }
             }
         }
@@ -204,13 +230,9 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 try {
                     handler.handle(key);
                 } catch (Throwable t) {
-                    // A single misbehaving connection must not take down the
-                    // EventLoop (which serves many connections). Cancel this
-                    // key, close the channel, and continue — other connections
-                    // keep running.
+                    // A misbehaving connection must not take down the loop.
                     try { key.cancel(); } catch (Throwable _) {}
                     try { key.channel().close(); } catch (Throwable _) {}
-                    // Surface for diagnostics but don't rethrow.
                     System.err.println("EventLoop: handler threw, connection closed: " + t);
                 }
             }

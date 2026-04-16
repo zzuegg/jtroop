@@ -279,7 +279,7 @@ public final class Server implements AutoCloseable {
             var wireBuf = ByteBuffer.allocate(65536);
             config.pipeline().encodeOutbound(buf, wireBuf);
             wireBuf.flip();
-            try { channel.write(wireBuf); } catch (IOException _) {}
+            writeFully(channel, wireBuf);
             handshakePending.remove(connId);
             serviceRegistry.dispatchConnect(connId);
         } else {
@@ -296,10 +296,8 @@ public final class Server implements AutoCloseable {
         var wireBuf = ByteBuffer.allocate(256);
         config.pipeline().encodeOutbound(buf, wireBuf);
         wireBuf.flip();
-        try {
-            channel.write(wireBuf);
-            channel.close();
-        } catch (IOException _) {}
+        writeFully(channel, wireBuf);
+        try { channel.close(); } catch (IOException _) {}
         key.cancel();
         handshakePending.remove(connId);
         sessions.release(connId);
@@ -340,17 +338,30 @@ public final class Server implements AutoCloseable {
         wireBuf.flip();
 
         // Multiple threads (worker loops + executor) may send to the same channel
-        // (e.g. broadcast fan-out while handler emits a reply). SocketChannel.write
-        // is not ordered across threads — interleaved writes corrupt the framed
-        // wire format. Serialize per-channel.
+        // (broadcast + handler reply). Serialize per-channel to prevent interleaved
+        // writes from corrupting the framed wire format. writeFully retries on
+        // partial writes so back-pressure never silently drops bytes.
         synchronized (channel) {
+            writeFully(channel, wireBuf);
+        }
+    }
+
+    /**
+     * Write the full buffer to a non-blocking channel, respecting back-pressure.
+     * A partial write (count == 0) triggers spin-wait up to 5s rather than dropping bytes.
+     */
+    private static void writeFully(SocketChannel channel, ByteBuffer buf) {
+        long deadlineNs = System.nanoTime() + 5_000_000_000L;
+        while (buf.hasRemaining()) {
+            int written;
             try {
-                while (wireBuf.hasRemaining()) {
-                    int n = channel.write(wireBuf);
-                    if (n == 0) break; // socket buffer full — best effort, drop
-                }
+                written = channel.write(buf);
             } catch (IOException e) {
-                // Connection lost
+                return; // Connection lost — caller sees disconnect on next read
+            }
+            if (written == 0) {
+                if (System.nanoTime() > deadlineNs) return; // Slow consumer — give up
+                Thread.onSpinWait();
             }
         }
     }
