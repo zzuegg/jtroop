@@ -64,6 +64,72 @@ External load generator, "Hello, World!" responses through the full HTTP pipelin
 - All JMH benchmarks encode/decode through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
 - The `-t4 -c100` HTTP regression is real: at low concurrency jtroop's SO_REUSEPORT fan-out leaves some workers idle (wrk's threads can't saturate N loops), so per-connection overhead dominates and Netty's queue batching wins narrowly. Past `-t8` the fan-out pays off.
 
+### UDP (game-shaped workload)
+
+Fire-and-forget position packets. `Transport.udpConnected(...)` pins the server-side peer so the read loop uses `channel.read(buf)` instead of allocation-heavy `channel.receive(buf, addr)`. Reliable variant adds Sequencing + DuplicateFilter + Ack layers.
+
+| Benchmark | ops/ms | B/op |
+|---|---:|---:|
+| `udpPositionUpdate` (connected) | 1,218 | **0.002** |
+| `udpReliable` (seq+dup+ack) | 916 | **0.003** |
+
+### Session iteration (N=100 active in 4096-slot store)
+
+Used by broadcast fan-out and GC sweeps. Three API shapes, all zero-alloc:
+
+| Benchmark | ops/ms | B/op |
+|---|---:|---:|
+| `forEachActive(Consumer<ConnectionId>)` — record | 1,254 | 0.003 |
+| `forEachActiveLong(LongConsumer)` — packed long | **1,475** | 0.003 |
+| `activeCopyIds(long[] out)` — snapshot | 984 | 0.004 |
+| `forEachActive` + fresh lambda per call | 1,274 | 0.122 |
+
+### Read-loop microbenchmarks (8 frames per op, no sockets)
+
+Confirms the inner receive-and-dispatch drain is zero-alloc — any residual would multiply by messages/sec in a real server.
+
+| Benchmark | ops/ms | B/op |
+|---|---:|---:|
+| `readLoop_clientDrain` (decode + primitive field touch) | 18,290 | ~10⁻⁴ |
+| `readLoop_serverDrain` (decode + `ServiceRegistry.dispatch`) | 13,445 | ~10⁻⁴ |
+| `readLoop_serverExecutor` (+ per-frame `executor.execute` lambda) | 13,317 | ~10⁻⁴ |
+
+### Dispatch microbenchmarks (isolated from transport)
+
+`ServiceRegistry.dispatch` through the hidden-class `HandlerInvoker` — no sockets, no framing, no codec.
+
+| Benchmark | ns/op | B/op |
+|---|---:|---:|
+| `dispatchDirect_void` | 3.30 | ~10⁻⁵ |
+| `dispatchDirect_returning` (shared return record) | 3.24 | ~10⁻⁵ |
+| `dispatchDirect_broadcast` (+ `Broadcast` injectable) | 2.82 | ~10⁻⁵ |
+| `dispatchDirect_allInjectables` (+ `Unicast` injectable) | 2.70 | ~10⁻⁵ |
+
+### Codec microbenchmarks (record ↔ ByteBuffer, no I/O)
+
+| Benchmark | ns/op | B/op |
+|---|---:|---:|
+| `encodeOnly` (fresh record per call) | 4.37 | ~10⁻⁵ |
+| `encodeOnly_cachedRecord` | 4.53 | ~10⁻⁵ |
+| `decodeOnly` (returns record) | 8.77 | 32 (record) |
+| `encodeDecodeRoundtrip` | 8.20 | 32 (record) |
+
+### Payload size sweep (`PositionBlob` record with growing `byte[]` field)
+
+| Payload | ops/ms | B/op |
+|---|---:|---:|
+| 16 B small | 28,459 | 80 |
+| 256 B medium | 5,234 | 720 |
+| 4 KB large | 452 | 4,512 |
+
+Allocation scales linearly with payload because the `byte[]` inside the `PositionBlob` record is structurally a fresh heap object per op (and is correctly observed as such).
+
+### Many clients (100 TCP clients, round-robin send)
+
+| Benchmark | ops/ms | B/op |
+|---|---:|---:|
+| `positionUpdate_manyClients` | 14,151 | 38 |
+
 ## Design Approach
 
 jtroop minimizes allocation on the hot path through these techniques:
