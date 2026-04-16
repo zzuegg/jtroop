@@ -382,7 +382,7 @@ public final class Client implements AutoCloseable {
     private int encodeUdpInline(Record message) {
         var encode = encodeBuf.get();
         encode.clear();
-        codec.encode(message, new WriteBuffer(encode));
+        codec.encode(message, encode);
         encode.flip();
         return encode.remaining();
     }
@@ -448,7 +448,7 @@ public final class Client implements AutoCloseable {
         var encode = encodeBuf.get();
         var wire = wireBuf.get();
         encode.clear();
-        codec.encode(message, new WriteBuffer(encode));
+        codec.encode(message, encode);
         encode.flip();
 
         wire.clear();

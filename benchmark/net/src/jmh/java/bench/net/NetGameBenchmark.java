@@ -192,6 +192,32 @@ public class NetGameBenchmark {
         }
     }
 
+    /**
+     * Isolation harness: same 10-iteration loop shape as {@link #mixedTraffic}
+     * but only sends position updates. Confirms the per-call overhead of
+     * {@code client.send(Record)} at a monomorphic callsite — divergence from
+     * 10 × positionUpdate's 0.019 B/op reveals loop-scope allocation.
+     */
+    @Benchmark
+    public void mixedTraffic_positionOnly() {
+        for (int i = 0; i < 10; i++) {
+            client.send(new PositionUpdate(i * 0.1f, i * 0.2f, i * 0.3f, i * 0.01f));
+        }
+    }
+
+    /**
+     * Isolation harness: same 10-iteration loop shape as {@link #mixedTraffic}
+     * but only sends chat messages. Compare against 10 × chatMessage to see
+     * whether the mixed-type polymorphic dispatch in {@link #mixedTraffic} is
+     * the regression source or whether it's per-call overhead.
+     */
+    @Benchmark
+    public void mixedTraffic_chatOnly() {
+        for (int i = 0; i < 10; i++) {
+            client.send(new ChatMessage(GameMessages.CHAT_TEXT, i));
+        }
+    }
+
     // --- Read-loop microbenchmarks --------------------------------------------
     //
     // Simulate Server.handleRead / Client.handleRead on a pre-filled readBuf

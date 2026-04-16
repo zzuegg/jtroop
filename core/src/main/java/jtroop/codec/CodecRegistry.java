@@ -131,14 +131,22 @@ public final class CodecRegistry {
         return entry.type();
     }
 
-    @SuppressWarnings("unchecked")
     public void encode(Record msg, WriteBuffer wb) {
+        encode(msg, wb.buffer());
+    }
+
+    /**
+     * Direct {@link ByteBuffer}-taking overload used on hot send paths. Avoids
+     * the per-call {@code new WriteBuffer(buf)} wrapper (16 B/op) when the
+     * caller already holds a reusable {@link ByteBuffer}.
+     */
+    @SuppressWarnings("unchecked")
+    public void encode(Record msg, ByteBuffer buf) {
         var entry = byClass.get(msg.getClass());
         if (entry == null) {
             register((Class<? extends Record>) msg.getClass());
             entry = byClass.get(msg.getClass());
         }
-        var buf = wb.buffer();
         buf.putShort((short) entry.typeId());
         if (entry.generatedCodec() != null) {
             entry.generatedCodec().encode(msg, buf);
