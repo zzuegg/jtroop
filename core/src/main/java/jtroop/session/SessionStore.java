@@ -1,6 +1,7 @@
 package jtroop.session;
 
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 
 /**
  * SoA (Struct-of-Arrays) session state storage.
@@ -125,5 +126,62 @@ public final class SessionStore {
                 consumer.accept(ConnectionId.of(i, gens[i]));
             }
         }
+    }
+
+    /**
+     * Iterate active connections as packed {@code long} ids (no
+     * {@link ConnectionId} record construction). The long encodes
+     * {@code (generation << 32) | (index & 0xFFFFFFFFL)} — the exact same
+     * layout as {@link ConnectionId#id()}.
+     *
+     * <p>This is the fastest iteration path: when the {@link LongConsumer}
+     * callsite is monomorphic (e.g. a cached field-captured lambda) the
+     * entire loop body collapses to a primitive scan with no heap traffic,
+     * independent of C2's ability to scalar-replace the {@link ConnectionId}
+     * record. Use this for broadcast fan-out, metrics sweeps, and connection
+     * GC sweeps on hot paths.
+     *
+     * @param consumer receives each active id as a packed long; reconstruct
+     *                 a {@link ConnectionId} via {@code new ConnectionId(id)}
+     *                 only if needed downstream.
+     */
+    public synchronized void forEachActiveLong(LongConsumer consumer) {
+        final long[] sa = stateAndActive;
+        final int[] gens = generations;
+        final int cap = capacity;
+        for (int i = 0; i < cap; i++) {
+            if ((sa[i] & ACTIVE_BIT) != 0L) {
+                // Packed form matches ConnectionId.of(index, generation).
+                consumer.accept(((long) gens[i] << 32) | (i & 0xFFFFFFFFL));
+            }
+        }
+    }
+
+    /**
+     * Snapshot active ids into a caller-owned {@code long[]}. Returns the
+     * number of ids written. No allocation when {@code out.length >=
+     * activeCount()}.
+     *
+     * <p>Useful for callers that need to iterate active connections without
+     * holding this store's monitor during the callback (e.g. to allow
+     * re-entrant mutations via a deferred-command buffer).
+     *
+     * @param out destination buffer; must be sized to {@code activeCount()}
+     *            or larger. If smaller, the method writes up to
+     *            {@code out.length} entries and returns that count.
+     * @return number of active ids written
+     */
+    public synchronized int activeCopyIds(long[] out) {
+        final long[] sa = stateAndActive;
+        final int[] gens = generations;
+        final int cap = capacity;
+        final int max = out.length;
+        int n = 0;
+        for (int i = 0; i < cap && n < max; i++) {
+            if ((sa[i] & ACTIVE_BIT) != 0L) {
+                out[n++] = ((long) gens[i] << 32) | (i & 0xFFFFFFFFL);
+            }
+        }
+        return n;
     }
 }

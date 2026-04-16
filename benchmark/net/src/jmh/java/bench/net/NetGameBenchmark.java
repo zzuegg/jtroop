@@ -9,12 +9,15 @@ import jtroop.pipeline.layers.FramingLayer;
 import jtroop.server.Server;
 import jtroop.service.*;
 import jtroop.session.ConnectionId;
+import jtroop.session.SessionStore;
 import jtroop.transport.Transport;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 
 /**
  * JMH benchmark: Our net module game server processing position updates + chat messages.
@@ -56,6 +59,20 @@ public class NetGameBenchmark {
     private Server server;
     private Client client;
 
+    // --- sessionIteration state ---
+    // N=100 active connections sparsely distributed in a 4096-slot store,
+    // mirroring the Server's default session capacity.
+    private static final int SESSION_CAPACITY = 4096;
+    private static final int SESSION_ACTIVE = 100;
+    private SessionStore sessionStore;
+    // Cached field-captured consumers so the per-invocation lambda capture
+    // allocation is not mistaken for iteration cost (CLAUDE.md rule #7).
+    private Consumer<ConnectionId> recordSink;
+    private LongConsumer longSink;
+    private long iterChecksum;
+    // Reusable snapshot buffer for activeCopyIds (no per-call long[] alloc).
+    private long[] snapshotBuf;
+
     @Setup(Level.Trial)
     public void setup() throws Exception {
         var handler = new GameHandler();
@@ -72,6 +89,43 @@ public class NetGameBenchmark {
                 .build();
         client.start();
         Thread.sleep(500); // wait for connection
+
+        // --- Build a sparse N=100 active session set for sessionIteration.
+        sessionStore = new SessionStore(SESSION_CAPACITY);
+        int stride = SESSION_CAPACITY / SESSION_ACTIVE; // 40
+        var allocated = new ConnectionId[SESSION_CAPACITY];
+        for (int i = 0; i < SESSION_CAPACITY; i++) {
+            allocated[i] = sessionStore.allocate();
+        }
+        // Release everything except every `stride`-th slot so the remaining
+        // active set is evenly distributed across the capacity.
+        for (int i = 0; i < SESSION_CAPACITY; i++) {
+            if (i % stride != 0) {
+                sessionStore.release(allocated[i]);
+            }
+        }
+        // Expected exactly SESSION_ACTIVE + 1 due to integer rounding; trim extras.
+        while (sessionStore.activeCount() > SESSION_ACTIVE) {
+            for (int i = 1; i < SESSION_CAPACITY; i++) {
+                if (sessionStore.activeCount() <= SESSION_ACTIVE) break;
+                if (sessionStore.isActive(allocated[i])) {
+                    sessionStore.release(allocated[i]);
+                    break;
+                }
+            }
+        }
+
+        recordSink = id -> iterChecksum ^= id.id();
+        longSink = id -> iterChecksum ^= id;
+        snapshotBuf = new long[SESSION_CAPACITY];
+
+        // Pre-warm branch profiles (CLAUDE.md rule #8) — 10K invocations so
+        // C1 inlines the cold paths.
+        for (int i = 0; i < 10_000; i++) {
+            sessionStore.forEachActive(recordSink);
+            sessionStore.forEachActiveLong(longSink);
+            sessionStore.activeCopyIds(snapshotBuf);
+        }
     }
 
     @TearDown(Level.Trial)
@@ -112,6 +166,7 @@ public class NetGameBenchmark {
         }
     }
 
+<<<<<<< HEAD
     // --- Read-loop microbenchmarks --------------------------------------------
     //
     // Simulate Server.handleRead / Client.handleRead on a pre-filled readBuf
@@ -398,5 +453,57 @@ public class NetGameBenchmark {
     @OutputTimeUnit(TimeUnit.NANOSECONDS)
     public void dispatchDirect_allInjectables(DirectDispatchState s, Blackhole bh) {
         bh.consume(s.allReg.dispatch(s.ping, s.sender));
+    }
+
+    // --- Session iteration microbenchmarks -----------------------------------
+    //
+    // Iterate an N=100 active connection set in a 4096-slot SessionStore
+    // (sparsely distributed). Exercises the scan used by broadcast fan-out
+    // and the GC sweep. Targets zero allocation in all shapes.
+
+    /**
+     * Iterate N=100 active connections via the record-yielding
+     * {@link SessionStore#forEachActive} API. Target: 0 B/op — the
+     * {@link ConnectionId} record built inside the scan must be
+     * scalar-replaced by C2 (CLAUDE.md rule #2).
+     */
+    @Benchmark
+    public void sessionIteration() {
+        sessionStore.forEachActive(recordSink);
+    }
+
+    /**
+     * Iterate the same N=100 set via the primitive-long API. This is the
+     * broadcast/GC-sweep fast path — no ConnectionId record at all, so EA
+     * is a non-issue. Expected: 0 B/op unconditionally.
+     */
+    @Benchmark
+    public void sessionIteration_long() {
+        sessionStore.forEachActiveLong(longSink);
+    }
+
+    /**
+     * Snapshot the active set into a caller-owned {@code long[]} and loop.
+     * Models the "iterate without holding the store monitor" pattern used
+     * by deferred-mutation callers. Reusable buffer → 0 B/op.
+     */
+    @Benchmark
+    public void sessionIteration_snapshot(Blackhole bh) {
+        int n = sessionStore.activeCopyIds(snapshotBuf);
+        long acc = 0;
+        for (int i = 0; i < n; i++) {
+            acc ^= snapshotBuf[i];
+        }
+        bh.consume(acc);
+    }
+
+    /**
+     * Realistic caller pattern: fresh lambda per invocation that captures a
+     * local Blackhole. Stresses whether the record + lambda capture can both
+     * be scalar-replaced at the invokeinterface callsite.
+     */
+    @Benchmark
+    public void sessionIteration_freshLambda(Blackhole bh) {
+        sessionStore.forEachActive(id -> bh.consume(id.id()));
     }
 }

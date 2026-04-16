@@ -277,4 +277,82 @@ class SessionTest {
         assertEquals(0, store.activeCount());
         assertThrows(IllegalStateException.class, store::allocate);
     }
+
+    @Test
+    void sessionStore_forEachActiveLong_emitsPackedIdsMatchingConnectionId() {
+        var store = new SessionStore(8);
+        var id1 = store.allocate();
+        var id2 = store.allocate();
+        store.release(id1);
+        var id3 = store.allocate(); // reuses id1's slot with bumped generation
+
+        var seen = new java.util.ArrayList<Long>();
+        store.forEachActiveLong(seen::add);
+        assertEquals(2, seen.size());
+        // Each emitted long must match an active ConnectionId.id() exactly.
+        assertTrue(seen.contains(id2.id()));
+        assertTrue(seen.contains(id3.id()));
+        assertFalse(seen.contains(id1.id())); // stale generation
+    }
+
+    @Test
+    void sessionStore_forEachActiveLong_roundTripsViaConnectionIdRecord() {
+        var store = new SessionStore(4);
+        var a = store.allocate();
+        var b = store.allocate();
+        var seen = new java.util.ArrayList<ConnectionId>();
+        store.forEachActiveLong(id -> seen.add(new ConnectionId(id)));
+        assertEquals(2, seen.size());
+        assertTrue(seen.contains(a));
+        assertTrue(seen.contains(b));
+    }
+
+    @Test
+    void sessionStore_activeCopyIds_fillsBufferAndReturnsCount() {
+        var store = new SessionStore(8);
+        var id1 = store.allocate();
+        var id2 = store.allocate();
+        var id3 = store.allocate();
+        store.release(id1);
+
+        var buf = new long[8];
+        int n = store.activeCopyIds(buf);
+        assertEquals(2, n);
+        // Copied ids must match the currently-active ConnectionId.id() values.
+        var set = new java.util.HashSet<Long>();
+        for (int i = 0; i < n; i++) set.add(buf[i]);
+        assertTrue(set.contains(id2.id()));
+        assertTrue(set.contains(id3.id()));
+        assertFalse(set.contains(id1.id()));
+        // Entries beyond `n` must be untouched zero.
+        for (int i = n; i < buf.length; i++) {
+            assertEquals(0L, buf[i]);
+        }
+    }
+
+    @Test
+    void sessionStore_activeCopyIds_truncatesToBufferSize() {
+        var store = new SessionStore(8);
+        for (int i = 0; i < 5; i++) store.allocate();
+        var small = new long[3];
+        int n = store.activeCopyIds(small);
+        assertEquals(3, n); // truncated to buffer capacity
+        for (int i = 0; i < 3; i++) assertNotEquals(0L, small[i]);
+    }
+
+    @Test
+    void sessionStore_activeCopyIds_emptyStore_returnsZero() {
+        var store = new SessionStore(4);
+        var buf = new long[4];
+        assertEquals(0, store.activeCopyIds(buf));
+        for (long v : buf) assertEquals(0L, v);
+    }
+
+    @Test
+    void sessionStore_forEachActiveLong_emptyStore_callsConsumerZeroTimes() {
+        var store = new SessionStore(8);
+        var count = new int[1];
+        store.forEachActiveLong(id -> count[0]++);
+        assertEquals(0, count[0]);
+    }
 }
