@@ -14,45 +14,55 @@ All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. J
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|----------------|-----------|------------------|
-| positionUpdate | 29,722 | 5,026 | 12,624 | 625 |
-| chatMessage | 14,024 | 3,773 | 13,314 | 609 |
-| mixedTraffic (10 msg) | 2,156 | — | 1,277 | 61 |
-| requestResponse (RPC) | 944 | — | — | — |
+| positionUpdate | 27,506 | 4,762 | 12,624 | 625 |
+| chatMessage (record) | 13,516 | 4,067 | 13,314 | 609 |
+| chatMessage (@ZeroAlloc) | **13,713** | — | — | — |
+| mixedTraffic (10 msg) | 2,047 | — | 1,277 | 61 |
+| requestResponse (RPC) | 945 | — | — | — |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|--------|----------------|-----------|------------------|
-| positionUpdate | **0.019** | **0.015** | 1,110 | 449 |
-| chatMessage | 416 | 384 | 1,577 | 840 |
-| mixedTraffic (10 msg) | 1,441 | — | 12,272 | 6,391 |
-| requestResponse (RPC) | 184 | — | — | — |
+| positionUpdate | **~10⁻⁴** | **0.001** | 1,110 | 449 |
+| chatMessage (record) | 384 | 384 | 1,577 | 840 |
+| chatMessage (@ZeroAlloc) | **24** | — | — | — |
+| mixedTraffic (10 msg) | 1,440 | — | 12,272 | 6,391 |
+| requestResponse (RPC) | **88** | — | — | — |
+
+### Layer overhead (B/op)
+
+| Layer stack | ops/ms | B/op |
+|---|---:|---:|
+| framing only | 31,109 | 64 |
+| framing + compression (Deflater reused) | 940 | **32** |
+| framing + AES-GCM encryption (Cipher reused) | 4,784 | 1,864 |
 
 ### HTTP/1.1 throughput (wrk) — higher is better
 
-External load generator, "Hello, World!" responses through the full HTTP pipeline (per-request encoding via `HttpLayer`, no pre-built cheat). Run on the same box.
+External load generator, "Hello, World!" responses through the full HTTP pipeline (per-request encoding via `HttpLayer`, no pre-built cheat). Same JDK 26, same box, TCP_NODELAY, SO_REUSEPORT worker fan-out on both sides.
 
 | Load | jtroop | Netty 4.2 | jtroop advantage |
 |------|-------:|----------:|-----------------:|
-| `wrk -t4 -c100 -d15s` | **1,202,903 req/s** | 1,163,670 req/s | +3.4% |
-| `wrk -t8 -c400 -d15s` | **1,933,471 req/s** | 1,787,747 req/s | +8.2% |
-
-Same JDK 26, same machine, TCP_NODELAY, multi-threaded worker pool on both sides.
+| `wrk -t4 -c100 -d15s` | 1,105,044 req/s | **1,175,169 req/s** | −6% (client-bottlenecked) |
+| `wrk -t8 -c400 -d15s` | **2,079,014 req/s** | 1,764,029 req/s | +17.8% |
+| `wrk -t16 -c400 -d15s` | **3,235,494 req/s** | 2,676,074 req/s | +20.9% |
+| `wrk -t32 -c400 -d15s` | **3,481,729 req/s** | 2,792,112 req/s | +24.7% |
 
 ### Notes
 
-- **jtroop fire-and-forget**: stages encoded bytes into a pre-allocated direct ByteBuffer. The EventLoop flushes on a 1ms poll cycle. **0.019 B/op** for position updates — below the JMH noise floor.
-- **jtroop blocking**: direct-write fast path under the per-slot buffer lock when nothing is staged — bypasses the selector wakeup (which would otherwise allocate a `HashMap$Node` inside `sun.nio.ch.SelectorImpl.processReadyEvents` per op). Falls back to park/unpark on partial write or contention. Dropped from 16 B/op → 0.015 B/op and 987 → 5,026 ops/ms (5×).
-- **Netty**: jtroop beats Netty 4.2 on every benchmark:
-  - 2.4× throughput, ~60,000× less allocation on `positionUpdate`
-  - 28× throughput on `positionUpdate_blocking`
-  - 1.05× throughput, 3.8× less allocation on `chatMessage`
-  - 20.6× throughput on `chatMessage_blocking`
-  - 1.7× throughput, 8.5× less allocation on `mixedTraffic`
+- **jtroop fire-and-forget** `positionUpdate`: stages encoded bytes into a pre-allocated direct ByteBuffer. Under broadcast-connection load the selector-Consumer form of EventLoop dispatch drove residual allocation from 0.019 → ~10⁻⁴ B/op (below any reliable measurement).
+- **jtroop blocking** `positionUpdate_blocking`: direct-write fast path under the per-slot buffer lock when nothing is staged — bypasses the selector wakeup. Dropped from 16 B/op → 0.001 B/op across two optimisation rounds; 987 → 4,762 ops/ms.
+- **`chatMessage (@ZeroAlloc)`**: opt-in handler dispatch via `@ZeroAlloc(ChatMessage.class)` routes the inbound frame straight to a hidden-class `RawHandlerInvoker` taking `(ByteBuffer, ConnectionId, Broadcast, Unicast)`. Skips codec-decode entirely; 24 B/op is just the ChatMessage record the legacy handler still constructs for the server-side work. Legacy record-parameter handler continues to work (back-compat).
+- **`requestResponse`**: the response decode now happens on the **waiter's stack** (not the EventLoop thread) — the waiter's scratch ByteBuffer is filled with raw bytes, parked/unparked, and then decoded locally, keeping the record EA-eligible. 184 → 88 B/op.
+- **Netty**: jtroop beats Netty 4.2 on every JMH benchmark and on HTTP at ≥ 8 wrk threads:
+  - 2.2× throughput, ~11,000,000× less allocation on `positionUpdate`
+  - 27× throughput on `positionUpdate_blocking`
+  - Throughput parity, 4× less allocation on `chatMessage` (record); 17× less alloc with `@ZeroAlloc`
+  - 18–25% more HTTP req/s at `-t8/-t16/-t32 -c400`
 - **SpiderMonkey**: stable but throughput limited by thread-per-kernel model and reflection-based serialization.
-- **All benchmarks** use proper object encoding/decoding through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
-- The mixedTraffic benchmark measures batches of 10 messages per operation (8 position + 2 chat).
-- `requestResponse` uses a typed service proxy (generated hidden class) with flat-ring pending-request storage. 184 B/op is dominated by the unavoidable response-record decode.
+- All JMH benchmarks encode/decode through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
+- The `-t4 -c100` HTTP regression is real: at low concurrency jtroop's SO_REUSEPORT fan-out leaves some workers idle (wrk's threads can't saturate N loops), so per-connection overhead dominates and Netty's queue batching wins narrowly. Past `-t8` the fan-out pays off.
 
 ## Design Approach
 
@@ -233,6 +243,7 @@ jtroop/
 | Direct ByteBuffers | 0 | 30,736 | Direct write buffers, spin-wait blocking, encodeToWire split |
 | Agent sweep (9 worktrees) | 0.03 | 27,963 | SoA session store, flat codec table, hidden-class service dispatch, cached framing view, zero-alloc UDP dup filter, back-pressure correctness, large-message path, malformed-input hardening, HTTP/1.1 robustness |
 | Agent sweep II (11 worktrees) | 0.019 | 29,722 | Zero-alloc UTF-8 String codec, MPSC setup queue, blocking-send direct-write fast path, zero-alloc RPC ring + typed proxy, broadcast encode-once fan-out, UDP JMH bench + AckLayer SoA, fused-pipeline wired onto hot paths, primitive-long session iteration |
+| Agent sweep III (10 worktrees) | ~10⁻⁴ | 27,506 | `@ZeroAlloc` handler opt-in (24 B/op chat), Deflater/Cipher pooling, connected-UDP mode (0.004 B/op), flat slot→channel array for broadcast, select(Consumer) eliminates HashIterator, adaptive selectNow, HTTP SO_REUSEPORT, waiter-side RPC decode |
 
 See [docs/performance-journey.md](docs/performance-journey.md) for details.
 
