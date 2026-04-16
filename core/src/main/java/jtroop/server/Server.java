@@ -206,17 +206,15 @@ public final class Server implements AutoCloseable {
     private void handleRead(SelectionKey key, ConnectionId connId, ListenerConfig config,
                             ByteBuffer readBuf) throws IOException {
         var channel = (SocketChannel) key.channel();
-        int n = channel.read(readBuf);
+        int n;
+        try {
+            n = channel.read(readBuf);
+        } catch (IOException e) {
+            // Abrupt close / reset — treat as disconnect
+            n = -1;
+        }
         if (n == -1) {
-            // Client disconnected
-            key.cancel();
-            channel.close();
-            serviceRegistry.dispatchDisconnect(connId);
-            sessions.release(connId);
-            keyToConnection.remove(key);
-            connectionToKey.remove(connId);
-            connectionConfig.remove(connId);
-            connectionChannels.remove(connId);
+            closeConnectionInternal(connId, key, channel);
             return;
         }
         if (n > 0) {
@@ -325,6 +323,31 @@ public final class Server implements AutoCloseable {
         var p = boundUdpPorts.get(connectionType);
         if (p == null) throw new IllegalArgumentException("No UDP listener for " + connectionType.getName());
         return p;
+    }
+
+    /**
+     * Manually close a connection. Fires @OnDisconnect on the handler.
+     * Thread-safe — operation is dispatched to the owning worker loop.
+     */
+    public void closeConnection(ConnectionId connId) {
+        var selKey = connectionToKey.get(connId);
+        if (selKey == null) return;
+        var channel = (SocketChannel) selKey.channel();
+        // Dispatch to the loop that owns this connection
+        var workerLoop = workerGroup.get(Math.floorMod(connId.index(), workerGroup.size()));
+        workerLoop.submit(() -> closeConnectionInternal(connId, selKey, channel));
+    }
+
+    private void closeConnectionInternal(ConnectionId connId, java.nio.channels.SelectionKey key, SocketChannel channel) {
+        if (!connectionChannels.containsKey(connId)) return; // already closed
+        key.cancel();
+        try { channel.close(); } catch (IOException _) {}
+        serviceRegistry.dispatchDisconnect(connId);
+        sessions.release(connId);
+        keyToConnection.remove(key);
+        connectionToKey.remove(connId);
+        connectionConfig.remove(connId);
+        connectionChannels.remove(connId);
     }
 
     public void switchPipeline(ConnectionId connId, Pipeline newPipeline) {

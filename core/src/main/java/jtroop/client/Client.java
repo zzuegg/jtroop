@@ -362,6 +362,20 @@ public final class Client implements AutoCloseable {
         return channel != null && channel.isConnected();
     }
 
+    /**
+     * Close a specific connection (by type). Remaining connections stay open.
+     */
+    public void closeConnection(Class<? extends Record> connectionType) {
+        var channel = channels.remove(connectionType);
+        if (channel != null) {
+            try { channel.close(); } catch (IOException _) {}
+        }
+        var udp = udpChannels.remove(connectionType);
+        if (udp != null) {
+            try { udp.close(); } catch (IOException _) {}
+        }
+    }
+
     @Override
     public void close() {
         for (var channel : channels.values()) {
