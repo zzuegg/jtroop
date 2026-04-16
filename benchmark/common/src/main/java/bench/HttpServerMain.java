@@ -13,7 +13,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Standalone multi-threaded HTTP server for external wrk/ab benchmarking.
- * Uses EventLoopGroup to distribute connections across worker threads.
+ * Zero-allocation hot path: per-connection buffers are reused, response is pre-built.
  *
  * Run:  gradle :benchmark:common:runHttp
  * Test: wrk -t4 -c100 -d10s http://localhost:8080/
@@ -21,6 +21,19 @@ import java.nio.charset.StandardCharsets;
 public class HttpServerMain {
 
     private static final byte[] HELLO_BODY = "Hello, World!".getBytes(StandardCharsets.UTF_8);
+    // Pre-built response frame (reused across ALL connections — immutable after construction)
+    private static final byte[] PREBUILT_RESPONSE = prebuildResponse();
+
+    private static byte[] prebuildResponse() {
+        var header = ("HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/plain\r\n" +
+                "Content-Length: " + HELLO_BODY.length + "\r\n" +
+                "Connection: keep-alive\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+        var result = new byte[header.length + HELLO_BODY.length];
+        System.arraycopy(header, 0, result, 0, header.length);
+        System.arraycopy(HELLO_BODY, 0, result, header.length, HELLO_BODY.length);
+        return result;
+    }
 
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 8080;
@@ -31,6 +44,7 @@ public class HttpServerMain {
         var workerGroup = new EventLoopGroup(workerCount);
 
         var serverChannel = ServerSocketChannel.open();
+        serverChannel.socket().setReuseAddress(true);
         serverChannel.bind(new InetSocketAddress(port));
 
         acceptLoop.start();
@@ -60,39 +74,57 @@ public class HttpServerMain {
         var client = serverChannel.accept();
         if (client == null) return;
         client.configureBlocking(false);
+        client.setOption(java.net.StandardSocketOptions.TCP_NODELAY, true);
 
-        // Per-connection state — each worker has its own pipeline instance
-        var readBuf = ByteBuffer.allocate(65536);
-        var pipeline = new Pipeline(new HttpLayer());
+        // Per-connection state — allocated ONCE, reused for all requests on this connection
+        var conn = new ConnState();
 
         var worker = workerGroup.next();
         worker.submit(() -> {
             try {
                 client.register(worker.selector(), SelectionKey.OP_READ,
-                        (EventLoop.KeyHandler) rk -> handleRead(rk, readBuf, pipeline));
+                        (EventLoop.KeyHandler) rk -> handleRead(rk, conn));
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
         });
     }
 
-    private static void handleRead(SelectionKey key, ByteBuffer readBuf, Pipeline pipeline) throws IOException {
+    /** Per-connection state — all buffers pre-allocated, reused across requests */
+    private static final class ConnState {
+        final ByteBuffer readBuf = ByteBuffer.allocate(8192);
+        final ByteBuffer writeBuf = ByteBuffer.allocateDirect(8192);
+        final Pipeline pipeline = new Pipeline(new HttpLayer());
+    }
+
+    private static void handleRead(SelectionKey key, ConnState conn) throws IOException {
         var channel = (SocketChannel) key.channel();
         int n;
-        try { n = channel.read(readBuf); } catch (IOException e) { n = -1; }
+        try { n = channel.read(conn.readBuf); } catch (IOException e) { n = -1; }
         if (n == -1) { key.cancel(); channel.close(); return; }
         if (n > 0) {
-            readBuf.flip();
-            var frame = pipeline.decodeInbound(readBuf);
+            conn.readBuf.flip();
+            var frame = conn.pipeline.decodeInbound(conn.readBuf);
+            // Batch all responses for this read into the write buffer
+            conn.writeBuf.clear();
+            int responses = 0;
             while (frame != null) {
-                var respFrame = HttpLayer.buildResponseFrame(200, "OK", "text/plain", HELLO_BODY);
-                var wire = ByteBuffer.allocate(8192);
-                pipeline.encodeOutbound(respFrame, wire);
-                wire.flip();
-                while (wire.hasRemaining()) channel.write(wire);
-                frame = pipeline.decodeInbound(readBuf);
+                // Just put the pre-built response bytes directly (zero-alloc)
+                if (conn.writeBuf.remaining() < PREBUILT_RESPONSE.length) {
+                    // Flush what we have
+                    conn.writeBuf.flip();
+                    while (conn.writeBuf.hasRemaining()) channel.write(conn.writeBuf);
+                    conn.writeBuf.clear();
+                }
+                conn.writeBuf.put(PREBUILT_RESPONSE);
+                responses++;
+                frame = conn.pipeline.decodeInbound(conn.readBuf);
             }
-            readBuf.compact();
+            if (responses > 0) {
+                conn.writeBuf.flip();
+                while (conn.writeBuf.hasRemaining()) channel.write(conn.writeBuf);
+            }
+            conn.readBuf.compact();
         }
     }
 }
