@@ -84,14 +84,88 @@ public final class Server implements AutoCloseable {
         serviceRegistry.setUnicast(this::unicastImpl);
     }
 
+    // Reusable fan-out walker. broadcastImpl is serialized by broadcastLock
+    // below so a single instance is safe across worker loops — no per-call
+    // allocation (CLAUDE.md rule #7), and the call site at
+    // forEachActiveIndex(walker) stays monomorphic (CLAUDE.md rule #4).
+    private final BroadcastWalker broadcastWalker = new BroadcastWalker();
+    // Broadcast fan-out lock. Serializes broadcastImpl across worker loops
+    // for two reasons:
+    //   1. Pipeline.tempBuffers is shared state — concurrent encodeOutbound
+    //      races on it. The original code only worked because sendResponse
+    //      was called from inside SessionStore.forEachActive's synchronized
+    //      block, which unintentionally serialized the encode too. Moving
+    //      encode out of that lock (to encode once, not N times) removes
+    //      that implicit protection, so we add an explicit one.
+    //   2. We reuse a single broadcastWalker + the ThreadLocal wireBuf of
+    //      whichever thread got the lock. A single encode + fan-out fills
+    //      the buffer, then per-recipient writeFully rewinds and sends.
+    private final Object broadcastLock = new Object();
+
     private void broadcastImpl(Record message) {
-        sessions.forEachActive(connId -> {
-            var channel = connectionChannels.get(connId);
-            var config = connectionConfig.get(connId);
-            if (channel != null && channel.isConnected() && config != null) {
-                sendResponse(message, config, channel);
+        synchronized (broadcastLock) {
+            // Encode once — not per recipient. The wire bytes are identical
+            // for every destination. All active sessions share the same
+            // ListenerConfig (one pipeline per connectionType), so we pick
+            // any active config and encode against that pipeline.
+            ListenerConfig anyConfig = null;
+            for (var cfg : connectionConfig.values()) {
+                anyConfig = cfg;
+                break;
             }
-        });
+            if (anyConfig == null) return;
+
+            var encodeBuf = serverEncodeBuf.get();
+            var wireBuf = serverWireBuf.get();
+            encodeBuf.clear();
+            codec.encode(message, new WriteBuffer(encodeBuf));
+            encodeBuf.flip();
+
+            wireBuf.clear();
+            anyConfig.pipeline().encodeOutbound(encodeBuf, wireBuf);
+            wireBuf.flip();
+
+            // Fan out the pre-encoded bytes. No lambda capture.
+            broadcastWalker.prepare(wireBuf);
+            sessions.forEachActiveIndex(broadcastWalker);
+        }
+    }
+
+    /**
+     * Stateful primitive-spec visitor used by {@link #broadcastImpl}. Holds
+     * the pre-encoded wire bytes for the current broadcast and writes them
+     * to every active connection's channel. Shared single instance guarded
+     * by {@link #broadcastLock} — no per-call alloc.
+     */
+    private final class BroadcastWalker implements SessionStore.IndexVisitor {
+        private ByteBuffer wire;
+        private int wireStart;
+        private int wireEnd;
+
+        void prepare(ByteBuffer wireBuf) {
+            this.wire = wireBuf;
+            this.wireStart = wireBuf.position();
+            this.wireEnd = wireBuf.limit();
+        }
+
+        @Override
+        public void visit(int index, int generation) {
+            // ConnectionId constructed on stack for the map lookup; the record
+            // is scalar-replaced at this monomorphic call site (CLAUDE.md #2).
+            var connId = ConnectionId.of(index, generation);
+            var channel = connectionChannels.get(connId);
+            if (channel == null || !channel.isConnected()) return;
+
+            // Rewind the buffer without allocating a duplicate — we own it
+            // for the whole fan-out and each writeFully consumes position→limit.
+            // limit() must be widened before position() is set if the buffer
+            // was fully consumed by the previous iteration.
+            wire.limit(wireEnd);
+            wire.position(wireStart);
+            synchronized (channel) {
+                writeFully(channel, wire);
+            }
+        }
     }
 
     private void unicastImpl(ConnectionId target, Record message) {

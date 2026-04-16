@@ -166,7 +166,6 @@ public class NetGameBenchmark {
         }
     }
 
-<<<<<<< HEAD
     // --- Read-loop microbenchmarks --------------------------------------------
     //
     // Simulate Server.handleRead / Client.handleRead on a pre-filled readBuf
@@ -429,6 +428,88 @@ public class NetGameBenchmark {
                 allReg.dispatch(ping, sender);
             }
         }
+    }
+
+    // --- Broadcast fan-out benchmark ----------------------------------------
+    //
+    // Measures the server-side broadcast path: one client sends a tick, the
+    // server's handler broadcasts it to every connected client. The critical
+    // hot path we want at ~0 B/op is Server#broadcastImpl + SessionStore scan
+    // + per-recipient wire write, for N recipients.
+    //
+    // gc.alloc.rate.norm here is reported per benchmark invocation (one
+    // trigger message from the sender) but captures allocations on all JVM
+    // threads — including the server event loops doing the fan-out.
+
+    public record BroadcastTick(int seq) {}
+
+    public interface BroadcastService {
+        void tick(BroadcastTick t);
+    }
+
+    @Handles(BroadcastService.class)
+    public static class BroadcastHandler {
+        @OnMessage void tick(BroadcastTick t, ConnectionId sender, Broadcast broadcast) {
+            broadcast.send(t);
+        }
+    }
+
+    record BroadcastConn(int v) {}
+
+    @State(Scope.Benchmark)
+    public static class BroadcastState {
+        @Param({"10", "100"})
+        public int clients;
+
+        Server server;
+        Client[] connected;
+        Client sender;
+
+        @Setup(Level.Trial)
+        public void setup() throws Exception {
+            var handler = new BroadcastHandler();
+            server = Server.builder()
+                    .listen(BroadcastConn.class, Transport.tcp(0), new FramingLayer())
+                    .addService(handler, BroadcastConn.class)
+                    .build();
+            server.start();
+            int port = server.port(BroadcastConn.class);
+
+            connected = new Client[clients];
+            for (int i = 0; i < clients; i++) {
+                connected[i] = Client.builder()
+                        .connect(BroadcastConn.class, Transport.tcp("localhost", port), new FramingLayer())
+                        .addService(BroadcastService.class, BroadcastConn.class)
+                        .onMessage(BroadcastTick.class, _ -> { /* swallow */ })
+                        .build();
+                connected[i].start();
+            }
+            sender = connected[0];
+            // Wait for all connections to establish on the server side.
+            Thread.sleep(500);
+
+            // Pre-warm the dispatch + broadcast path so C2 profiles the hot
+            // loop at actual fan-out size (CLAUDE.md rule #8).
+            for (int i = 0; i < 2_000; i++) {
+                sender.send(new BroadcastTick(i));
+            }
+            Thread.sleep(200);
+        }
+
+        @TearDown(Level.Trial)
+        public void teardown() {
+            if (connected != null) {
+                for (var c : connected) {
+                    if (c != null) c.close();
+                }
+            }
+            if (server != null) server.close();
+        }
+    }
+
+    @Benchmark
+    public void broadcastFanOut(BroadcastState state) {
+        state.sender.send(new BroadcastTick(1));
     }
 
     @Benchmark

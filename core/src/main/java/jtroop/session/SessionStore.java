@@ -158,6 +158,29 @@ public final class SessionStore {
     }
 
     /**
+     * Primitive-spec iteration for allocation-sensitive fan-out paths.
+     *
+     * <p>Yields {@code (index, generation)} as primitives directly — no
+     * {@link ConnectionId} record is constructed here, so there is nothing
+     * to scalar-replace at the iteration boundary. Server broadcast uses
+     * this to walk all connected clients with zero per-iteration allocation.
+     *
+     * <p>The {@link IndexVisitor} is typically a final class held as a
+     * server field, so the call site is monomorphic and C2 inlines the
+     * visit body into the scan loop (CLAUDE.md rule #4).
+     */
+    public synchronized void forEachActiveIndex(IndexVisitor visitor) {
+        final long[] sa = stateAndActive;
+        final int[] gens = generations;
+        final int cap = capacity;
+        for (int i = 0; i < cap; i++) {
+            if ((sa[i] & ACTIVE_BIT) != 0L) {
+                visitor.visit(i, gens[i]);
+            }
+        }
+    }
+
+    /**
      * Snapshot active ids into a caller-owned {@code long[]}. Returns the
      * number of ids written. No allocation when {@code out.length >=
      * activeCount()}.
@@ -183,5 +206,11 @@ public final class SessionStore {
             }
         }
         return n;
+    }
+
+    /** Primitive visitor used by {@link #forEachActiveIndex}. */
+    @FunctionalInterface
+    public interface IndexVisitor {
+        void visit(int index, int generation);
     }
 }
