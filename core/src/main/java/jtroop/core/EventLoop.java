@@ -70,10 +70,13 @@ public final class EventLoop implements Runnable, AutoCloseable {
      * Hot path: stage bytes for writing. Uses synchronized on the per-slot buffer
      * (biased locking ~6ns uncontended).
      *
-     * Back-pressure: if the staging buffer cannot hold the new data, we drain
-     * what the socket accepts (compact — no data loss), then wake the EventLoop
-     * so it can continue draining. If room is still unavailable, spin-yield up
-     * to 5s. No bytes are silently dropped.
+     * <p>Back-pressure: if the staging buffer cannot hold the new data, we drain
+     * what the socket accepts (compact — no data loss), then spin-yield until
+     * room is available or 5s deadline elapses. No bytes are silently dropped.
+     *
+     * <p>Oversized payloads (larger than the slot buffer, 8 KiB): we hold the
+     * buf lock, flush whatever's staged, then write the oversized payload
+     * directly to the channel. Prevents BufferOverflowException on large frames.
      */
     public void stageWrite(int slot, ByteBuffer data) {
         var buf = writeBuffers[slot];
@@ -86,11 +89,35 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 PENDING_WRITE.setRelease(pendingWrite, slot, true);
                 return;
             }
+            // Oversized — larger than the slot buffer itself. Drain staged,
+            // then write the big payload directly under the buf lock so no
+            // other thread interleaves bytes on the same channel.
+            if (need > buf.capacity() && channel != null && channel.isConnected()) {
+                buf.flip();
+                try {
+                    while (buf.hasRemaining()) {
+                        int n = channel.write(buf);
+                        if (n == 0) { Thread.onSpinWait(); }
+                    }
+                } catch (IOException _) { buf.clear(); return; }
+                buf.clear();
+                PENDING_WRITE.setRelease(pendingWrite, slot, false);
+                try {
+                    long dl = System.nanoTime() + 5_000_000_000L;
+                    while (data.hasRemaining()) {
+                        int n = channel.write(data);
+                        if (n == 0) {
+                            if (System.nanoTime() > dl) return;
+                            Thread.onSpinWait();
+                        }
+                    }
+                } catch (IOException _) {}
+                return;
+            }
         }
-        // Slow path: buffer full — drain what fits, spin until room is available.
+        // Slow path: buffer full but fits in capacity — drain, spin until room available.
         long deadlineNs = System.nanoTime() + 5_000_000_000L;
         while (true) {
-            boolean roomAvailable;
             synchronized (buf) {
                 if (channel != null && channel.isConnected()) {
                     buf.flip();
@@ -100,8 +127,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
                         PENDING_WRITE.setRelease(pendingWrite, slot, true);
                     }
                 }
-                roomAvailable = buf.remaining() >= need;
-                if (roomAvailable) {
+                if (buf.remaining() >= need) {
                     buf.put(data);
                     PENDING_WRITE.setRelease(pendingWrite, slot, true);
                     return;

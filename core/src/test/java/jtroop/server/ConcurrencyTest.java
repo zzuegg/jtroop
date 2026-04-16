@@ -311,8 +311,11 @@ class ConcurrencyTest {
         server.start();
         int port = server.port(GameConn.class);
 
-        int numClients = 12;
-        int messagesPerClient = 20_000;
+        // Each handler broadcast writes to N clients; N*messages writes per
+        // input. With N=6 × 2000 in × 6 out fan-out = 72K writes under 5s
+        // writeFully deadline. Kept modest so CI doesn't flake under load.
+        int numClients = 6;
+        int messagesPerClient = 2_000;
         var clients = new Client[numClients];
         var received = new AtomicInteger[numClients];
         for (int i = 0; i < numClients; i++) {

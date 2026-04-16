@@ -288,14 +288,14 @@ class LayerTest {
 
     @Test
     void framingLayer_negativeLengthRejected() {
-        // Defensive: a corrupted length prefix must not crash or return a bogus view.
+        // Defensive: corrupt length prefix throws FramingException (caught by
+        // Server.handleRead which closes the misbehaving connection).
         var framing = new FramingLayer();
         var wire = ByteBuffer.allocate(16);
         wire.putInt(-1);
         wire.putInt(0);
         wire.flip();
 
-        assertNull(framing.decodeInbound(wire), "negative length must return null");
-        assertEquals(0, wire.position(), "position must be unchanged on invalid length");
+        assertThrows(IllegalStateException.class, () -> framing.decodeInbound(wire));
     }
 }
