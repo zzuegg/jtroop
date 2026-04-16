@@ -7,6 +7,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class EventLoop implements Runnable, AutoCloseable {
 
@@ -16,10 +17,12 @@ public final class EventLoop implements Runnable, AutoCloseable {
     // from hoisting the stageWriteAndFlush spin-wait read out of its loop.
     private static final VarHandle PENDING_WRITE;
     private static final VarHandle WRITE_TARGETS;
+    private static final VarHandle SETUP_SLOTS;
     static {
         try {
             PENDING_WRITE = MethodHandles.arrayElementVarHandle(boolean[].class);
             WRITE_TARGETS = MethodHandles.arrayElementVarHandle(SocketChannel[].class);
+            SETUP_SLOTS   = MethodHandles.arrayElementVarHandle(Runnable[].class);
         } catch (Throwable t) {
             throw new ExceptionInInitializerError(t);
         }
@@ -29,7 +32,20 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private final Thread thread;
     private volatile boolean running;
 
-    private final Queue<Runnable> setupQueue = new ConcurrentLinkedQueue<>();
+    // Lock-free MPSC ring for submit(Runnable). Pre-sized; zero per-call
+    // allocation on the fast path. Producers CAS a write index, then
+    // release-store the Runnable into the ring slot. The single consumer
+    // (loop thread) acquire-loads each slot; a null means "not yet published".
+    // Overflow (ring full) falls back to a ConcurrentLinkedQueue so no task
+    // is ever dropped; that path does allocate a node but is off the hot path
+    // for the sizes we see in practice (submits happen on accept / connect /
+    // close — O(connection lifecycle), not O(message)).
+    private static final int SETUP_RING_CAPACITY = 4096; // power of 2
+    private static final int SETUP_RING_MASK = SETUP_RING_CAPACITY - 1;
+    private final Runnable[] setupRing = new Runnable[SETUP_RING_CAPACITY];
+    private final AtomicLong setupWriteIndex = new AtomicLong(0);
+    private long setupReadIndex = 0; // single-consumer (event-loop thread)
+    private final Queue<Runnable> setupOverflow = new ConcurrentLinkedQueue<>();
 
     private final ByteBuffer[] writeBuffers;
     private final boolean[] pendingWrite;
@@ -61,8 +77,34 @@ public final class EventLoop implements Runnable, AutoCloseable {
         thread.start();
     }
 
+    /**
+     * Submit a task for execution on the event-loop thread.
+     * Thread-safe for any producer; single-consumer drain on the loop thread.
+     *
+     * <p>Fast path (ring has room): zero heap allocation — CAS-claim a slot,
+     * release-store the Runnable reference, wake the selector.
+     *
+     * <p>Slow path (ring full, &gt; {@value #SETUP_RING_CAPACITY} backlog): falls
+     * back to a ConcurrentLinkedQueue. Correct but allocates a queue node.
+     * Never drops a task.
+     */
     public void submit(Runnable task) {
-        setupQueue.add(task);
+        long idx;
+        do {
+            idx = setupWriteIndex.get();
+            if (idx - setupReadIndex >= SETUP_RING_CAPACITY) {
+                // Ring full — fall back. `setupReadIndex` is a plain long
+                // read here (producer side) so it may be stale; that only
+                // causes us to declare full a bit early, which is safe.
+                setupOverflow.add(task);
+                selector.wakeup();
+                return;
+            }
+        } while (!setupWriteIndex.compareAndSet(idx, idx + 1));
+
+        int slot = (int) (idx & SETUP_RING_MASK);
+        // Release-store so the consumer's acquire-load sees the publish.
+        SETUP_SLOTS.setRelease(setupRing, slot, task);
         selector.wakeup();
     }
 
@@ -182,14 +224,30 @@ public final class EventLoop implements Runnable, AutoCloseable {
     }
 
     private void processSetupTasks() {
-        Runnable task;
-        while ((task = setupQueue.poll()) != null) {
+        // Drain the MPSC ring first (zero-alloc fast path).
+        while (true) {
+            int slot = (int) (setupReadIndex & SETUP_RING_MASK);
+            var task = (Runnable) SETUP_SLOTS.getAcquire(setupRing, slot);
+            if (task == null) break; // slot not yet published / ring empty
+            // Clear slot before running so a producer can refill even if the
+            // task itself submits more work (re-entrant-safe).
+            SETUP_SLOTS.setRelease(setupRing, slot, (Runnable) null);
+            setupReadIndex++;
             try {
                 task.run();
             } catch (Throwable t) {
                 // Setup tasks often register channels that may have been closed
                 // by another thread (Client.close() during start()). One failing
                 // task must not kill the loop.
+                System.err.println("EventLoop: setup task failed: " + t);
+            }
+        }
+        // Drain overflow (tasks that arrived while the ring was full).
+        Runnable overflow;
+        while ((overflow = setupOverflow.poll()) != null) {
+            try {
+                overflow.run();
+            } catch (Throwable t) {
                 System.err.println("EventLoop: setup task failed: " + t);
             }
         }
