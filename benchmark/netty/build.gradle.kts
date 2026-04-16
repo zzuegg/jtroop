@@ -1,6 +1,15 @@
 plugins {
     java
+    application
     id("me.champeau.jmh") version "0.7.3"
+}
+
+tasks.register<JavaExec>("runHttp") {
+    group = "application"
+    description = "Run Netty HTTP server for wrk testing"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("bench.netty.NettyHttpServerMain")
+    jvmArgs = listOf("--enable-preview")
 }
 
 dependencies {
