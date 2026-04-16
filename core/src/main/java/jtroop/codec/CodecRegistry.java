@@ -175,6 +175,24 @@ public final class CodecRegistry {
         }
     }
 
+    /**
+     * Look up the pre-generated hidden-class codec for a specific record type.
+     * Used by hot paths that already know the expected type (e.g. request/response
+     * with a known response class) to bypass the {@code byId[typeId]} lookup and
+     * the typeId read. Returning the concrete codec keeps the subsequent
+     * {@code .decode(buf)} callsite monomorphic, letting C2 inline end-to-end
+     * and EA scalar-replace the returned record.
+     *
+     * @return the generated codec, or {@code null} if reflective-fallback is used
+     *         (happens only for types that failed bytecode generation).
+     */
+    public jtroop.generate.CodecClassGenerator.GeneratedCodec generatedCodecFor(
+            Class<? extends Record> type) {
+        var entry = byClass.get(type);
+        if (entry == null) throw new IllegalArgumentException("Unregistered type: " + type.getName());
+        return entry.generatedCodec();
+    }
+
     private List<ComponentCodec> buildComponentCodecs(Class<? extends Record> type) {
         var result = new ArrayList<ComponentCodec>();
         for (RecordComponent rc : type.getRecordComponents()) {

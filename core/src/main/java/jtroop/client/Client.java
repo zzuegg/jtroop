@@ -63,26 +63,50 @@ public final class Client implements AutoCloseable {
 
     // Slot-based pending request ring. Zero-allocation request/response:
     //  - request(): atomic-claim a slot, publish thread, park.
-    //  - reader thread: scan for first pending slot, deposit response, unpark.
+    //  - reader thread: scan for first pending slot, stash raw frame bytes,
+    //    mark ready, unpark. NO record allocation on the event-loop thread.
+    //  - waiter thread: on wake, decode the record FROM THE STASHED BYTES on
+    //    its own stack frame. With the full codec.decode chain inlined, C2
+    //    scalar-replaces the record — it never hits the heap.
     // No CompletableFuture per call, no Integer boxing, no HashMap entry.
     // 256 slots supports up to 256 in-flight requests per Client (typical: 1-4).
     private static final int REQ_SLOTS = 256;
     private static final int REQ_MASK = REQ_SLOTS - 1;
+    // Per-slot scratch size. Covers typeId (2B) + small primitive response
+    // records; grown lazily if a larger response arrives.
+    private static final int REQ_SCRATCH_INITIAL = 64;
     private static final VarHandle REQ_WAITER;
-    private static final VarHandle REQ_RESPONSE;
+    private static final VarHandle REQ_READY;
     static {
         try {
             REQ_WAITER = MethodHandles.arrayElementVarHandle(Thread[].class);
-            REQ_RESPONSE = MethodHandles.arrayElementVarHandle(Record[].class);
+            REQ_READY = MethodHandles.arrayElementVarHandle(int[].class);
         } catch (Throwable t) {
             throw new ExceptionInInitializerError(t);
         }
     }
     final Thread[] reqWaiters = new Thread[REQ_SLOTS];
-    final Record[] reqResponses = new Record[REQ_SLOTS];
+    // Per-slot ready flag. 0 = waiting, 1 = response bytes stashed in
+    // reqScratch[slot]. Primitive int avoids the heap pin that a Record[]
+    // reference slot creates for the cross-thread handoff.
+    final int[] reqReady = new int[REQ_SLOTS];
+    // Per-slot raw-frame scratch. Reader copies the inbound frame's bytes
+    // (including typeId) into scratch; waiter calls codec.decode on its own
+    // thread so EA can scalar-replace the result record.
+    final ByteBuffer[] reqScratch = new ByteBuffer[REQ_SLOTS];
+    {
+        for (int i = 0; i < REQ_SLOTS; i++) {
+            reqScratch[i] = ByteBuffer.allocate(REQ_SCRATCH_INITIAL);
+        }
+    }
     // Reader drain cursor: only mutated on the event-loop thread. Scanning
     // from here preserves FIFO response-to-waiter matching (legacy behaviour).
     private int reqDrainCursor = 0;
+    // Response-type → pre-resolved generated codec. Populated lazily on first
+    // request(msg, T) for a given T so the hot path skips the byId lookup
+    // and keeps the .decode(buf) callsite monomorphic per response type.
+    private final ConcurrentHashMap<Class<? extends Record>, jtroop.generate.CodecClassGenerator.GeneratedCodec>
+            responseCodecCache = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers;
     private final Map<Class<? extends Record>, Record> handshakeInstances;
     private final Map<Class<? extends Record>, CompletableFuture<Record>> handshakeResults = new ConcurrentHashMap<>();
@@ -215,9 +239,22 @@ public final class Client implements AutoCloseable {
                     frame = fused.decodeInbound(readBuf);
                     continue;
                 }
-                var rb = new ReadBuffer(frame);
-                var message = codec.decode(rb);
-                handleIncoming(message);
+                // Peek type id without consuming. If a push handler is
+                // registered for this type we must build the Record here
+                // (the handler signature demands it). Otherwise this is a
+                // response-to-request: stash the raw frame bytes into the
+                // waiter's slot and let the waiter decode on its own stack
+                // so C2's EA can scalar-replace the record.
+                int typeId = frame.getShort(frame.position()) & 0xFFFF;
+                var msgType = codec.classForTypeId(typeId);
+                var pushHandler = messageHandlers.get(msgType);
+                if (pushHandler != null) {
+                    var rb = new ReadBuffer(frame);
+                    var message = codec.decode(rb);
+                    pushHandler.accept(message);
+                } else {
+                    stashResponseFrame(frame);
+                }
                 frame = fused.decodeInbound(readBuf);
             }
             readBuf.compact();
@@ -255,27 +292,40 @@ public final class Client implements AutoCloseable {
         return null;
     }
 
-    private void handleIncoming(Record message) {
-        // First: check if there's a registered push handler for this type
-        @SuppressWarnings("unchecked")
-        var handler = messageHandlers.get(message.getClass());
-        if (handler != null) {
-            handler.accept(message);
-            return;
-        }
-        // Then: match against pending request slots. We scan from reqDrainCursor
-        // forward (FIFO) and deliver to the first pending waiter. This preserves
-        // the legacy "first pending wins" semantics without a HashMap scan,
-        // without per-call CompletableFuture allocation, and without Integer
-        // boxing of request ids. Hot path is an array walk + varhandle swap.
+    /**
+     * Stash the raw frame bytes (including typeId) into the first pending
+     * waiter's slot scratch buffer, mark ready, and unpark the waiter.
+     *
+     * <p>Runs on the event-loop thread. Crucially, NO Record is constructed
+     * here — the record allocation is deferred to the waiter thread's own
+     * stack frame where C2's EA can scalar-replace it. The cross-thread
+     * handoff carries only primitive bytes, never an object reference that
+     * would pin the record to the heap.
+     *
+     * <p>The scratch buffer is pre-allocated per slot (reqScratch[slot]) and
+     * sized for typical small primitive responses; it grows lazily if a
+     * larger frame arrives.
+     */
+    private void stashResponseFrame(ByteBuffer frame) {
         int start = reqDrainCursor;
         for (int i = 0; i < REQ_SLOTS; i++) {
             int slot = (start + i) & REQ_MASK;
             var waiter = (Thread) REQ_WAITER.getAcquire(reqWaiters, slot);
             if (waiter != null) {
-                REQ_RESPONSE.setRelease(reqResponses, slot, message);
-                // Clear waiter marker *before* unparking so a re-use of the slot
-                // by the same thread can't race with a stale unpark.
+                int remaining = frame.remaining();
+                ByteBuffer scratch = reqScratch[slot];
+                if (scratch.capacity() < remaining) {
+                    int newCap = Integer.highestOneBit(remaining - 1) << 1;
+                    scratch = ByteBuffer.allocate(newCap);
+                    reqScratch[slot] = scratch;
+                }
+                scratch.clear();
+                scratch.put(frame); // advances frame past the consumed bytes
+                scratch.flip();
+                // setRelease on the ready flag publishes scratch contents to
+                // the waiter. Clear the waiter marker before unpark so slot
+                // reuse by the same thread can't race with a stale unpark.
+                REQ_READY.setRelease(reqReady, slot, 1);
                 REQ_WAITER.setRelease(reqWaiters, slot, (Thread) null);
                 LockSupport.unpark(waiter);
                 reqDrainCursor = (slot + 1) & REQ_MASK;
@@ -414,9 +464,16 @@ public final class Client implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public <T extends Record> T request(Record message, Class<T> responseType) {
         // Zero-alloc request: claim a slot in the flat ring, publish our
-        // thread, send, park until reader deposits response + unparks.
-        // No CompletableFuture (waiter list allocation), no Map entry, no
-        // Integer boxing. The slot index stays as an int local → EA-friendly.
+        // thread, send, park until reader stashes response bytes + unparks.
+        // No CompletableFuture (waiter list alloc), no Map entry, no Integer
+        // boxing. The slot index stays as an int local → EA-friendly.
+        //
+        // The decode happens on THIS thread (after unpark) rather than on
+        // the event-loop thread. That keeps the Record's allocation local to
+        // a stack frame C2 can inline end-to-end (codec.decode → generated
+        // hidden class → new EchoAck(seq)), enabling scalar replacement of
+        // the returned record itself — the cross-thread handoff carries only
+        // primitive bytes, never an object reference.
         int slot = requestIdCounter.getAndIncrement() & REQ_MASK;
         Thread self = Thread.currentThread();
         // Publish waiter *before* send so the reader can't see a response
@@ -424,8 +481,7 @@ public final class Client implements AutoCloseable {
         REQ_WAITER.setRelease(reqWaiters, slot, self);
         send(message);
         long deadlineNs = System.nanoTime() + 5_000_000_000L;
-        Record response;
-        while ((response = (Record) REQ_RESPONSE.getAcquire(reqResponses, slot)) == null) {
+        while ((int) REQ_READY.getAcquire(reqReady, slot) == 0) {
             long remaining = deadlineNs - System.nanoTime();
             if (remaining <= 0) {
                 // Timed out — clear slot so reader doesn't fire a stale unpark.
@@ -434,9 +490,32 @@ public final class Client implements AutoCloseable {
             }
             LockSupport.parkNanos(remaining);
         }
-        // Clear response slot for reuse. The waiter slot was cleared by the
-        // reader when it deposited the response.
-        REQ_RESPONSE.setRelease(reqResponses, slot, (Record) null);
+        // Decode on the caller's stack, bypassing the byId lookup entirely.
+        // The scratch ByteBuffer starts at position 0 with limit = frame len.
+        // We skip the 2-byte typeId and call the pre-resolved GeneratedCodec
+        // for the expected response type directly — no ReadBuffer wrapper,
+        // no Map lookup, a monomorphic invokeinterface on a stable target.
+        // With the chain fully inlined C2 scalar-replaces the returned record.
+        var decoder = responseCodecCache.get(responseType);
+        if (decoder == null) {
+            // Cold path: resolve the codec and cache it. Subsequent calls take
+            // the fast branch above.
+            codec.register(responseType);
+            decoder = codec.generatedCodecFor(responseType);
+            if (decoder != null) responseCodecCache.put(responseType, decoder);
+        }
+        ByteBuffer scratch = reqScratch[slot];
+        Record response;
+        if (decoder != null) {
+            scratch.position(2); // skip typeId — known from responseType
+            response = decoder.decode(scratch);
+        } else {
+            scratch.position(0);
+            response = codec.decode(new ReadBuffer(scratch)); // fallback
+        }
+        // Clear ready flag for slot reuse. The waiter slot was cleared by
+        // the reader when it stashed the response.
+        REQ_READY.setRelease(reqReady, slot, 0);
         return (T) response;
     }
 
