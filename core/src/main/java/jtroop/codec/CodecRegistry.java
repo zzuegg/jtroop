@@ -92,7 +92,10 @@ public final class CodecRegistry {
     }
 
     private final Map<Class<? extends Record>, CodecEntry> byClass = new HashMap<>();
-    private final Map<Integer, CodecEntry> byId = new HashMap<>();
+    // Direct int-indexed lookup table avoids Integer boxing on the hot decode path.
+    // Type IDs are u16 (see stableTypeId) — worst case 65536 slots × 8 B reference = 512 KB.
+    // Allocation-free access (no HashMap.get → Integer.valueOf), monomorphic aaload.
+    private final CodecEntry[] byId = new CodecEntry[65536];
     private int nextId = 0;
 
     public void register(Class<? extends Record> type) {
@@ -110,7 +113,7 @@ public final class CodecRegistry {
         }
         var entry = new CodecEntry(type, id, constructor, components, accessors, generated);
         byClass.put(type, entry);
-        byId.put(id, entry);
+        byId[id] = entry;
     }
 
     private static int stableTypeId(Class<?> type) {
@@ -125,7 +128,7 @@ public final class CodecRegistry {
     }
 
     public Class<? extends Record> classForTypeId(int typeId) {
-        var entry = byId.get(typeId);
+        var entry = byId[typeId];
         if (entry == null) throw new IllegalArgumentException("Unknown type id: " + typeId);
         return entry.type();
     }
@@ -153,11 +156,15 @@ public final class CodecRegistry {
     }
 
     public Record decode(ReadBuffer rb) {
-        int typeId = rb.readShort() & 0xFFFF;
-        var entry = byId.get(typeId);
+        // Read ByteBuffer once into a local — lets EA inline the generated codec call
+        // without re-dereferencing ReadBuffer.buf on every field access.
+        var buf = rb.buffer();
+        int typeId = buf.getShort() & 0xFFFF;
+        var entry = byId[typeId];
         if (entry == null) throw new IllegalArgumentException("Unknown type id: " + typeId);
-        if (entry.generatedCodec() != null) {
-            return entry.generatedCodec().decode(rb.buffer());
+        var generated = entry.generatedCodec();
+        if (generated != null) {
+            return generated.decode(buf);
         }
         var args = new Object[entry.components().size()];
         for (int i = 0; i < args.length; i++) {
