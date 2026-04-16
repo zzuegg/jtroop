@@ -4,6 +4,17 @@ import jtroop.pipeline.layers.*;
 
 import javax.crypto.SecretKey;
 
+/**
+ * Factory helpers for {@link Layer} implementations.
+ *
+ * <p><b>Stateful vs stateless layers.</b> {@link FramingLayer} and
+ * {@link CompressionLayer} are effectively stateless — one instance can be
+ * shared by multiple connections. In contrast {@link SequencingLayer},
+ * {@link DuplicateFilterLayer}, {@link AckLayer} and {@link EncryptionLayer}
+ * own per-connection state (sequence counters, anti-replay windows, cipher
+ * nonces, unacked maps). A fresh instance MUST be constructed per connection
+ * for those — sharing them corrupts the protocol.
+ */
 public final class Layers {
     private Layers() {}
 

@@ -9,6 +9,20 @@ import java.util.Map;
 /**
  * Reliable UDP layer: sequence numbers, acknowledgments, retransmit on timeout.
  * Sender tracks unacked packets. Receiver generates acks.
+ *
+ * <p><b>Per-connection state:</b> every {@code AckLayer} instance owns a private
+ * send counter, a map of unacked packets and a pending-ack slot. These are per-peer
+ * concepts — a single instance shared across connections would cross-acknowledge
+ * traffic between unrelated peers. Always construct a fresh instance per connection.
+ *
+ * <p><b>Wiring acks onto the wire:</b> this layer does NOT embed acks inside the
+ * {@link #encodeOutbound} / {@link #decodeInbound} byte stream. After every decode
+ * the caller must check {@link #hasAckToSend()} and, if set, call {@link #writeAck}
+ * to produce an ack datagram to send back on the transport. On receipt the peer
+ * feeds that datagram into {@link #processAck(ByteBuffer)}. A periodic tick must
+ * also call {@link #writeRetransmits(ByteBuffer)} to resend packets that haven't
+ * been acked before the retransmit timeout. See
+ * {@code ReliableUdpIntegrationTest} for a concrete driver.
  */
 public final class AckLayer implements Layer {
 
@@ -99,9 +113,9 @@ public final class AckLayer implements Layer {
             if (now - pkt.sentAtNanos() >= retransmitTimeoutNanos) {
                 buf.putInt(pkt.seq());
                 buf.put(pkt.data());
-                // Reset timer
-                unacked.put(entry.getKey(),
-                        new UnackedPacket(pkt.seq(), pkt.data(), now));
+                // Reset timer — setValue() on the existing entry avoids
+                // touching the map structurally (no CME, no rehash).
+                entry.setValue(new UnackedPacket(pkt.seq(), pkt.data(), now));
                 count++;
             }
         }
