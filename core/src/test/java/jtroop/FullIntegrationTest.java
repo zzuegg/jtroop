@@ -98,7 +98,9 @@ class FullIntegrationTest {
 
         var server = Server.builder()
                 .listen(GameConn.class, Transport.tcp(0), new FramingLayer(), new EncryptionLayer(key))
-                .listen(GameConn.class, Transport.udp(0), new SequencingLayer())
+                // Use connected UDP — layers like SequencingLayer carry per-peer
+                // state and only make sense with a pinned peer.
+                .listen(GameConn.class, Transport.udpConnected(0), new SequencingLayer())
                 .onHandshake(GameConn.class, req -> {
                     if (req.version() >= 1) {
                         return new GameConn.Accepted(req.version(), req.caps() & (GameConn.CHAT | GameConn.MOVE));
@@ -118,7 +120,7 @@ class FullIntegrationTest {
         var client = Client.builder()
                 .connect(new GameConn(2, GameConn.CHAT | GameConn.MOVE),
                         Transport.tcp("localhost", tcpPort), new FramingLayer(), new EncryptionLayer(key))
-                .connect(GameConn.class, Transport.udp("localhost", udpPort), new SequencingLayer())
+                .connect(GameConn.class, Transport.udpConnected("localhost", udpPort), new SequencingLayer())
                 .addService(ChatService.class, GameConn.class)
                 .addService(MovementService.class, GameConn.class)
                 .onMessage(ServerPush.class, msg -> { pushReceived.add(msg); pushLatch.countDown(); })

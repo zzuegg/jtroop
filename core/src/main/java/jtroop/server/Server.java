@@ -56,6 +56,9 @@ public final class Server implements AutoCloseable {
     private final Map<SelectionKey, ConnectionId> keyToConnection = new ConcurrentHashMap<>();
     private final Map<ConnectionId, SelectionKey> connectionToKey = new ConcurrentHashMap<>();
     private final Map<ConnectionId, SocketChannel> connectionChannels = new ConcurrentHashMap<>();
+    // For connected-UDP listeners: connection id -> pinned DatagramChannel used
+    // to write unicast replies through the same pipeline instance.
+    private final Map<ConnectionId, java.nio.channels.DatagramChannel> udpConnectionChannels = new ConcurrentHashMap<>();
     private final Map<ConnectionId, ListenerConfig> connectionConfig = new ConcurrentHashMap<>();
     // Per-connection Layer.Context. One instance per accepted connection,
     // reused across every pipeline call on that connection. The Context holds
@@ -243,6 +246,13 @@ public final class Server implements AutoCloseable {
 
     private void startUdpListener(ListenerConfig config) throws IOException {
         var channel = java.nio.channels.DatagramChannel.open();
+        // Raise SO_RCVBUF: burst-of-packets handoff (benchmarks, reliability
+        // layers stacking sends) otherwise gets dropped at the kernel when the
+        // default 208 KB fills up before the read thread drains. 4 MB is
+        // tiny on a modern host and covers ~2750 MTU-sized datagrams.
+        try {
+            channel.setOption(java.net.StandardSocketOptions.SO_RCVBUF, 4 * 1024 * 1024);
+        } catch (IOException _) { /* best effort — some OSes cap lower */ }
         channel.bind(config.transport().address());
         int port = ((InetSocketAddress) channel.getLocalAddress()).getPort();
         boundUdpPorts.put(config.connectionType(), port);
@@ -268,11 +278,6 @@ public final class Server implements AutoCloseable {
         }
     }
 
-    // Stable ConnectionId used for every packet on a connected-mode channel.
-    // With the channel pinned to a single peer, sender identity is implicit,
-    // so a constant id avoids ConnectionId construction AND address hashing.
-    private static final ConnectionId UDP_CONNECTED_SENDER = ConnectionId.of(1, 1);
-
     private void startConnectedUdpListener(java.nio.channels.DatagramChannel channel,
                                            ListenerConfig config) throws IOException {
         // Blocking channel: read() parks the thread in the kernel — no JDK
@@ -292,6 +297,9 @@ public final class Server implements AutoCloseable {
         // First-packet setup: receive() returns the sender so we can pin the
         // channel via connect(). Subsequent packets use read(), which avoids
         // the per-packet {@link InetSocketAddress} allocation inside receive().
+        ConnectionId connId = null;
+        LayerContext ctx = null;
+        boolean dispatchedConnect = false;
         try {
             while (!Thread.currentThread().isInterrupted() && acceptLoop.isRunning()) {
                 readBuf.clear();
@@ -299,22 +307,115 @@ public final class Server implements AutoCloseable {
                     var remoteAddr = channel.receive(readBuf);
                     if (remoteAddr == null) continue;
                     try { channel.connect(remoteAddr); } catch (IOException _) {}
+                    // Promote peer: allocate a per-connection id + LayerContext
+                    // so every layer call sees a stable connectionId, the peer's
+                    // InetSocketAddress, and close hooks wired to this channel.
+                    if (connId == null) {
+                        connId = sessions.allocate();
+                        final ConnectionId pinnedId = connId;
+                        final java.nio.channels.DatagramChannel pinnedChannel = channel;
+                        ctx = new LayerContext(
+                                connId.id(),
+                                (InetSocketAddress) remoteAddr,
+                                System.nanoTime(),
+                                /* closeAfterFlush */ () -> closeUdpConnection(pinnedId, pinnedChannel),
+                                /* closeNow */        () -> closeUdpConnection(pinnedId, pinnedChannel));
+                        connectionContexts.put(connId, ctx);
+                        connectionConfig.put(connId, config);
+                        udpConnectionChannels.put(connId, channel);
+                        serviceRegistry.dispatchConnect(connId);
+                        dispatchedConnect = true;
+                    }
                 } else {
                     int n = channel.read(readBuf);
                     if (n <= 0) continue;
+                    if (ctx != null) ctx.addBytesRead(n);
                 }
                 readBuf.flip();
-                if (readBuf.remaining() >= 2) {
-                    var rb = new ReadBuffer(readBuf);
-                    var message = codec.decode(rb);
-                    serviceRegistry.dispatch(message, UDP_CONNECTED_SENDER);
+                if (readBuf.remaining() >= 2 && ctx != null) {
+                    processUdpInbound(readBuf, connId, config, channel, ctx);
                 }
             }
         } catch (ClosedChannelException _) {
             // Normal shutdown (includes AsynchronousCloseException)
         } catch (Throwable t) {
             System.err.println("Server: connected-UDP loop error: " + t);
+        } finally {
+            if (connId != null && dispatchedConnect) {
+                try { serviceRegistry.dispatchDisconnect(connId); } catch (Throwable _) {}
+                connectionContexts.remove(connId);
+                connectionConfig.remove(connId);
+                udpConnectionChannels.remove(connId);
+                sessions.release(connId);
+            }
         }
+    }
+
+    /**
+     * Pipeline-aware UDP inbound processing. Runs the fused pipeline over the
+     * received datagram, peeks the type id to fast-path {@code @ZeroAlloc} raw
+     * handlers, or falls back to codec decode + dispatch. Responses from
+     * non-raw handlers go back out through the same pipeline via
+     * {@link #sendUdpResponse}.
+     */
+    private void processUdpInbound(ByteBuffer wire, ConnectionId sender, ListenerConfig config,
+                                    java.nio.channels.DatagramChannel channel, LayerContext ctx) {
+        var fused = config.pipeline().fused();
+        var frame = fused.decodeInbound(ctx, wire);
+        if (frame == null || frame.remaining() < 2) return;
+
+        int typeId = frame.getShort() & 0xFFFF;
+        if (serviceRegistry.hasRawHandler(typeId)) {
+            serviceRegistry.dispatchRaw(typeId, frame, sender);
+            return;
+        }
+        frame.position(frame.position() - 2);
+        var rb = new ReadBuffer(frame);
+        var message = codec.decode(rb);
+        var result = serviceRegistry.dispatch(message, sender);
+        if (result instanceof Record response) {
+            sendUdpResponse(response, config, channel, sender);
+        }
+    }
+
+    /**
+     * Send a response record on a connected-UDP channel, running it through
+     * the pipeline's {@code encodeOutbound} chain with the per-connection
+     * {@link LayerContext}. Serializes on the channel (datagrams can still
+     * interleave across threads if a handler fans out).
+     */
+    private void sendUdpResponse(Record response, ListenerConfig config,
+                                  java.nio.channels.DatagramChannel channel,
+                                  ConnectionId connId) {
+        var encodeBuf = serverEncodeBuf.get();
+        var wireBuf = serverWireBuf.get();
+        encodeBuf.clear();
+        codec.encode(response, new WriteBuffer(encodeBuf));
+        encodeBuf.flip();
+
+        wireBuf.clear();
+        var ctx = connectionContexts.get(connId);
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        config.pipeline().fused().encodeOutbound(lc, encodeBuf, wireBuf);
+        wireBuf.flip();
+        int written = wireBuf.remaining();
+        try {
+            synchronized (channel) {
+                channel.write(wireBuf);
+            }
+        } catch (IOException _) {
+            // UDP write failure — best effort
+            return;
+        }
+        if (ctx != null) ctx.addBytesWritten(written);
+    }
+
+    /** Close callback for a connected-UDP session. Invoked from layer
+     *  callbacks (any thread) — unbinds the session store entry and closes the
+     *  channel, which ends the blocking read loop. */
+    private void closeUdpConnection(ConnectionId connId, java.nio.channels.DatagramChannel channel) {
+        try { channel.close(); } catch (IOException _) {}
+        // The loop's finally block will release the session + dispatch disconnect.
     }
 
     private void startMultiPeerUdpListener(java.nio.channels.DatagramChannel channel,
@@ -749,6 +850,19 @@ public final class Server implements AutoCloseable {
         private int eventLoops = 1;
 
         public Builder listen(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
+            // Plan A for unconnected UDP: the pipeline is per-connection
+            // (SequencingLayer, AckLayer, DuplicateFilterLayer all hold per-peer
+            // state) but an unconnected DatagramChannel sees every peer on the
+            // same socket. We would silently cross-contaminate their state.
+            // Fail loudly so users don't lose their filter/reliability layers.
+            if (transport instanceof jtroop.transport.UdpTransport udp
+                    && !udp.connected() && layers != null && layers.length > 0) {
+                throw new IllegalArgumentException(
+                        "Unconnected UDP (Transport.udp(...)) does not support pipeline layers — "
+                                + "per-peer state would be shared across all senders. "
+                                + "Use Transport.udpConnected(...) for filter/reliability layers, "
+                                + "or drop the layers for a pass-through unconnected UDP listener.");
+            }
             listeners.add(new ListenerConfig(connectionType, transport, new Pipeline(layers), layers));
             return this;
         }

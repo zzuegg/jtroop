@@ -246,9 +246,97 @@ public final class Client implements AutoCloseable {
 
     private void connectUdp(ConnectionConfig config) throws IOException {
         var channel = java.nio.channels.DatagramChannel.open();
-        channel.configureBlocking(false);
+        // Blocking mode only for pipelined UDP (we run a dedicated read thread
+        // that parks inside read()). Non-blocking matches the existing
+        // fire-and-forget write behaviour.
+        boolean pipelined = config.pipeline().size() > 0;
+        channel.configureBlocking(pipelined);
         channel.connect(config.transport().address()); // "connected" UDP — sends to fixed address
         udpChannels.put(config.connectionType(), channel);
+
+        // Allocate a per-connection LayerContext so every UDP layer call sees
+        // the peer's InetSocketAddress, the packed connection id, and byte
+        // counters. Only meaningful when the pipeline has layers — but cheap
+        // regardless, and skipping it would force the LayerContext.NOOP branch
+        // permanently which defeats filter layers like AllowListLayer.
+        java.net.InetSocketAddress peer = null;
+        try {
+            var remote = channel.getRemoteAddress();
+            if (remote instanceof java.net.InetSocketAddress isa) peer = isa;
+        } catch (IOException _) {}
+        final var connTypeFinal = config.connectionType();
+        // Slot index: pack a synthetic id — UDP doesn't use the event loop's
+        // channelSlots since it has no SelectionKey here. Use hashCode so
+        // multiple UDP connections produce distinct ids.
+        long packedId = ((long) 1 << 32) | (connTypeFinal.hashCode() & 0xFFFFFFFFL);
+        var ctx = new LayerContext(
+                packedId,
+                peer,
+                System.nanoTime(),
+                /* closeAfterFlush */ () -> closeConnection(connTypeFinal),
+                /* closeNow */        () -> closeConnection(connTypeFinal));
+        contextsByType.put(connTypeFinal, ctx);
+
+        // Only register the receive loop when the pipeline has layers. Without
+        // layers, unidirectional fire-and-forget is the intended use case and
+        // we want to preserve the zero-alloc fast path in sendUdpFast — no
+        // read, no context lookup on send.
+        if (config.pipeline().size() > 0) {
+            startUdpReadLoop(channel, config);
+        }
+    }
+
+    /**
+     * Dedicated blocking UDP read thread for pipelined connections. The thread
+     * reads raw datagrams, runs them through the fused pipeline (filters,
+     * reliability, framing, decompression, etc.), then dispatches through the
+     * usual push-handler / response-slot paths. Stops on channel close.
+     */
+    private final List<Thread> udpReadThreads = new ArrayList<>();
+
+    private void startUdpReadLoop(java.nio.channels.DatagramChannel channel,
+                                   ConnectionConfig config) throws IOException {
+        var t = new Thread(() -> runUdpReadLoop(channel, config),
+                "client-udp-" + config.connectionType().getSimpleName());
+        t.setDaemon(true);
+        udpReadThreads.add(t);
+        t.start();
+    }
+
+    private void runUdpReadLoop(java.nio.channels.DatagramChannel channel,
+                                 ConnectionConfig config) {
+        var readBuf = ByteBuffer.allocate(65536);
+        var ctx = contextsByType.get(config.connectionType());
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        try {
+            while (!Thread.currentThread().isInterrupted()) {
+                readBuf.clear();
+                int n = channel.read(readBuf);
+                if (n <= 0) continue;
+                if (ctx != null) ctx.addBytesRead(n);
+                readBuf.flip();
+                var fused = config.pipeline().fused();
+                var frame = fused.decodeInbound(lc, readBuf);
+                if (frame == null || frame.remaining() < 2) continue;
+                int typeId = frame.getShort(frame.position()) & 0xFFFF;
+                var msgType = codec.classForTypeId(typeId);
+                if (msgType == null) continue;
+                var pushHandler = messageHandlers.get(msgType);
+                if (pushHandler != null) {
+                    var rb = new ReadBuffer(frame);
+                    var message = codec.decode(rb);
+                    pushHandler.accept(message);
+                } else {
+                    // No push handler — stash frame bytes for a pending waiter
+                    // (request/response over UDP).
+                    stashResponseFrame(frame);
+                }
+            }
+        } catch (java.nio.channels.ClosedChannelException _) {
+            // Normal shutdown
+        } catch (IOException _) {
+            // Best effort
+        }
     }
 
     private void handleRead(SelectionKey key, ConnectionConfig config, ByteBuffer readBuf) throws IOException {
@@ -380,7 +468,7 @@ public final class Client implements AutoCloseable {
         // fresh record.
         var udpChannel = udpChannelByMsgType.get(msgType);
         if (udpChannel != null) {
-            sendUdpFast(message, udpChannel);
+            sendUdpFast(message, udpChannel, msgType);
             return;
         }
         sendTcpOrCold(message, msgType);
@@ -402,7 +490,7 @@ public final class Client implements AutoCloseable {
                 throw new IllegalStateException("No UDP connection for " + msgType.getName());
             }
             udpChannelByMsgType.put(msgType, ch);
-            sendUdpFast(message, ch);
+            sendUdpFast(message, ch, msgType);
         }
     }
 
@@ -425,9 +513,19 @@ public final class Client implements AutoCloseable {
         return encode.remaining();
     }
 
-    private void sendUdpFast(Record message, java.nio.channels.DatagramChannel udpChannel) {
+    private void sendUdpFast(Record message, java.nio.channels.DatagramChannel udpChannel,
+                              Class<? extends Record> msgType) {
         if (encodeUdpInline(message) > 0) {
-            writeUdpEncoded(udpChannel);
+            // Connected UDP with a pipeline runs encode through the layer
+            // stack (framing, sequencing, ack, compression, ...). No-layer
+            // connections keep the zero-alloc direct write path.
+            var connType = serviceToConnection.getOrDefault(msgType, msgType);
+            var cfg = udpConfigByType.get(connType);
+            if (cfg != null && cfg.pipeline().size() > 0) {
+                writeUdpThroughPipeline(udpChannel, cfg, connType);
+            } else {
+                writeUdpEncoded(udpChannel);
+            }
         }
     }
 
@@ -449,6 +547,33 @@ public final class Client implements AutoCloseable {
         } catch (IOException _) {
             // UDP send failure — best effort
         }
+    }
+
+    /**
+     * Pipeline-aware UDP write. Runs the already-encoded payload through the
+     * fused pipeline's encodeOutbound chain (with the per-connection ctx),
+     * then writes the resulting wire bytes to the datagram channel.
+     */
+    private void writeUdpThroughPipeline(java.nio.channels.DatagramChannel udpChannel,
+                                          ConnectionConfig cfg,
+                                          Class<? extends Record> connType) {
+        var encode = encodeBuf.get();
+        var wire = wireBuf.get();
+        wire.clear();
+        var ctx = contextsByType.get(connType);
+        Layer.Context lc = ctx != null ? ctx : LayerContext.NOOP;
+        cfg.pipeline().fused().encodeOutbound(lc, encode, wire);
+        wire.flip();
+        int written = wire.remaining();
+        try {
+            synchronized (udpChannel) {
+                udpChannel.write(wire);
+            }
+        } catch (IOException _) {
+            // UDP send failure — best effort
+            return;
+        }
+        if (ctx != null) ctx.addBytesWritten(written);
     }
 
     /**
@@ -662,6 +787,10 @@ public final class Client implements AutoCloseable {
         for (var channel : udpChannels.values()) {
             try { channel.close(); } catch (IOException _) {}
         }
+        for (var t : udpReadThreads) {
+            t.interrupt();
+            try { t.join(500); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
+        }
         eventLoop.close();
     }
 
@@ -679,6 +808,14 @@ public final class Client implements AutoCloseable {
         private java.util.concurrent.Executor executor;
 
         public Builder connect(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
+            if (transport instanceof jtroop.transport.UdpTransport udp
+                    && !udp.connected() && layers != null && layers.length > 0) {
+                throw new IllegalArgumentException(
+                        "Unconnected UDP (Transport.udp(...)) does not support pipeline layers — "
+                                + "per-peer state would be shared across all senders. "
+                                + "Use Transport.udpConnected(...) for filter/reliability layers, "
+                                + "or drop the layers for a pass-through unconnected UDP client.");
+            }
             connections.add(new ConnectionConfig(connectionType, transport, new Pipeline(layers), layers));
             return this;
         }
