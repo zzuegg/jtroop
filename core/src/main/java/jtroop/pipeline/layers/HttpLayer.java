@@ -18,7 +18,21 @@ import java.nio.charset.StandardCharsets;
  */
 public final class HttpLayer implements Layer {
 
+    /** Upper bound on the header section (request line + all headers). */
+    public static final int MAX_HEADER_SIZE = 8192;
+    /** Upper bound on the request body. */
+    public static final int MAX_BODY_SIZE = 1024 * 1024;
+
     public record ParsedRequest(String method, String path, byte[] body) {}
+
+    /**
+     * Thrown on malformed requests (bad request line, oversized headers,
+     * negative/duplicate/missing Content-Length on a body-bearing method, etc.).
+     * The caller should close the connection.
+     */
+    public static final class HttpProtocolException extends RuntimeException {
+        public HttpProtocolException(String msg) { super(msg); }
+    }
 
     // Pre-computed byte patterns
     private static final byte[] CRLF_CRLF = {'\r', '\n', '\r', '\n'};
@@ -35,18 +49,56 @@ public final class HttpLayer implements Layer {
     public ByteBuffer decodeInbound(ByteBuffer wire) {
         int start = wire.position();
         int headerEnd = indexOf(wire, CRLF_CRLF);
-        if (headerEnd < 0) return null;
+        if (headerEnd < 0) {
+            // No end-of-headers in sight. If the peer has already sent more
+            // than MAX_HEADER_SIZE bytes without emitting CRLFCRLF, this is
+            // a protocol violation — otherwise we'd buffer unbounded garbage.
+            if (wire.remaining() > MAX_HEADER_SIZE) {
+                throw new HttpProtocolException("Header section exceeds " + MAX_HEADER_SIZE + " bytes");
+            }
+            return null;
+        }
+        if (headerEnd - start > MAX_HEADER_SIZE) {
+            throw new HttpProtocolException("Header section exceeds " + MAX_HEADER_SIZE + " bytes");
+        }
+
+        // The request line ends at the first CRLF (which may be at headerEnd
+        // when there are no headers other than the empty terminator line).
+        int requestLineEnd = indexOfCrlf(wire, start, headerEnd + 2);
+        if (requestLineEnd < 0) throw new HttpProtocolException("Malformed request line");
 
         // Parse request line directly from bytes (no String allocation)
         // Find space after method
-        int methodEnd = indexOfByte(wire, start, headerEnd, (byte) ' ');
-        if (methodEnd < 0) return null;
+        int methodEnd = indexOfByte(wire, start, requestLineEnd, (byte) ' ');
+        if (methodEnd < 0 || methodEnd == start) {
+            throw new HttpProtocolException("Malformed request line: missing method");
+        }
         // Find space after path
-        int pathEnd = indexOfByte(wire, methodEnd + 1, headerEnd, (byte) ' ');
-        if (pathEnd < 0) return null;
+        int pathEnd = indexOfByte(wire, methodEnd + 1, requestLineEnd, (byte) ' ');
+        if (pathEnd < 0 || pathEnd == methodEnd + 1) {
+            throw new HttpProtocolException("Malformed request line: missing path");
+        }
 
-        // Find Content-Length in headers (case-insensitive byte scan)
+        boolean bodyMethod = isBodyMethod(wire, start, methodEnd);
+
+        // findContentLength returns:
+        //   -1 absent, -2 duplicated/conflicting, -3 malformed value
         int contentLength = findContentLength(wire, pathEnd, headerEnd);
+        if (contentLength == -2) {
+            throw new HttpProtocolException("Duplicate Content-Length header");
+        }
+        if (contentLength == -3) {
+            throw new HttpProtocolException("Malformed Content-Length header");
+        }
+        if (contentLength == -1) {
+            if (bodyMethod) {
+                throw new HttpProtocolException("Missing Content-Length on body-bearing request");
+            }
+            contentLength = 0;
+        }
+        if (contentLength > MAX_BODY_SIZE) {
+            throw new HttpProtocolException("Content-Length exceeds " + MAX_BODY_SIZE);
+        }
 
         // Check body is complete
         int bodyStart = headerEnd + 4;
@@ -136,30 +188,68 @@ public final class HttpLayer implements Layer {
         for (int i = 0; i < s.length(); i++) out.put((byte) s.charAt(i));
     }
 
+    /**
+     * Returns Content-Length value, or sentinel:
+     *   -1 absent
+     *   -2 duplicated with conflicting values
+     *   -3 malformed (no digits, non-numeric, overflow)
+     */
     private static int findContentLength(ByteBuffer wire, int from, int to) {
-        // Case-insensitive search for "content-length:"
         int patLen = CONTENT_LENGTH.length;
+        int found = -1;
         outer:
         for (int i = from; i <= to - patLen; i++) {
+            // A header name can only appear at the start of a header line.
+            // Ensure previous char is LF (\n) so "X-Content-Length:" is not
+            // mistaken for Content-Length.
+            if (i > from && wire.get(i - 1) != '\n') continue;
             for (int j = 0; j < patLen; j++) {
                 byte b = wire.get(i + j);
-                // Lowercase comparison (ASCII)
                 if ((b | 0x20) != CONTENT_LENGTH[j]) continue outer;
             }
-            // Found — parse number
             int numStart = i + patLen;
-            int value = 0;
-            // Skip spaces
             while (numStart < to && wire.get(numStart) == ' ') numStart++;
+            int digitStart = numStart;
+            long value = 0;
             while (numStart < to) {
                 byte b = wire.get(numStart);
                 if (b < '0' || b > '9') break;
                 value = value * 10 + (b - '0');
+                if (value > Integer.MAX_VALUE) return -3;
                 numStart++;
             }
-            return value;
+            if (numStart == digitStart) return -3; // no digits
+            int parsed = (int) value;
+            if (found >= 0 && found != parsed) return -2;
+            found = parsed;
         }
-        return 0;
+        return found;
+    }
+
+    /**
+     * Methods that carry a body and therefore require Content-Length framing
+     * (POST, PUT, PATCH). Others (GET, HEAD, DELETE, OPTIONS) may omit it.
+     */
+    private static boolean isBodyMethod(ByteBuffer wire, int start, int methodEnd) {
+        int len = methodEnd - start;
+        return matchesAscii(wire, start, len, "POST")
+                || matchesAscii(wire, start, len, "PUT")
+                || matchesAscii(wire, start, len, "PATCH");
+    }
+
+    private static boolean matchesAscii(ByteBuffer wire, int start, int len, String expected) {
+        if (len != expected.length()) return false;
+        for (int i = 0; i < len; i++) {
+            if (wire.get(start + i) != (byte) expected.charAt(i)) return false;
+        }
+        return true;
+    }
+
+    private static int indexOfCrlf(ByteBuffer buf, int from, int to) {
+        for (int i = from; i < to - 1; i++) {
+            if (buf.get(i) == '\r' && buf.get(i + 1) == '\n') return i;
+        }
+        return -1;
     }
 
     private static int indexOfByte(ByteBuffer buf, int from, int to, byte target) {
