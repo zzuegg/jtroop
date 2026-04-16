@@ -12,16 +12,15 @@ import java.util.*;
 
 public final class ServiceRegistry {
 
-    private record HandlerEntry(
-            HandlerInvoker invoker,
-            Class<? extends Record> messageType,
-            boolean hasReturn
-    ) {}
-
     private record LifecycleEntry(Object instance, MethodHandle method) {}
 
     private final CodecRegistry codec;
-    private final Map<Class<? extends Record>, HandlerEntry> handlers = new HashMap<>();
+    // Hot path: dispatch() looks up the invoker by message class. Storing the
+    // HandlerInvoker directly (rather than a wrapping record) drops one method
+    // call and one field read per dispatch — keeps the path small enough for
+    // C2 to inline the full chain and scalar-replace injectables (CLAUDE.md
+    // rule #3).
+    private final Map<Class<? extends Record>, HandlerInvoker> handlers = new HashMap<>();
     private final Map<Class<?>, Class<?>> handlerToInterface = new HashMap<>();
     private final Map<Class<?>, Set<Class<? extends Record>>> interfaceToMessageTypes = new HashMap<>();
     private final Set<Class<? extends Record>> datagramTypes = new HashSet<>();
@@ -94,13 +93,12 @@ public final class ServiceRegistry {
                 datagramTypes.add(msgType);
             }
 
-            boolean hasReturn = m.getReturnType() != void.class;
             // Generate a hidden-class invoker with fixed arity. This avoids the
             // per-dispatch Object[] allocation that MethodHandle.invokeWithArguments
             // requires, and gives C2 a monomorphic invokevirtual that can be inlined
             // and scalar-replaced across.
             var invoker = HandlerInvokerGenerator.generate(handlerInstance, m, msgType);
-            handlers.put(msgType, new HandlerEntry(invoker, msgType, hasReturn));
+            handlers.put(msgType, invoker);
         }
 
         // Scan for lifecycle methods
@@ -119,22 +117,30 @@ public final class ServiceRegistry {
         }
     }
 
-    private Broadcast broadcast;
-    private Unicast unicast;
+    // Default to the shared no-op singletons so a handler declaring a
+    // Broadcast/Unicast parameter never sees null, and so dispatch never
+    // needs a null-check. setBroadcast/setUnicast swaps them for the real
+    // Server-backed impls during wire-up.
+    private Broadcast broadcast = Broadcast.NO_OP;
+    private Unicast unicast = Unicast.NO_OP;
 
-    public void setBroadcast(Broadcast broadcast) { this.broadcast = broadcast; }
-    public void setUnicast(Unicast unicast) { this.unicast = unicast; }
+    public void setBroadcast(Broadcast broadcast) {
+        this.broadcast = broadcast == null ? Broadcast.NO_OP : broadcast;
+    }
+    public void setUnicast(Unicast unicast) {
+        this.unicast = unicast == null ? Unicast.NO_OP : unicast;
+    }
 
     public Object dispatch(Record message, ConnectionId sender) {
-        var entry = handlers.get(message.getClass());
-        if (entry == null) {
+        // Hot path: single HashMap lookup, single monomorphic invokevirtual
+        // on the hidden-class HandlerInvoker. No per-call allocation —
+        // verified by NetGameBenchmark.dispatchDirect_* at ≈ 0 B/op.
+        var invoker = handlers.get(message.getClass());
+        if (invoker == null) {
             throw new IllegalArgumentException("No handler for message type: " + message.getClass().getName());
         }
         try {
-            // Fixed-arity invocation: no Object[] allocated, no MethodHandle boxing.
-            // The HandlerInvoker is a hidden class with a monomorphic invokevirtual
-            // to the real handler method.
-            return entry.invoker().invoke(message, sender, broadcast, unicast);
+            return invoker.invoke(message, sender, broadcast, unicast);
         } catch (RuntimeException e) {
             throw e;
         } catch (Throwable e) {

@@ -11,6 +11,7 @@ import jtroop.service.*;
 import jtroop.session.ConnectionId;
 import jtroop.transport.Transport;
 import org.openjdk.jmh.annotations.*;
+import org.openjdk.jmh.infra.Blackhole;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
@@ -283,5 +284,119 @@ public class NetGameBenchmark {
     @Benchmark
     public int readLoop_serverExecutor(ReadLoopState s) {
         return s.drainOnceExecutor();
+    }
+
+    // --- Direct dispatch microbenchmarks -------------------------------------
+    //
+    // Isolate ServiceRegistry.dispatch from the transport stack — no sockets,
+    // no framing, no codec, no executor. Exercises exactly the per-message
+    // path:  handlers.get → monomorphic invokevirtual on the hidden-class
+    // HandlerInvoker → user handler → return.
+    //
+    // Complements readLoop_serverDrain (dispatch + decode) and the full
+    // chatMessage (dispatch + decode + framing + socket + encode). Target
+    // for all four shapes is ≈ 0 B/op.
+
+    public record DispatchPos(float x, float y, float z, float yaw) {}
+    public record DispatchChat(int room) {}
+    public record DispatchAck(int code) {}
+    public record DispatchEcho(int seq) {}
+    public record DispatchPing(long id) {}
+
+    public interface DispatchSvc {
+        void pos(DispatchPos p);
+        DispatchAck chat(DispatchChat c);
+        void echo(DispatchEcho e);
+        void ping(DispatchPing p);
+    }
+
+    @Handles(DispatchSvc.class)
+    public static class DispatchVoidHandler {
+        @OnMessage void pos(DispatchPos p, ConnectionId sender) {}
+    }
+
+    @Handles(DispatchSvc.class)
+    public static class DispatchReturningHandler {
+        // Returning a shared constant isolates dispatch return handling from
+        // the user-side record allocation, which would otherwise add 16 B/op.
+        static final DispatchAck SHARED_ACK = new DispatchAck(0);
+        @OnMessage DispatchAck chat(DispatchChat c, ConnectionId sender) { return SHARED_ACK; }
+    }
+
+    @Handles(DispatchSvc.class)
+    public static class DispatchBroadcastHandler {
+        @OnMessage void echo(DispatchEcho e, ConnectionId sender, Broadcast broadcast) {}
+    }
+
+    @Handles(DispatchSvc.class)
+    public static class DispatchAllHandler {
+        @OnMessage void ping(DispatchPing p, ConnectionId sender,
+                              Broadcast broadcast, Unicast unicast) {}
+    }
+
+    @State(Scope.Benchmark)
+    public static class DirectDispatchState {
+        ServiceRegistry voidReg;
+        ServiceRegistry returningReg;
+        ServiceRegistry broadcastReg;
+        ServiceRegistry allReg;
+
+        final DispatchPos pos = new DispatchPos(1f, 2f, 3f, 0.5f);
+        final DispatchChat chat = new DispatchChat(42);
+        final DispatchEcho echo = new DispatchEcho(7);
+        final DispatchPing ping = new DispatchPing(0xDEADBEEFL);
+        final ConnectionId sender = ConnectionId.of(1, 1);
+
+        @Setup(Level.Trial)
+        public void setup() {
+            voidReg = new ServiceRegistry(new CodecRegistry());
+            voidReg.register(new DispatchVoidHandler());
+
+            returningReg = new ServiceRegistry(new CodecRegistry());
+            returningReg.register(new DispatchReturningHandler());
+
+            broadcastReg = new ServiceRegistry(new CodecRegistry());
+            broadcastReg.register(new DispatchBroadcastHandler());
+            broadcastReg.setBroadcast(Broadcast.NO_OP);
+            broadcastReg.setUnicast(Unicast.NO_OP);
+
+            allReg = new ServiceRegistry(new CodecRegistry());
+            allReg.register(new DispatchAllHandler());
+            allReg.setBroadcast(Broadcast.NO_OP);
+            allReg.setUnicast(Unicast.NO_OP);
+
+            // Pre-warm so C2 compiles the hot path with real profiles
+            // (CLAUDE.md rule #8).
+            for (int i = 0; i < 20_000; i++) {
+                voidReg.dispatch(pos, sender);
+                returningReg.dispatch(chat, sender);
+                broadcastReg.dispatch(echo, sender);
+                allReg.dispatch(ping, sender);
+            }
+        }
+    }
+
+    @Benchmark
+    @OutputTimeUnit(TimeUnit.NANOSECONDS)
+    public void dispatchDirect_void(DirectDispatchState s, Blackhole bh) {
+        bh.consume(s.voidReg.dispatch(s.pos, s.sender));
+    }
+
+    @Benchmark
+    @OutputTimeUnit(TimeUnit.NANOSECONDS)
+    public void dispatchDirect_returning(DirectDispatchState s, Blackhole bh) {
+        bh.consume(s.returningReg.dispatch(s.chat, s.sender));
+    }
+
+    @Benchmark
+    @OutputTimeUnit(TimeUnit.NANOSECONDS)
+    public void dispatchDirect_broadcast(DirectDispatchState s, Blackhole bh) {
+        bh.consume(s.broadcastReg.dispatch(s.echo, s.sender));
+    }
+
+    @Benchmark
+    @OutputTimeUnit(TimeUnit.NANOSECONDS)
+    public void dispatchDirect_allInjectables(DirectDispatchState s, Blackhole bh) {
+        bh.consume(s.allReg.dispatch(s.ping, s.sender));
     }
 }
