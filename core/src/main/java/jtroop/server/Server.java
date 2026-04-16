@@ -18,6 +18,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class Server implements AutoCloseable {
 
@@ -39,18 +40,25 @@ public final class Server implements AutoCloseable {
     private final SessionStore sessions;
     private final EventLoop acceptLoop;
     private final EventLoopGroup workerGroup;
-    private final ByteBuffer serverEncodeBuf = ByteBuffer.allocate(65536);
-    private final ByteBuffer serverWireBuf = ByteBuffer.allocate(65536);
-    private final Map<Class<? extends Record>, Integer> boundPorts = new HashMap<>();
-    private final Map<Class<? extends Record>, Integer> boundUdpPorts = new HashMap<>();
-    private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new HashMap<>();
-    private final Map<SelectionKey, ConnectionId> keyToConnection = new HashMap<>();
-    private final Map<ConnectionId, SelectionKey> connectionToKey = new HashMap<>();
-    private final Map<ConnectionId, SocketChannel> connectionChannels = new HashMap<>();
-    private final Map<ConnectionId, ListenerConfig> connectionConfig = new HashMap<>();
+    // Per-thread scratch buffers for encoding. sendResponse may run on any
+    // worker loop (broadcast fan-out) or on an executor thread (request/response).
+    // Sharing a single ByteBuffer across threads would corrupt encoded frames.
+    private final ThreadLocal<ByteBuffer> serverEncodeBuf =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(65536));
+    private final ThreadLocal<ByteBuffer> serverWireBuf =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(65536));
+    // All connection-state maps are mutated on worker/accept loops and read
+    // from any loop during broadcast/unicast fan-out. ConcurrentHashMap for safety.
+    private final Map<Class<? extends Record>, Integer> boundPorts = new ConcurrentHashMap<>();
+    private final Map<Class<? extends Record>, Integer> boundUdpPorts = new ConcurrentHashMap<>();
+    private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new ConcurrentHashMap<>();
+    private final Map<SelectionKey, ConnectionId> keyToConnection = new ConcurrentHashMap<>();
+    private final Map<ConnectionId, SelectionKey> connectionToKey = new ConcurrentHashMap<>();
+    private final Map<ConnectionId, SocketChannel> connectionChannels = new ConcurrentHashMap<>();
+    private final Map<ConnectionId, ListenerConfig> connectionConfig = new ConcurrentHashMap<>();
     @SuppressWarnings("rawtypes")
     private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers;
-    private final Set<ConnectionId> handshakePending = new HashSet<>();
+    private final Set<ConnectionId> handshakePending = ConcurrentHashMap.newKeySet();
 
     private final java.util.concurrent.Executor executor;
 
@@ -219,10 +227,27 @@ public final class Server implements AutoCloseable {
         }
         if (n > 0) {
             readBuf.flip();
-            if (handshakePending.contains(connId)) {
-                processHandshake(readBuf, connId, config, channel, key);
-            } else {
-                processInbound(readBuf, connId, config, channel);
+            try {
+                if (handshakePending.contains(connId)) {
+                    processHandshake(readBuf, connId, config, channel, key);
+                } else {
+                    processInbound(readBuf, connId, config, channel);
+                }
+            } catch (Throwable t) {
+                // Malformed / malicious input: framing length out of range,
+                // unknown message type, truncated record, bad HTTP, etc.
+                // Close this connection cleanly — fires @OnDisconnect if the
+                // handshake had already completed — but do NOT let the
+                // exception reach the EventLoop, since that would cancel the
+                // key for the wrong reason and still leave state inconsistent.
+                System.err.println("Server: malformed input on " + connId + ", closing: " + t);
+                if (handshakePending.contains(connId)) {
+                    // Never dispatched connect → don't dispatch disconnect.
+                    rejectConnection(channel, config, key, connId);
+                } else {
+                    closeConnectionInternal(connId, key, channel);
+                }
+                return;
             }
             readBuf.compact();
         }
@@ -303,19 +328,30 @@ public final class Server implements AutoCloseable {
     }
 
     private void sendResponse(Record response, ListenerConfig config, SocketChannel channel) {
-        serverEncodeBuf.clear();
-        var wb = new WriteBuffer(serverEncodeBuf);
+        var encodeBuf = serverEncodeBuf.get();
+        var wireBuf = serverWireBuf.get();
+        encodeBuf.clear();
+        var wb = new WriteBuffer(encodeBuf);
         codec.encode(response, wb);
-        serverEncodeBuf.flip();
+        encodeBuf.flip();
 
-        serverWireBuf.clear();
-        config.pipeline().encodeOutbound(serverEncodeBuf, serverWireBuf);
-        serverWireBuf.flip();
+        wireBuf.clear();
+        config.pipeline().encodeOutbound(encodeBuf, wireBuf);
+        wireBuf.flip();
 
-        try {
-            channel.write(serverWireBuf);
-        } catch (IOException e) {
-            // Connection lost
+        // Multiple threads (worker loops + executor) may send to the same channel
+        // (e.g. broadcast fan-out while handler emits a reply). SocketChannel.write
+        // is not ordered across threads — interleaved writes corrupt the framed
+        // wire format. Serialize per-channel.
+        synchronized (channel) {
+            try {
+                while (wireBuf.hasRemaining()) {
+                    int n = channel.write(wireBuf);
+                    if (n == 0) break; // socket buffer full — best effort, drop
+                }
+            } catch (IOException e) {
+                // Connection lost
+            }
         }
     }
 

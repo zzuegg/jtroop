@@ -2,6 +2,17 @@ package jtroop.session;
 
 import java.util.function.Consumer;
 
+/**
+ * Tracks active connections with recycled slot indices and generation counters.
+ *
+ * Thread-safety: allocate/release/isActive/forEachActive/activeCount are safe
+ * to call from multiple threads (accept loop allocates, worker loops release,
+ * broadcast traverses from any worker loop). Mutations are serialised under
+ * {@code this} monitor; forEachActive/isActive use volatile-like reads on the
+ * {@code active} array via synchronized blocks to avoid publishing stale state.
+ * Throughput remains adequate because allocate/release are low-frequency
+ * relative to the inline hot path.
+ */
 public final class SessionStore {
 
     private final int capacity;
@@ -30,7 +41,7 @@ public final class SessionStore {
         freeHead = 0;
     }
 
-    public ConnectionId allocate() {
+    public synchronized ConnectionId allocate() {
         if (freeHead == END_OF_FREE) {
             throw new IllegalStateException("SessionStore full (capacity=" + capacity + ")");
         }
@@ -44,7 +55,7 @@ public final class SessionStore {
         return ConnectionId.of(index, generations[index]);
     }
 
-    public void release(ConnectionId id) {
+    public synchronized void release(ConnectionId id) {
         int index = id.index();
         if (!active[index] || generations[index] != id.generation()) return;
         active[index] = false;
@@ -53,34 +64,40 @@ public final class SessionStore {
         count--;
     }
 
-    public boolean isActive(ConnectionId id) {
+    public synchronized boolean isActive(ConnectionId id) {
         int index = id.index();
         return index >= 0 && index < capacity
                 && active[index]
                 && generations[index] == id.generation();
     }
 
-    public void setState(ConnectionId id, int state) {
+    public synchronized void setState(ConnectionId id, int state) {
         states[id.index()] = state;
     }
 
-    public int getState(ConnectionId id) {
+    public synchronized int getState(ConnectionId id) {
         return states[id.index()];
     }
 
-    public void setLastActivity(ConnectionId id, long nanos) {
+    public synchronized void setLastActivity(ConnectionId id, long nanos) {
         lastActivity[id.index()] = nanos;
     }
 
-    public long getLastActivity(ConnectionId id) {
+    public synchronized long getLastActivity(ConnectionId id) {
         return lastActivity[id.index()];
     }
 
-    public int activeCount() {
+    public synchronized int activeCount() {
         return count;
     }
 
-    public void forEachActive(Consumer<ConnectionId> consumer) {
+    /**
+     * Iterate active connections. The consumer runs while the store's monitor
+     * is held — do not call back into allocate/release from the consumer or
+     * you will deadlock. Broadcast/unicast encode-and-write paths are fine
+     * because they operate on SocketChannels, not on this store.
+     */
+    public synchronized void forEachActive(Consumer<ConnectionId> consumer) {
         for (int i = 0; i < capacity; i++) {
             if (active[i]) {
                 consumer.accept(ConnectionId.of(i, generations[i]));

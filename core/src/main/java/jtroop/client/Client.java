@@ -17,6 +17,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class Client implements AutoCloseable {
 
@@ -31,11 +32,20 @@ public final class Client implements AutoCloseable {
     private final CodecRegistry codec;
     private final Map<Class<? extends Record>, Class<? extends Record>> serviceToConnection;
     private final EventLoop eventLoop;
-    private final ByteBuffer encodeBuf = ByteBuffer.allocate(65536);
-    private final ByteBuffer wireBuf = ByteBuffer.allocate(65536);
-    private final Map<Class<? extends Record>, SocketChannel> channels = new HashMap<>();
-    private final Map<Class<? extends Record>, Integer> channelSlots = new HashMap<>();
-    private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new HashMap<>();
+    // Per-thread encode/wire scratch. The Client encode path is reached from
+    // user threads (send/request/sendBlocking) concurrently; a shared ByteBuffer
+    // would corrupt the encoded frame when two threads interleave. Each thread
+    // gets its own scratch, used only between encode → stageWrite.
+    private final ThreadLocal<ByteBuffer> encodeBuf =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(65536));
+    private final ThreadLocal<ByteBuffer> wireBuf =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(65536));
+    // channels / channelSlots / udpChannels are read on the event loop thread
+    // (for handleRead) and mutated/read on external threads (start, send,
+    // closeConnection). ConcurrentHashMap for safe publication + lookup.
+    private final Map<Class<? extends Record>, SocketChannel> channels = new ConcurrentHashMap<>();
+    private final Map<Class<? extends Record>, Integer> channelSlots = new ConcurrentHashMap<>();
+    private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> configByType = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> udpConfigByType = new HashMap<>();
     private final java.util.concurrent.Executor executor;
@@ -45,7 +55,7 @@ public final class Client implements AutoCloseable {
     private final Map<Class<? extends Record>, Record> handshakeInstances;
     private final Map<Class<? extends Record>, CompletableFuture<Record>> handshakeResults = new ConcurrentHashMap<>();
     private final Set<Class<? extends Record>> handshakePending = ConcurrentHashMap.newKeySet();
-    private int requestIdCounter = 0;
+    private final AtomicInteger requestIdCounter = new AtomicInteger(0);
 
     private int nextSlot = 0;
 
@@ -227,7 +237,8 @@ public final class Client implements AutoCloseable {
             return;
         }
 
-        // Phase 1: encode — small inlinable method, EA eliminates the record
+        // Phase 1: encode — small inlinable method, EA eliminates the record.
+        // The encoded bytes land in the caller thread's own wireBuf (ThreadLocal).
         int encodedBytes = encodeToWire(message);
 
         // Phase 2: stage for async write
@@ -235,7 +246,7 @@ public final class Client implements AutoCloseable {
             var connType = resolveConnection(message.getClass());
             var slot = channelSlots.get(connType);
             if (slot != null) {
-                eventLoop.stageWrite(slot, wireBuf);
+                eventLoop.stageWrite(slot, wireBuf.get());
             }
         }
     }
@@ -258,7 +269,7 @@ public final class Client implements AutoCloseable {
             var connType = resolveConnection(message.getClass());
             var slot = channelSlots.get(connType);
             if (slot != null) {
-                eventLoop.stageWriteAndFlush(slot, wireBuf);
+                eventLoop.stageWriteAndFlush(slot, wireBuf.get());
             }
         }
     }
@@ -272,14 +283,16 @@ public final class Client implements AutoCloseable {
         var config = configByType.get(connType);
         if (config == null) return 0;
 
-        encodeBuf.clear();
-        codec.encode(message, new WriteBuffer(encodeBuf));
-        encodeBuf.flip();
+        var encode = encodeBuf.get();
+        var wire = wireBuf.get();
+        encode.clear();
+        codec.encode(message, new WriteBuffer(encode));
+        encode.flip();
 
-        wireBuf.clear();
-        config.pipeline().encodeOutbound(encodeBuf, wireBuf);
-        wireBuf.flip();
-        return wireBuf.remaining();
+        wire.clear();
+        config.pipeline().encodeOutbound(encode, wire);
+        wire.flip();
+        return wire.remaining();
     }
 
     private void sendUdp(Record message) {
@@ -290,13 +303,19 @@ public final class Client implements AutoCloseable {
         }
 
         // UDP: encode message directly (no framing needed), reuse buffer
-        encodeBuf.clear();
-        var wb = new WriteBuffer(encodeBuf);
+        var encode = encodeBuf.get();
+        encode.clear();
+        var wb = new WriteBuffer(encode);
         codec.encode(message, wb);
-        encodeBuf.flip();
+        encode.flip();
 
         try {
-            udpChannel.write(encodeBuf);
+            // DatagramChannel.write is thread-safe via internal write lock,
+            // but we still need to ensure the full datagram goes out without
+            // another thread interleaving on the same channel buffer.
+            synchronized (udpChannel) {
+                udpChannel.write(encode);
+            }
         } catch (IOException e) {
             // UDP send failure — best effort
         }
@@ -305,7 +324,7 @@ public final class Client implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public <T extends Record> T request(Record message, Class<T> responseType) {
         var future = new CompletableFuture<Record>();
-        int reqId = requestIdCounter++;
+        int reqId = requestIdCounter.getAndIncrement();
         pendingRequests.put(reqId, future);
         send(message);
         try {
