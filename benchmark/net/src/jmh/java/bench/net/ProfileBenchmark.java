@@ -76,6 +76,22 @@ public class ProfileBenchmark {
         return codec.decode(new ReadBuffer(frame));
     }
 
+    /** Isolate: pipeline decode only. Targets the allocation cost of
+     *  FramingLayer.decodeInbound — previously 56 B/op from wire.slice(). */
+    @Benchmark
+    public Object pipelineDecode() {
+        // Prepare a framed wire buffer (setup excluded from the hot path is
+        // unrealistic; include it so the frame is fresh each call). The encode
+        // steps do not allocate, so any B/op reported is from decode.
+        encodeBuf.clear();
+        codec.encode(msg, wb);
+        encodeBuf.flip();
+        wireBuf.clear();
+        pipeline.encodeOutbound(encodeBuf, wireBuf);
+        wireBuf.flip();
+        return pipeline.decodeInbound(wireBuf);
+    }
+
     /** Isolate: full send path (encode + pipeline + stageWrite, no actual network) */
     record BenchConn(int v) {}
 
