@@ -144,4 +144,137 @@ class SessionTest {
         assertTrue(active.contains(id1));
         assertTrue(active.contains(id3));
     }
+
+    @Test
+    void sessionStore_allocate_beyondCapacityBoundary_reusesReleasedSlots() {
+        var store = new SessionStore(3);
+        var a = store.allocate();
+        var b = store.allocate();
+        var c = store.allocate();
+        assertThrows(IllegalStateException.class, store::allocate);
+
+        // Release two, re-allocate — should succeed and then fail on the fourth.
+        store.release(a);
+        store.release(b);
+        var d = store.allocate();
+        var e = store.allocate();
+        assertTrue(store.isActive(c));
+        assertTrue(store.isActive(d));
+        assertTrue(store.isActive(e));
+        assertThrows(IllegalStateException.class, store::allocate);
+    }
+
+    @Test
+    void sessionStore_releaseTwice_isSafeNoOp() {
+        var store = new SessionStore(4);
+        var id = store.allocate();
+        store.release(id);
+        assertEquals(0, store.activeCount());
+        // Second release with the same (now-stale) handle must be a no-op.
+        store.release(id);
+        assertEquals(0, store.activeCount());
+        // And still allocates correctly after the double-release.
+        var next = store.allocate();
+        assertTrue(store.isActive(next));
+        assertEquals(1, store.activeCount());
+    }
+
+    @Test
+    void sessionStore_release_withStaleGeneration_isSafeNoOp() {
+        var store = new SessionStore(4);
+        var id1 = store.allocate();
+        store.release(id1);
+        var id2 = store.allocate(); // same slot, new generation
+        // Releasing the stale handle must not affect the current live session.
+        store.release(id1);
+        assertTrue(store.isActive(id2));
+        assertEquals(1, store.activeCount());
+    }
+
+    @Test
+    void sessionStore_release_withInvalidIndex_isSafeNoOp() {
+        var store = new SessionStore(4);
+        store.allocate();
+        // Out-of-range handles must be a silent no-op (not throw).
+        store.release(ConnectionId.of(-1, 1));
+        store.release(ConnectionId.of(99, 1));
+        assertEquals(1, store.activeCount());
+    }
+
+    @Test
+    void sessionStore_forEachActive_withAllocationsAndReleasesInterleaved() {
+        var store = new SessionStore(8);
+        var ids = new ConnectionId[8];
+        for (int i = 0; i < 8; i++) ids[i] = store.allocate();
+        // Release every other slot.
+        store.release(ids[1]);
+        store.release(ids[3]);
+        store.release(ids[5]);
+        store.release(ids[7]);
+
+        var seen = new java.util.ArrayList<ConnectionId>();
+        store.forEachActive(seen::add);
+        assertEquals(4, seen.size());
+        assertTrue(seen.contains(ids[0]));
+        assertTrue(seen.contains(ids[2]));
+        assertTrue(seen.contains(ids[4]));
+        assertTrue(seen.contains(ids[6]));
+
+        // Re-allocate into freed slots — generation must have advanced.
+        var reused = store.allocate();
+        assertEquals(2, reused.generation());
+        seen.clear();
+        store.forEachActive(seen::add);
+        assertEquals(5, seen.size());
+        assertTrue(seen.contains(reused));
+    }
+
+    @Test
+    void sessionStore_forEachActive_emptyStore_callsConsumerZeroTimes() {
+        var store = new SessionStore(8);
+        var seen = new java.util.ArrayList<ConnectionId>();
+        store.forEachActive(seen::add);
+        assertEquals(0, seen.size());
+    }
+
+    @Test
+    void sessionStore_state_preservedIndependentlyOfFreeList() {
+        // Regression: old implementation overloaded `states` to carry the
+        // free-list pointer. Make sure freeing and re-allocating a different
+        // slot does not corrupt another slot's state.
+        var store = new SessionStore(4);
+        var a = store.allocate();
+        var b = store.allocate();
+        store.setState(a, 111);
+        store.setState(b, 222);
+        store.release(b); // alters free list; must not touch `a`'s state
+        assertEquals(111, store.getState(a));
+        var c = store.allocate(); // reuses b's slot
+        assertEquals(0, store.getState(c)); // fresh slot starts at 0
+        assertEquals(111, store.getState(a)); // still intact
+    }
+
+    @Test
+    void sessionStore_state_independentOfActiveBit() {
+        // State is packed alongside the active flag in the new layout.
+        // Verify that setting negative / sign-bit state values still works.
+        var store = new SessionStore(4);
+        var id = store.allocate();
+        store.setState(id, -1);
+        assertEquals(-1, store.getState(id));
+        assertTrue(store.isActive(id));
+        store.setState(id, Integer.MIN_VALUE);
+        assertEquals(Integer.MIN_VALUE, store.getState(id));
+        assertTrue(store.isActive(id));
+        store.setState(id, Integer.MAX_VALUE);
+        assertEquals(Integer.MAX_VALUE, store.getState(id));
+        assertTrue(store.isActive(id));
+    }
+
+    @Test
+    void sessionStore_zeroCapacity_allocateThrows() {
+        var store = new SessionStore(0);
+        assertEquals(0, store.activeCount());
+        assertThrows(IllegalStateException.class, store::allocate);
+    }
 }
