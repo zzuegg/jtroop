@@ -1,6 +1,8 @@
 package jtroop.service;
 
 import jtroop.codec.CodecRegistry;
+import jtroop.generate.HandlerInvokerGenerator;
+import jtroop.generate.HandlerInvokerGenerator.HandlerInvoker;
 import jtroop.session.ConnectionId;
 
 import java.lang.invoke.MethodHandle;
@@ -11,8 +13,7 @@ import java.util.*;
 public final class ServiceRegistry {
 
     private record HandlerEntry(
-            Object instance,
-            MethodHandle method,
+            HandlerInvoker invoker,
             Class<? extends Record> messageType,
             boolean hasReturn
     ) {}
@@ -93,13 +94,13 @@ public final class ServiceRegistry {
                 datagramTypes.add(msgType);
             }
 
-            try {
-                var mh = lookup.unreflect(m);
-                boolean hasReturn = m.getReturnType() != void.class;
-                handlers.put(msgType, new HandlerEntry(handlerInstance, mh, msgType, hasReturn));
-            } catch (IllegalAccessException e) {
-                throw new RuntimeException("Cannot access method: " + m.getName(), e);
-            }
+            boolean hasReturn = m.getReturnType() != void.class;
+            // Generate a hidden-class invoker with fixed arity. This avoids the
+            // per-dispatch Object[] allocation that MethodHandle.invokeWithArguments
+            // requires, and gives C2 a monomorphic invokevirtual that can be inlined
+            // and scalar-replaced across.
+            var invoker = HandlerInvokerGenerator.generate(handlerInstance, m, msgType);
+            handlers.put(msgType, new HandlerEntry(invoker, msgType, hasReturn));
         }
 
         // Scan for lifecycle methods
@@ -130,23 +131,12 @@ public final class ServiceRegistry {
             throw new IllegalArgumentException("No handler for message type: " + message.getClass().getName());
         }
         try {
-            var method = entry.method();
-            var params = method.type().parameterList();
-            var args = new Object[params.size()];
-            args[0] = entry.instance();
-            for (int i = 1; i < params.size(); i++) {
-                var paramType = params.get(i);
-                if (paramType.isInstance(message)) {
-                    args[i] = message;
-                } else if (paramType == ConnectionId.class) {
-                    args[i] = sender;
-                } else if (paramType == Broadcast.class) {
-                    args[i] = broadcast;
-                } else if (paramType == Unicast.class) {
-                    args[i] = unicast;
-                }
-            }
-            return method.invokeWithArguments(args);
+            // Fixed-arity invocation: no Object[] allocated, no MethodHandle boxing.
+            // The HandlerInvoker is a hidden class with a monomorphic invokevirtual
+            // to the real handler method.
+            return entry.invoker().invoke(message, sender, broadcast, unicast);
+        } catch (RuntimeException e) {
+            throw e;
         } catch (Throwable e) {
             throw new RuntimeException("Dispatch failed for " + message.getClass().getName(), e);
         }
