@@ -239,13 +239,13 @@ public final class EventLoop implements Runnable, AutoCloseable {
         if (slot >= activeSlots) activeSlots = slot + 1;
     }
 
-    // Cached consumer handed to {@link Selector#select(Consumer, long)} so
-    // the loop doesn't allocate a fresh lambda per cycle. The Selector.select
-    // form iterates its internal ready-keys directly and auto-removes each
-    // entry — no {@code selectedKeys().iterator()} HashIterator allocation
-    // (~32 B/cycle) per fan-out recipient (CLAUDE.md rule #7). Under broadcast
-    // fan-out at N=100 this saved 100×32 = ~3200 B/op across the N receiver
-    // client EventLoops.
+    // Cached consumer handed to {@link Selector#select(Consumer, long)} /
+    // {@link Selector#selectNow(Consumer)} so the loop doesn't allocate a
+    // fresh lambda per cycle. Those Selector.select forms iterate the internal
+    // ready-keys directly and auto-remove each entry — no
+    // {@code selectedKeys().iterator()} HashIterator allocation (~32 B/cycle)
+    // per fan-out recipient (CLAUDE.md rule #7). Under broadcast fan-out at
+    // N=100 this saves 100×32 = ~3200 B/op across the N receiver client loops.
     private final java.util.function.Consumer<SelectionKey> keyDispatch = this::dispatchKey;
 
     private void dispatchKey(SelectionKey key) {
@@ -262,16 +262,46 @@ public final class EventLoop implements Runnable, AutoCloseable {
         }
     }
 
+    // Adaptive-poll tuning. The goal is to shave the ~1ms latency floor that
+    // a naive select(1) imposes when a producer stages bytes just *after*
+    // the loop last returned from the selector — without starving the
+    // producer on localhost where producer and loop threads compete for CPU.
+    //
+    //   * When we have work queued (pending writes or pending setup tasks)
+    //     there's no reason to block in select — use selectNow() so the
+    //     next iteration drains the new bytes without a 1ms stall. This is
+    //     the critical path for stageWriteAndFlush() which wakes the loop
+    //     but may race such that by the time we re-enter select(), the
+    //     wakeup token has already been consumed by an earlier cycle.
+    //
+    //   * When truly idle, fall back to select(1ms). Any producer thread
+    //     calling submit() / stageWriteAndFlush() wakes the selector
+    //     promptly via the existing wakeup() machinery, so wakeup-path
+    //     latency is unchanged.
+    //
+    //   * The work-detection check is O(activeSlots) of plain-volatile
+    //     reads, but flushPendingWrites() does the same scan inside the
+    //     loop so it is already on the hot path; no new cost.
+    //
+    //   * Graceful shutdown: close() sets running=false and wakes the
+    //     selector; we exit either branch promptly on the next loop check.
+    private static final long BLOCKING_SELECT_TIMEOUT_MS = 1L;
+
     @Override
     public void run() {
         while (running) {
             try {
-                // Selector.select(Consumer, long): dispatch each ready key
-                // through {@code keyDispatch} without ever materialising the
-                // {@code selectedKeys()} Set's iterator. Replaces the classic
-                // {@code select(); iterator() while(hasNext){ ... }} shape,
-                // which allocated a {@code HashMap$KeyIterator} per cycle.
-                selector.select(keyDispatch, 1);
+                // Adaptive: if producers have already staged bytes or queued
+                // setup tasks, skip the 1ms block and drain immediately via
+                // selectNow(Consumer). Otherwise block up to 1ms via
+                // select(Consumer, long). Both forms iterate the internal
+                // ready-keys directly through `keyDispatch`, so no
+                // selectedKeys().iterator() allocation either way.
+                if (hasPendingWrites() || hasSetupTasks()) {
+                    selector.selectNow(keyDispatch);
+                } else {
+                    selector.select(keyDispatch, BLOCKING_SELECT_TIMEOUT_MS);
+                }
                 processSetupTasks();
                 flushPendingWrites();
             } catch (IOException e) {
@@ -281,6 +311,13 @@ public final class EventLoop implements Runnable, AutoCloseable {
             }
         }
         try { selector.close(); } catch (IOException _) {}
+    }
+
+    /** True if any producer has published a setup task we haven't drained yet. */
+    private boolean hasSetupTasks() {
+        int slot = (int) (setupReadIndex & SETUP_RING_MASK);
+        if (SETUP_SLOTS.getAcquire(setupRing, slot) != null) return true;
+        return !setupOverflow.isEmpty();
     }
 
     private void processSetupTasks() {
