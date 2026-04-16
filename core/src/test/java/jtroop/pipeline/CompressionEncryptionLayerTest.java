@@ -79,6 +79,73 @@ class CompressionEncryptionLayerTest {
     }
 
     @Test
+    void encryptionLayer_variousPayloadSizes() throws Exception {
+        var key = generateKey();
+        var encLayer = new EncryptionLayer(key);
+        var decLayer = new EncryptionLayer(key);
+        int[] sizes = {0, 1, 16, 1024, 4096, 16384, 65000};
+        for (int size : sizes) {
+            var plain = new byte[size];
+            for (int i = 0; i < size; i++) plain[i] = (byte) (i * 31);
+            var payload = ByteBuffer.allocate(Math.max(size, 1));
+            payload.put(plain);
+            payload.flip();
+
+            var wire = ByteBuffer.allocate(size + 256);
+            encLayer.encodeOutbound(payload, wire);
+            wire.flip();
+
+            var decoded = decLayer.decodeInbound(wire);
+            assertNotNull(decoded, "decoded null for size " + size);
+            var result = new byte[decoded.remaining()];
+            decoded.get(result);
+            assertArrayEquals(plain, result, "roundtrip mismatch for size " + size);
+        }
+    }
+
+    @Test
+    void encryptionLayer_tamperedCiphertextRejected() throws Exception {
+        var key = generateKey();
+        var encLayer = new EncryptionLayer(key);
+        var decLayer = new EncryptionLayer(key);
+
+        var payload = ByteBuffer.allocate(64);
+        payload.putLong(0xDEADBEEFCAFEBABEL);
+        payload.flip();
+
+        var wire = ByteBuffer.allocate(256);
+        encLayer.encodeOutbound(payload, wire);
+        wire.flip();
+
+        // Flip one byte deep inside the ciphertext (past IV + length prefix).
+        int tamperIdx = wire.position() + 12 + 4 + 2;
+        wire.put(tamperIdx, (byte) (wire.get(tamperIdx) ^ 0x01));
+
+        assertThrows(RuntimeException.class, () -> decLayer.decodeInbound(wire),
+                "MAC must detect tampered ciphertext");
+    }
+
+    @Test
+    void encryptionLayer_uniqueIvPerEncode() throws Exception {
+        // Guardrail against the catastrophic GCM failure mode of IV reuse.
+        var key = generateKey();
+        var layer = new EncryptionLayer(key);
+        var seen = new java.util.HashSet<String>();
+        for (int i = 0; i < 1000; i++) {
+            var payload = ByteBuffer.allocate(8);
+            payload.putLong(i);
+            payload.flip();
+            var wire = ByteBuffer.allocate(128);
+            layer.encodeOutbound(payload, wire);
+            wire.flip();
+            var iv = new byte[12];
+            wire.get(iv);
+            var hex = java.util.HexFormat.of().formatHex(iv);
+            assertTrue(seen.add(hex), "IV reused at iteration " + i);
+        }
+    }
+
+    @Test
     void encryptionLayer_ciphertextDiffersFromPlaintext() throws Exception {
         var key = generateKey();
         var layer = new EncryptionLayer(key);
