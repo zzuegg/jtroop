@@ -13,7 +13,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Standalone multi-threaded HTTP server for external wrk/ab benchmarking.
- * Zero-allocation hot path: per-connection buffers are reused, response is pre-built.
+ * Realistic: per-request response encoding through HttpLayer (no pre-built cheat).
  *
  * Run:  gradle :benchmark:common:runHttp
  * Test: wrk -t4 -c100 -d10s http://localhost:8080/
@@ -21,19 +21,8 @@ import java.nio.charset.StandardCharsets;
 public class HttpServerMain {
 
     private static final byte[] HELLO_BODY = "Hello, World!".getBytes(StandardCharsets.UTF_8);
-    // Pre-built response frame (reused across ALL connections — immutable after construction)
-    private static final byte[] PREBUILT_RESPONSE = prebuildResponse();
-
-    private static byte[] prebuildResponse() {
-        var header = ("HTTP/1.1 200 OK\r\n" +
-                "Content-Type: text/plain\r\n" +
-                "Content-Length: " + HELLO_BODY.length + "\r\n" +
-                "Connection: keep-alive\r\n\r\n").getBytes(StandardCharsets.UTF_8);
-        var result = new byte[header.length + HELLO_BODY.length];
-        System.arraycopy(header, 0, result, 0, header.length);
-        System.arraycopy(HELLO_BODY, 0, result, header.length, HELLO_BODY.length);
-        return result;
-    }
+    private static final String OK_REASON = "OK";
+    private static final String TEXT_PLAIN = "text/plain";
 
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 8080;
@@ -76,7 +65,7 @@ public class HttpServerMain {
         client.configureBlocking(false);
         client.setOption(java.net.StandardSocketOptions.TCP_NODELAY, true);
 
-        // Per-connection state — allocated ONCE, reused for all requests on this connection
+        // Per-connection state — allocated ONCE, reused for all requests
         var conn = new ConnState();
 
         var worker = workerGroup.next();
@@ -105,22 +94,14 @@ public class HttpServerMain {
         if (n > 0) {
             conn.readBuf.flip();
             var frame = conn.pipeline.decodeInbound(conn.readBuf);
-            // Batch all responses for this read into the write buffer
             conn.writeBuf.clear();
-            int responses = 0;
             while (frame != null) {
-                // Just put the pre-built response bytes directly (zero-alloc)
-                if (conn.writeBuf.remaining() < PREBUILT_RESPONSE.length) {
-                    // Flush what we have
-                    conn.writeBuf.flip();
-                    while (conn.writeBuf.hasRemaining()) channel.write(conn.writeBuf);
-                    conn.writeBuf.clear();
-                }
-                conn.writeBuf.put(PREBUILT_RESPONSE);
-                responses++;
+                // Build response frame per-request via HttpLayer (realistic app workload)
+                var respFrame = HttpLayer.buildResponseFrame(200, OK_REASON, TEXT_PLAIN, HELLO_BODY);
+                conn.pipeline.encodeOutbound(respFrame, conn.writeBuf);
                 frame = conn.pipeline.decodeInbound(conn.readBuf);
             }
-            if (responses > 0) {
+            if (conn.writeBuf.position() > 0) {
                 conn.writeBuf.flip();
                 while (conn.writeBuf.hasRemaining()) channel.write(conn.writeBuf);
             }
