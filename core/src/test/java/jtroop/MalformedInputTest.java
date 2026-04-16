@@ -342,6 +342,7 @@ class MalformedInputTest {
         // (we treat them as harmless — same intent).
         var layer = new HttpLayer();
         var ok = ("POST /x HTTP/1.1\r\n"
+                + "Host: h\r\n"
                 + "Content-Length: 5\r\n"
                 + "Content-Length: 5\r\n"
                 + "\r\nhello").getBytes(StandardCharsets.UTF_8);
