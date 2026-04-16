@@ -3,8 +3,6 @@ package jtroop.pipeline.layers;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 /**
  * Reliable UDP layer: sequence numbers, acknowledgments, retransmit on timeout.
@@ -23,16 +21,34 @@ import java.util.Map;
  * also call {@link #writeRetransmits(ByteBuffer)} to resend packets that haven't
  * been acked before the retransmit timeout. See
  * {@code ReliableUdpIntegrationTest} for a concrete driver.
+ *
+ * <p><b>Zero-alloc on the hot path.</b> The unacked-packet store is a
+ * struct-of-arrays — three parallel primitive arrays ({@code int[] seqs},
+ * {@code long[] sentAtNanos}, and one flat {@code byte[] payloads} with
+ * {@code int[] lengths}) and a small {@code int[] slots} ring telling us which
+ * slot holds which seq. There is no {@code HashMap}, no {@code Integer}
+ * boxing and no per-call {@code byte[]} allocation — an {@link #encodeOutbound}
+ * call runs without any heap allocations after warmup.
  */
 public final class AckLayer implements Layer {
 
-    private record UnackedPacket(int seq, byte[] data, long sentAtNanos) {}
-
     private final long retransmitTimeoutNanos;
+
     private int sendSeq = 0;
-    private final Map<Integer, UnackedPacket> unacked = new LinkedHashMap<>();
-    private int lastAckedSeq = -1; // highest acked by peer
-    private int pendingAckSeq = -1; // seq to ack back to sender
+    private int lastAckedSeq = -1;   // highest seq acknowledged by peer
+    private int pendingAckSeq = -1;  // seq to ack back to sender
+
+    // Struct-of-arrays unacked ring. A slot is "occupied" iff {@code seqs[i] >= 0}.
+    // Slots are recycled when processAck matches.
+    private static final int INITIAL_CAPACITY = 64;
+    private static final int MAX_PAYLOAD_PER_SLOT = 1500; // MTU-sized datagrams
+    private int[] unackSeqs = new int[INITIAL_CAPACITY];
+    private long[] unackSentAtNanos = new long[INITIAL_CAPACITY];
+    private int[] unackLengths = new int[INITIAL_CAPACITY];
+    // Flat payload store: slot i occupies bytes [i*MAX_PAYLOAD_PER_SLOT,
+    // i*MAX_PAYLOAD_PER_SLOT + lengths[i]). One allocation at construction time.
+    private byte[] unackPayloads = new byte[INITIAL_CAPACITY * MAX_PAYLOAD_PER_SLOT];
+    private int unackCount = 0;
 
     public AckLayer() {
         this(200); // default 200ms timeout
@@ -40,20 +56,64 @@ public final class AckLayer implements Layer {
 
     public AckLayer(long retransmitTimeoutMs) {
         this.retransmitTimeoutNanos = retransmitTimeoutMs * 1_000_000L;
+        // Initialize seqs to -1 so an "empty" slot is distinguishable.
+        for (int i = 0; i < unackSeqs.length; i++) unackSeqs[i] = -1;
     }
 
     @Override
     public void encodeOutbound(ByteBuffer payload, ByteBuffer out) {
         int seq = sendSeq++;
         out.putInt(seq);
-        int start = payload.position();
+        int payloadStart = payload.position();
+        int payloadLen = payload.remaining();
         out.put(payload);
 
-        // Track for retransmit
-        payload.position(start);
-        var data = new byte[payload.remaining()];
-        payload.get(data);
-        unacked.put(seq, new UnackedPacket(seq, data, System.nanoTime()));
+        // Reset payload read-position so the caller can still read it (mirrors
+        // the historical record-creating code path).
+        payload.position(payloadStart);
+
+        // Track for retransmit. Copy payload bytes into the flat store.
+        int slot = allocateSlot();
+        unackSeqs[slot] = seq;
+        unackSentAtNanos[slot] = System.nanoTime();
+        unackLengths[slot] = payloadLen;
+        int base = slot * MAX_PAYLOAD_PER_SLOT;
+        // Use bulk get into the flat store so no temporary byte[] is allocated.
+        if (payloadLen > MAX_PAYLOAD_PER_SLOT) {
+            throw new IllegalStateException("AckLayer payload exceeds MTU slot size: " + payloadLen);
+        }
+        payload.get(unackPayloads, base, payloadLen);
+        // Restore read position once more — we moved it by the bulk get above.
+        payload.position(payloadStart);
+    }
+
+    /** Find a free slot, growing the arrays if every slot is full. */
+    private int allocateSlot() {
+        var seqs = unackSeqs;
+        for (int i = 0; i < seqs.length; i++) {
+            if (seqs[i] < 0) {
+                unackCount++;
+                return i;
+            }
+        }
+        // Grow — cold path (only hit if more than INITIAL_CAPACITY packets
+        // are in-flight without acks).
+        int newCap = seqs.length * 2;
+        var newSeqs = new int[newCap];
+        var newTimes = new long[newCap];
+        var newLens = new int[newCap];
+        var newData = new byte[newCap * MAX_PAYLOAD_PER_SLOT];
+        System.arraycopy(seqs, 0, newSeqs, 0, seqs.length);
+        for (int i = seqs.length; i < newCap; i++) newSeqs[i] = -1;
+        System.arraycopy(unackSentAtNanos, 0, newTimes, 0, seqs.length);
+        System.arraycopy(unackLengths, 0, newLens, 0, seqs.length);
+        System.arraycopy(unackPayloads, 0, newData, 0, unackPayloads.length);
+        unackSeqs = newSeqs;
+        unackSentAtNanos = newTimes;
+        unackLengths = newLens;
+        unackPayloads = newData;
+        unackCount++;
+        return seqs.length;
     }
 
     @Override
@@ -61,10 +121,10 @@ public final class AckLayer implements Layer {
         if (wire.remaining() < 4) return null;
         int seq = wire.getInt();
         pendingAckSeq = seq;
-
-        var payload = wire.slice(wire.position(), wire.remaining());
-        wire.position(wire.limit());
-        return payload;
+        // Return the same buffer, positioned past the 4-byte seq prefix.
+        // {@code wire.getInt()} above advanced position by 4, so the caller
+        // reads the payload from position..limit without any allocation.
+        return wire;
     }
 
     /** Whether this layer has an ack to send back to the sender. */
@@ -81,7 +141,16 @@ public final class AckLayer implements Layer {
     /** Process an incoming ack from the receiver. */
     public void processAck(ByteBuffer ackBuf) {
         int ackedSeq = ackBuf.getInt();
-        unacked.remove(ackedSeq);
+        // Linear scan — no allocation, branch-predictor friendly for typical
+        // in-flight window sizes (< 64).
+        var seqs = unackSeqs;
+        for (int i = 0; i < seqs.length; i++) {
+            if (seqs[i] == ackedSeq) {
+                seqs[i] = -1;
+                unackCount--;
+                break;
+            }
+        }
         if (ackedSeq > lastAckedSeq) {
             lastAckedSeq = ackedSeq;
         }
@@ -89,14 +158,16 @@ public final class AckLayer implements Layer {
 
     /** Number of packets sent but not yet acknowledged. */
     public int unackedCount() {
-        return unacked.size();
+        return unackCount;
     }
 
     /** Whether any unacked packets have exceeded the retransmit timeout. */
     public boolean hasRetransmits() {
         long now = System.nanoTime();
-        for (var pkt : unacked.values()) {
-            if (now - pkt.sentAtNanos() >= retransmitTimeoutNanos) return true;
+        var seqs = unackSeqs;
+        var times = unackSentAtNanos;
+        for (int i = 0; i < seqs.length; i++) {
+            if (seqs[i] >= 0 && now - times[i] >= retransmitTimeoutNanos) return true;
         }
         return false;
     }
@@ -107,15 +178,16 @@ public final class AckLayer implements Layer {
      */
     public int writeRetransmits(ByteBuffer buf) {
         long now = System.nanoTime();
+        var seqs = unackSeqs;
+        var times = unackSentAtNanos;
+        var lens = unackLengths;
+        var data = unackPayloads;
         int count = 0;
-        for (var entry : unacked.entrySet()) {
-            var pkt = entry.getValue();
-            if (now - pkt.sentAtNanos() >= retransmitTimeoutNanos) {
-                buf.putInt(pkt.seq());
-                buf.put(pkt.data());
-                // Reset timer — setValue() on the existing entry avoids
-                // touching the map structurally (no CME, no rehash).
-                entry.setValue(new UnackedPacket(pkt.seq(), pkt.data(), now));
+        for (int i = 0; i < seqs.length; i++) {
+            if (seqs[i] >= 0 && now - times[i] >= retransmitTimeoutNanos) {
+                buf.putInt(seqs[i]);
+                buf.put(data, i * MAX_PAYLOAD_PER_SLOT, lens[i]);
+                times[i] = now;
                 count++;
             }
         }

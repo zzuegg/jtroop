@@ -18,7 +18,7 @@ jmh {
     warmupIterations.set(1)
     iterations.set(2)
     benchmarkMode.set(listOf("thrpt"))
-    val includeProp = (project.findProperty("jmh.include") as String?) ?: "NetGameBenchmark"
+    val includeProp = (project.findProperty("jmh.include") as String?) ?: "Net(Game|Udp)Benchmark"
     includes.set(listOf(includeProp))
     profilers.addAll(listOf("gc"))
     forceGC.set(true)

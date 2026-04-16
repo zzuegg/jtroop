@@ -41,9 +41,8 @@ public final class DuplicateFilterLayer implements Layer {
     @Override
     public ByteBuffer decodeInbound(ByteBuffer wire) {
         if (wire.remaining() < 4) return null;
-        wire.mark();
-        int seq = wire.getInt();
-        wire.reset();
+        int startPos = wire.position();
+        int seq = wire.getInt(startPos); // peek without advancing
 
         if (containsSeq(seq)) {
             // Duplicate — drop the rest of the datagram.
@@ -52,11 +51,10 @@ public final class DuplicateFilterLayer implements Layer {
         }
 
         rememberSeq(seq);
-
-        // Return entire buffer (including seq — downstream layers may need it).
-        var result = wire.slice(wire.position(), wire.remaining());
-        wire.position(wire.limit());
-        return result;
+        // Return the same buffer — downstream layers consume position
+        // onwards (seq prefix still visible; AckLayer/SequencingLayer
+        // re-read the 4-byte prefix). No allocation.
+        return wire;
     }
 
     private boolean containsSeq(int seq) {

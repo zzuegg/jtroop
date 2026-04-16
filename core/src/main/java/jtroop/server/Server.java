@@ -162,6 +162,10 @@ public final class Server implements AutoCloseable {
     private void handleUdpRead(java.nio.channels.DatagramChannel channel, ListenerConfig config,
                                 ByteBuffer readBuf) throws IOException {
         readBuf.clear();
+        // {@link DatagramChannel#receive} returns a fresh {@link
+        // InetSocketAddress} per packet for unconnected channels (~32 B/op).
+        // This is the server's bottleneck for zero-alloc UDP — accepting it
+        // for now since multi-peer semantics require knowing the source.
         var remoteAddr = channel.receive(readBuf);
         if (remoteAddr == null) return;
         readBuf.flip();

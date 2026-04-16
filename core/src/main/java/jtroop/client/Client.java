@@ -46,6 +46,13 @@ public final class Client implements AutoCloseable {
     private final Map<Class<? extends Record>, SocketChannel> channels = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, Integer> channelSlots = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new ConcurrentHashMap<>();
+    /**
+     * Fast path: message type → UDP channel. Populated lazily on first send so
+     * the hot path is a single {@link ConcurrentHashMap#get(Object)} instead of
+     * {@code resolveConnection → udpChannels.get}. No {@code @Datagram} routing
+     * branch, no service-to-connection indirection.
+     */
+    private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannelByMsgType = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> configByType = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> udpConfigByType = new HashMap<>();
     private final java.util.concurrent.Executor executor;
@@ -240,24 +247,79 @@ public final class Client implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public void send(Record message) {
         var msgType = (Class<? extends Record>) message.getClass();
-
-        // Check if this is a @Datagram message → send via UDP
-        if (datagramMessageTypes.contains(msgType)) {
-            sendUdp(message);
+        // Two monomorphic fast paths, one branch each — kept compact so C2
+        // inlines send() end-to-end and EA scalar-replaces the caller's
+        // fresh record.
+        var udpChannel = udpChannelByMsgType.get(msgType);
+        if (udpChannel != null) {
+            sendUdpFast(message, udpChannel);
             return;
         }
+        sendTcpOrCold(message, msgType);
+    }
 
-        // Phase 1: encode — small inlinable method, EA eliminates the record.
-        // The encoded bytes land in the caller thread's own wireBuf (ThreadLocal).
+    /** Slow path: TCP send or first-time UDP cache population. */
+    private void sendTcpOrCold(Record message, Class<? extends Record> msgType) {
         int encodedBytes = encodeToWire(message);
-
-        // Phase 2: stage for async write
         if (encodedBytes > 0) {
-            var connType = resolveConnection(message.getClass());
+            var connType = resolveConnection(msgType);
             var slot = channelSlots.get(connType);
-            if (slot != null) {
-                eventLoop.stageWrite(slot, wireBuf.get());
+            if (slot != null) eventLoop.stageWrite(slot, wireBuf.get());
+            return;
+        }
+        if (datagramMessageTypes.contains(msgType)) {
+            var connType = resolveConnection(msgType);
+            var ch = udpChannels.get(connType);
+            if (ch == null) {
+                throw new IllegalStateException("No UDP connection for " + msgType.getName());
             }
+            udpChannelByMsgType.put(msgType, ch);
+            sendUdpFast(message, ch);
+        }
+    }
+
+    /**
+     * Hot UDP encode path. Kept minimal (just codec encode into the encode
+     * buffer) so C2 inlines {@code send → sendUdpFast → encodeUdpInline →
+     * codec.encode → generated codec}. With the full chain inlined, EA
+     * scalar-replaces the caller's fresh record and the WriteBuffer wrapper.
+     *
+     * <p>Splitting encode from socket write keeps the record's lifetime
+     * confined to a method that does NOT perform synchronized / IOException-
+     * throwing operations. Those are the boundaries that pin references on
+     * the stack and defeat scalar replacement.
+     */
+    private int encodeUdpInline(Record message) {
+        var encode = encodeBuf.get();
+        encode.clear();
+        codec.encode(message, new WriteBuffer(encode));
+        encode.flip();
+        return encode.remaining();
+    }
+
+    private void sendUdpFast(Record message, java.nio.channels.DatagramChannel udpChannel) {
+        if (encodeUdpInline(message) > 0) {
+            writeUdpEncoded(udpChannel);
+        }
+    }
+
+    /**
+     * Write the already-encoded bytes from {@code encodeBuf.get()} to the
+     * channel. Separated from {@link #encodeUdpInline} so the IOException /
+     * synchronized boundary is AFTER the point where the record dies — EA
+     * is unaffected by what happens here.
+     */
+    private void writeUdpEncoded(java.nio.channels.DatagramChannel udpChannel) {
+        var encode = encodeBuf.get();
+        try {
+            // DatagramChannel.write is thread-safe via an internal write lock,
+            // but we still need to serialize concurrent sends so another
+            // thread's bytes don't interleave into the same datagram buffer.
+            synchronized (udpChannel) {
+                udpChannel.write(encode);
+            }
+        } catch (IOException _) {
+            // UDP send failure — best effort
         }
     }
 
@@ -305,31 +367,6 @@ public final class Client implements AutoCloseable {
         return wire.remaining();
     }
 
-    private void sendUdp(Record message) {
-        var connType = resolveConnection(message.getClass());
-        var udpChannel = udpChannels.get(connType);
-        if (udpChannel == null) {
-            throw new IllegalStateException("No UDP connection for " + message.getClass().getName());
-        }
-
-        // UDP: encode message directly (no framing needed), reuse buffer
-        var encode = encodeBuf.get();
-        encode.clear();
-        var wb = new WriteBuffer(encode);
-        codec.encode(message, wb);
-        encode.flip();
-
-        try {
-            // DatagramChannel.write is thread-safe via internal write lock,
-            // but we still need to ensure the full datagram goes out without
-            // another thread interleaving on the same channel buffer.
-            synchronized (udpChannel) {
-                udpChannel.write(encode);
-            }
-        } catch (IOException e) {
-            // UDP send failure — best effort
-        }
-    }
 
     @SuppressWarnings("unchecked")
     public <T extends Record> T request(Record message, Class<T> responseType) {
@@ -402,6 +439,8 @@ public final class Client implements AutoCloseable {
         var udp = udpChannels.remove(connectionType);
         if (udp != null) {
             try { udp.close(); } catch (IOException _) {}
+            // Drop cached message-type → channel entries pointing at this UDP.
+            udpChannelByMsgType.values().removeIf(ch -> ch == udp);
         }
     }
 

@@ -36,10 +36,11 @@ public final class SequencingLayer implements Layer {
             return null;
         }
         lastReceivedSeq = seq;
-        // Return remaining as payload
-        var payload = wire.slice(wire.position(), wire.remaining());
-        wire.position(wire.limit());
-        return payload;
+        // Return the same buffer, positioned past the 4-byte sequence prefix.
+        // Callers read from position..limit so no {@code slice()} allocation
+        // is required. {@code wire.getInt()} above already advanced position
+        // by 4 bytes — the payload starts there.
+        return wire;
     }
 
     /** Highest sequence number successfully decoded (-1 before any packet). */
