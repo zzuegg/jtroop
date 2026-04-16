@@ -118,6 +118,25 @@ public final class Client implements AutoCloseable {
     private final Set<Class<? extends Record>> handshakePending = ConcurrentHashMap.newKeySet();
     private final AtomicInteger requestIdCounter = new AtomicInteger(0);
 
+    /**
+     * Pre-resolved send context for a specific message type. Caches the slot
+     * index, fused pipeline, layer context, and fixed-payload-size. Resolving
+     * these once eliminates 5-7 HashMap/ConcurrentHashMap lookups from the
+     * hot send path. Published via ConcurrentHashMap for safe visibility.
+     */
+    private record TcpSendCtx(
+            int slot,
+            jtroop.generate.FusedPipelineGenerator.FusedPipeline fused,
+            Layer.Context layerCtx,
+            int fixedPayloadSize,
+            boolean singleFraming
+    ) {}
+
+    // Per-message-type cached send context. ConcurrentHashMap for safe
+    // publication from the first-send thread; subsequent reads are a single
+    // volatile load + pointer chase (no hashing, no equals).
+    private final ConcurrentHashMap<Class<? extends Record>, TcpSendCtx> tcpSendCache = new ConcurrentHashMap<>();
+
     private int nextSlot = 0;
 
     private Client(List<ConnectionConfig> connections, CodecRegistry codec,
@@ -463,6 +482,12 @@ public final class Client implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public void send(Record message) {
         var msgType = (Class<? extends Record>) message.getClass();
+        // Fast path: pre-resolved TCP send context (zero map lookups).
+        var ctx = tcpSendCache.get(msgType);
+        if (ctx != null) {
+            sendTcpFast(message, ctx);
+            return;
+        }
         // Two monomorphic fast paths, one branch each — kept compact so C2
         // inlines send() end-to-end and EA scalar-replaces the caller's
         // fresh record.
@@ -474,13 +499,70 @@ public final class Client implements AutoCloseable {
         sendTcpOrCold(message, msgType);
     }
 
-    /** Slow path: TCP send or first-time UDP cache population. */
+    /**
+     * Hot TCP send with all references pre-resolved (zero map lookups).
+     *
+     * <p>For fixed-size messages with a single FramingLayer, the encode path
+     * is split into two phases (CLAUDE.md rule 3):
+     * <ol>
+     *   <li><b>Encode</b> (record consumed, EA can scalar-replace): write the
+     *       4-byte framing prefix + typeId + fields into the thread-local heap
+     *       wireBuf. No synchronized, no intermediate encodeBuf.</li>
+     *   <li><b>Stage</b> (record is dead): copy the small encoded frame
+     *       (~22 bytes for a position update) into the EventLoop's write
+     *       buffer under the per-slot monitor.</li>
+     * </ol>
+     *
+     * <p>Variable-size or complex-pipeline messages fall back to the full
+     * two-buffer encode + pipeline + stageWrite path.
+     */
+    private void sendTcpFast(Record message, TcpSendCtx ctx) {
+        if (ctx.singleFraming() && ctx.fixedPayloadSize() >= 0) {
+            // Phase 1: encode into heap buffer (EA-friendly, no sync).
+            var wire = wireBuf.get();
+            wire.clear();
+            wire.putInt(ctx.fixedPayloadSize()); // FramingLayer length prefix
+            codec.encode(message, wire);
+            wire.flip();
+            // Phase 2: stage into write buffer.
+            if (ctx.layerCtx() instanceof LayerContext lc) lc.addBytesWritten(wire.remaining());
+            eventLoop.stageWrite(ctx.slot(), wire);
+        } else {
+            var encode = encodeBuf.get();
+            var wire = wireBuf.get();
+            encode.clear();
+            codec.encode(message, encode);
+            encode.flip();
+            wire.clear();
+            ctx.fused().encodeOutbound(ctx.layerCtx(), encode, wire);
+            wire.flip();
+            if (ctx.layerCtx() instanceof LayerContext lc) lc.addBytesWritten(wire.remaining());
+            eventLoop.stageWrite(ctx.slot(), wire);
+        }
+    }
+
+    /** Slow path: first-time TCP cache population or UDP. */
+    @SuppressWarnings("unchecked")
     private void sendTcpOrCold(Record message, Class<? extends Record> msgType) {
         int encodedBytes = encodeToWire(message);
         if (encodedBytes > 0) {
             var connType = resolveConnection(msgType);
             var slot = channelSlots.get(connType);
-            if (slot != null) eventLoop.stageWrite(slot, wireBuf.get());
+            if (slot != null) {
+                eventLoop.stageWrite(slot, wireBuf.get());
+                // Populate cache for subsequent sends of this type.
+                var config = configByType.get(connType);
+                var lctx = contextsByType.get(connType);
+                Layer.Context lc = lctx != null ? lctx : LayerContext.NOOP;
+                var encoder = codec.resolveEncoder((Class<? extends Record>) msgType);
+                boolean singleFraming = config.pipeline().size() == 1
+                        && config.layers() != null
+                        && config.layers().length == 1
+                        && config.layers()[0] instanceof jtroop.pipeline.layers.FramingLayer;
+                tcpSendCache.put(msgType, new TcpSendCtx(
+                        slot, config.pipeline().fused(), lc,
+                        encoder.fixedPayloadSize(), singleFraming));
+            }
             return;
         }
         if (datagramMessageTypes.contains(msgType)) {

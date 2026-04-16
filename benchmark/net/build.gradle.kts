@@ -15,13 +15,15 @@ dependencies {
 jmh {
     jvmArgs.addAll(listOf("--enable-preview"))
     fork.set(1)
-    warmupIterations.set(1)
-    iterations.set(2)
+    warmupIterations.set(5)
+    warmup.set("3s")
+    iterations.set(5)
+    timeOnIteration.set("5s")
     benchmarkMode.set(listOf("thrpt"))
     val includeProp = (project.findProperty("jmh.include") as String?) ?: "Net(Game|Udp)Benchmark"
     includes.set(listOf(includeProp))
     (project.findProperty("jmh.timeOnIteration") as String?)?.let { timeOnIteration.set(it) }
     (project.findProperty("jmh.warmup") as String?)?.let { warmup.set(it) }
-    profilers.addAll(listOf("gc"))
+    profilers.addAll(listOf("gc", "stack"))
     forceGC.set(true)
 }

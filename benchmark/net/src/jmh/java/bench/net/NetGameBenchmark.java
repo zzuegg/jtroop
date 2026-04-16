@@ -141,6 +141,12 @@ public class NetGameBenchmark {
         // warm up request/response path
         for (int i = 0; i < 100; i++) echo.echo(new EchoMsg(i));
 
+        // Seed the TcpSendCtx cache — the first send resolves and caches the
+        // slot, pipeline, codec, etc. Subsequent sends take the zero-lookup
+        // fast path. JMH warmup iterations handle C2 compilation.
+        client.send(new PositionUpdate(0f, 0f, 0f, 0f));
+        Thread.sleep(50); // let server drain
+
         // --- Build a sparse N=100 active session set for sessionIteration.
         sessionStore = new SessionStore(SESSION_CAPACITY);
         int stride = SESSION_CAPACITY / SESSION_ACTIVE; // 40

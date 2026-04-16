@@ -191,6 +191,77 @@ public final class CodecRegistry {
     }
 
     /**
+     * Pre-resolved encode handle for a specific record type. Callers that send
+     * the same message type repeatedly can resolve once and skip the per-call
+     * {@code byClass.get()} HashMap lookup on every encode.
+     *
+     * <p>Returned by {@link #resolveEncoder(Class)}. The record is immutable and
+     * safe to cache for the life of the CodecRegistry.
+     */
+    public record EncoderHandle(
+            int typeId,
+            jtroop.generate.CodecClassGenerator.GeneratedCodec generatedCodec,
+            List<ComponentCodec> components,
+            List<MethodHandle> accessors,
+            int fixedPayloadSize
+    ) {
+        /** Encode the given record directly into the ByteBuffer, writing the
+         *  typeId prefix followed by all component fields. Zero per-call map
+         *  lookups — everything is pre-resolved. */
+        public void encode(Record msg, ByteBuffer buf) {
+            buf.putShort((short) typeId);
+            if (generatedCodec != null) {
+                generatedCodec.encode(msg, buf);
+            } else {
+                for (int i = 0; i < accessors.size(); i++) {
+                    try {
+                        components.get(i).encodeDirect(accessors.get(i), msg, buf);
+                    } catch (Throwable e) {
+                        throw new RuntimeException("Failed to encode component " + i, e);
+                    }
+                }
+            }
+        }
+
+        /** True if the encoded payload size (typeId + fields) is known at compile
+         *  time — i.e. the record has no String/variable-length fields. */
+        public boolean isFixedSize() { return fixedPayloadSize >= 0; }
+    }
+
+    /**
+     * Pre-resolve an encoder handle for the given record type. The returned
+     * handle can be cached and reused — it contains no mutable state.
+     */
+    @SuppressWarnings("unchecked")
+    public EncoderHandle resolveEncoder(Class<? extends Record> type) {
+        var entry = byClass.get(type);
+        if (entry == null) {
+            register(type);
+            entry = byClass.get(type);
+        }
+        int fixedSize = computeFixedPayloadSize(type);
+        return new EncoderHandle(entry.typeId(), entry.generatedCodec(),
+                entry.components(), entry.accessors(), fixedSize);
+    }
+
+    /**
+     * Compute the fixed encoded payload size (typeId + fields) for a record type.
+     * Returns -1 if the record contains variable-length fields (String, etc.).
+     */
+    private static int computeFixedPayloadSize(Class<? extends Record> type) {
+        int size = 2; // typeId (short)
+        for (var rc : type.getRecordComponents()) {
+            var t = rc.getType();
+            if (t == int.class || t == float.class) size += 4;
+            else if (t == long.class || t == double.class) size += 8;
+            else if (t == short.class) size += 2;
+            else if (t == byte.class || t == boolean.class) size += 1;
+            else return -1; // variable-length
+        }
+        return size;
+    }
+
+    /**
      * Look up the pre-generated hidden-class codec for a specific record type.
      * Used by hot paths that already know the expected type (e.g. request/response
      * with a known response class) to bypass the {@code byId[typeId]} lookup and
