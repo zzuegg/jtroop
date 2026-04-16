@@ -186,9 +186,42 @@ public final class EventLoop implements Runnable, AutoCloseable {
     }
 
     /**
-     * Stage bytes and block until the EventLoop has flushed them to the socket.
+     * Stage bytes and block until the bytes have been handed to the socket.
+     *
+     * <p>Fast path: the caller writes directly to the socket under the per-slot
+     * buffer lock. This avoids a selector.wakeup() + EventLoop round-trip per
+     * op, which was costing ~48 B/op of HashMap$Node allocation inside
+     * sun.nio.ch.SelectorImpl.processReadyEvents (the ready-keys set). The
+     * buffer lock serialises against the EventLoop's own flushPendingWrites(),
+     * so writes on the same channel are never interleaved.
+     *
+     * <p>Falls back to the EventLoop-driven path when the kernel socket buffer
+     * only partially accepts the write (TCP back-pressure), another thread has
+     * already staged bytes, or the channel is not yet connected. The existing
+     * park/unpark handoff drains the remainder on the next selector cycle —
+     * correctness is preserved.
      */
     public void stageWriteAndFlush(int slot, ByteBuffer data) {
+        var buf = writeBuffers[slot];
+        var channel = (SocketChannel) WRITE_TARGETS.getAcquire(writeTargets, slot);
+        if (channel != null && channel.isConnected()) {
+            synchronized (buf) {
+                if (buf.position() == 0) {
+                    // No staged bytes → write directly.
+                    int remaining = data.remaining();
+                    try {
+                        int n = channel.write(data);
+                        if (n == remaining) return; // fully accepted — done
+                        // Partial / zero write: leftover in `data` still needs to flush
+                        // via the staged path below.
+                    } catch (IOException _) {
+                        // Peer closed / reset — the read side will tear down.
+                        return;
+                    }
+                }
+            }
+        }
+        // Slow path: contended buffer, back-pressure, or channel not ready.
         waitingThreads[slot] = Thread.currentThread();
         stageWrite(slot, data);
         selector.wakeup();
@@ -305,6 +338,10 @@ public final class EventLoop implements Runnable, AutoCloseable {
 
     private void processSelectedKeys() throws IOException {
         var keys = selector.selectedKeys();
+        // Fast path: empty set (wakeup-only cycles, e.g. every stageWrite +
+        // selector.wakeup() without real I/O) avoids allocating a
+        // HashMap$KeyIterator per loop iteration.
+        if (keys.isEmpty()) return;
         var iter = keys.iterator();
         while (iter.hasNext()) {
             var key = iter.next();
