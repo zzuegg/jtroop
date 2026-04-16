@@ -5,7 +5,10 @@ import jtroop.pipeline.Layer;
 import java.lang.classfile.*;
 import java.lang.constant.*;
 import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Constructor;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static java.lang.classfile.ClassFile.*;
 
@@ -14,7 +17,19 @@ import static java.lang.classfile.ClassFile.*;
  * The generated class calls each layer's encode/decode in sequence via invokevirtual
  * on the concrete layer type (not the Layer interface), ensuring monomorphic dispatch.
  *
- * The layer instances are passed to the constructor and stored as fields.
+ * <p>The layer instances are passed to the constructor and stored as fields.
+ *
+ * <h2>Shape cache</h2>
+ * Pipeline mutation (HTTP→WebSocket upgrade, STARTTLS, etc.) spins up new Pipeline
+ * instances whose shape (Layer class sequence) may repeat millions of times across
+ * connections. We cache one hidden class per unique shape — keyed by the ordered
+ * tuple of concrete {@link Class} values. On hit: reuse the cached constructor,
+ * pass in the new layer instances, skip codegen. On miss: emit bytecode, define
+ * a hidden class, stash the constructor.
+ *
+ * <p>Memory bound: one entry per unique shape for the app lifetime. Typical apps
+ * have O(10) shapes (plain, framing, framing+encryption, http, websocket, …), not
+ * O(connections). No eviction in v1 — document the metaspace cost.
  */
 public final class FusedPipelineGenerator {
 
@@ -27,11 +42,72 @@ public final class FusedPipelineGenerator {
     private static final ClassDesc CD_FusedPipeline = ClassDesc.of(
             "jtroop.generate.FusedPipelineGenerator$FusedPipeline");
 
+    /**
+     * Shape key: ordered tuple of concrete {@link Layer} classes. Two Pipelines
+     * with identical class sequences share a hidden class even if their layer
+     * instances differ — the class takes a {@code Layer[]} and casts each slot.
+     */
+    private record ShapeKey(Class<?>[] classes) {
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof ShapeKey k && Arrays.equals(classes, k.classes);
+        }
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(classes);
+        }
+    }
+
+    private static final ConcurrentHashMap<ShapeKey, Constructor<?>> CACHE = new ConcurrentHashMap<>();
+
+    /**
+     * Cache stats for benchmarking / diagnostics. Plain atomic counters — no
+     * effect on the hot path (populated only from {@link #generate}).
+     */
+    private static final java.util.concurrent.atomic.AtomicLong CACHE_HITS = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong CACHE_MISSES = new java.util.concurrent.atomic.AtomicLong();
+
+    public static long cacheHits() { return CACHE_HITS.get(); }
+    public static long cacheMisses() { return CACHE_MISSES.get(); }
+    public static int cacheSize() { return CACHE.size(); }
+
     public static FusedPipeline generate(Layer... layers) {
         if (layers.length == 0) {
             return new IdentityPipeline();
         }
 
+        var key = shapeKey(layers);
+        var cached = CACHE.get(key);
+        if (cached != null) {
+            CACHE_HITS.incrementAndGet();
+            return instantiate(cached, layers);
+        }
+
+        // Compute-if-absent so concurrent callers with the same shape share
+        // a single codegen. The computeIfAbsent block runs the generator at
+        // most once per shape; later callers find the existing entry.
+        var ctor = CACHE.computeIfAbsent(key, k -> {
+            CACHE_MISSES.incrementAndGet();
+            return defineHiddenClass(layers);
+        });
+        return instantiate(ctor, layers);
+    }
+
+    private static ShapeKey shapeKey(Layer[] layers) {
+        var classes = new Class<?>[layers.length];
+        for (int i = 0; i < layers.length; i++) classes[i] = layers[i].getClass();
+        return new ShapeKey(classes);
+    }
+
+    private static FusedPipeline instantiate(Constructor<?> ctor, Layer[] layers) {
+        try {
+            return (FusedPipeline) ctor.newInstance((Object) layers);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException("Failed to instantiate fused pipeline", e);
+        }
+    }
+
+    private static Constructor<?> defineHiddenClass(Layer[] layers) {
         var lookup = MethodHandles.lookup();
         var className = "jtroop/generate/FusedPipeline$" + System.identityHashCode(layers);
 
@@ -159,8 +235,7 @@ public final class FusedPipelineGenerator {
 
         try {
             var hiddenClass = lookup.defineHiddenClass(bytes, true);
-            var ctor = hiddenClass.lookupClass().getDeclaredConstructor(Layer[].class);
-            return (FusedPipeline) ctor.newInstance((Object) layers);
+            return hiddenClass.lookupClass().getDeclaredConstructor(Layer[].class);
         } catch (Exception e) {
             throw new RuntimeException("Failed to generate fused pipeline", e);
         }

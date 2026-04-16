@@ -171,13 +171,21 @@ public final class Client implements AutoCloseable {
             sendHandshake(channel, config, hsInstance);
         }
 
+        var connType = config.connectionType();
         eventLoop.submit(() -> {
             try {
                 var readBuf = ByteBuffer.allocate(65536);
                 channel.register(eventLoop.selector(), SelectionKey.OP_READ,
                         (EventLoop.KeyHandler) key -> {
                             if (key.isReadable()) {
-                                handleRead(key, config, readBuf);
+                                // Look up the current ConnectionConfig on each
+                                // read — switchPipeline rewrites configByType
+                                // on this same event loop, so we always see the
+                                // pipeline in effect for the current read. Do
+                                // not capture `config` directly.
+                                var current = configByType.get(connType);
+                                if (current == null) current = config; // fall back to original
+                                handleRead(key, current, readBuf);
                             }
                         });
             } catch (IOException e) {
@@ -553,6 +561,41 @@ public final class Client implements AutoCloseable {
     /** Flush pending writes immediately. Call after send() for low-latency. */
     public void flush() {
         eventLoop.flush();
+    }
+
+    /**
+     * Replace the {@link Pipeline} used by the given connection type.
+     *
+     * <p>The swap happens on the event loop — may be called from any thread.
+     * Typical use: the client's {@code @OnMessage(ProtocolUpgrade.Accepted)}
+     * handler calls {@code switchPipeline(httpPipeline.replace(HttpLayer.class,
+     * new WebSocketLayer()))} after the server has acknowledged the upgrade.
+     *
+     * <p>See {@code Server.switchPipeline} for the safety contract. Same
+     * rules: frame-aligned, stateful-layer-beware.
+     *
+     * @param connectionType the connection whose pipeline should be swapped
+     * @param newPipeline    replacement pipeline
+     */
+    public void switchPipeline(Class<? extends Record> connectionType, Pipeline newPipeline) {
+        var oldConfig = configByType.get(connectionType);
+        if (oldConfig == null) return;
+        var newConfig = new ConnectionConfig(
+                oldConfig.connectionType(), oldConfig.transport(), newPipeline, null);
+        eventLoop.submit(() -> configByType.put(connectionType, newConfig));
+    }
+
+    /**
+     * Convenience overload: swap the pipeline for the client's (single)
+     * primary connection. Useful in tests and one-connection clients.
+     */
+    public void switchPipeline(Pipeline newPipeline) {
+        if (configByType.size() != 1) {
+            throw new IllegalStateException(
+                    "Client has " + configByType.size() + " connections; use switchPipeline(connectionType, pipeline)");
+        }
+        var connType = configByType.keySet().iterator().next();
+        switchPipeline(connType, newPipeline);
     }
 
     public boolean isConnected(Class<? extends Record> connectionType) {

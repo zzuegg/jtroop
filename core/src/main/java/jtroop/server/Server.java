@@ -369,12 +369,27 @@ public final class Server implements AutoCloseable {
         // monitor, flushing this store through the JMM read-of-monitor edge.
         slotChannels[connId.index()] = clientChannel;
 
-        // Assign to a worker loop (round-robin)
-        var workerLoop = workerGroup.next();
+        // Assign to a worker loop. switchPipeline dispatches to the loop
+        // selected by Math.floorMod(index, size), so this registration must
+        // pick the same loop. Round-robin via next() would leave switchPipeline
+        // submitting to a different thread than the one running handleRead —
+        // the config swap would race the decode loop.
+        var workerLoop = workerGroup.get(Math.floorMod(connId.index(), workerGroup.size()));
         workerLoop.submit(() -> {
             try {
+                // Look up the current ListenerConfig on each read. switchPipeline
+                // rewrites connectionConfig on the owning worker loop; the
+                // handler therefore always sees the pipeline that was in effect
+                // when the read began, and a pipeline installed after a frame
+                // boundary takes effect on the next selector cycle. Do NOT
+                // capture `config` here — it would pin the original pipeline
+                // for the lifetime of the selection key.
                 var selKey = clientChannel.register(workerLoop.selector(), SelectionKey.OP_READ,
-                        (EventLoop.KeyHandler) key -> handleRead(key, connId, config, readBuf));
+                        (EventLoop.KeyHandler) key -> {
+                            var current = connectionConfig.get(connId);
+                            if (current == null) return; // connection torn down
+                            handleRead(key, connId, current, readBuf);
+                        });
                 keyToConnection.put(selKey, connId);
                 connectionToKey.put(connId, selKey);
             } catch (IOException e) {
@@ -602,12 +617,49 @@ public final class Server implements AutoCloseable {
         connectionChannels.remove(connId);
     }
 
+    /**
+     * Replace the {@link Pipeline} used by the given connection.
+     *
+     * <p>The swap happens on the connection's owning event loop — the caller
+     * may invoke this from any thread (executor, @OnMessage handler, external
+     * thread). Used for HTTP→WebSocket upgrade, STARTTLS, ALPN, PROXY
+     * protocol, multi-protocol port sniffing.
+     *
+     * <p><b>Safety contract.</b> The swap is frame-aligned: it runs between
+     * inbound reads because the event-loop thread serializes the {@code
+     * handleRead → processInbound → fused.decodeInbound} chain for that slot.
+     * No partial frame is ever observed across the swap boundary — if bytes
+     * remain buffered when the swap fires, the next read cycle will feed them
+     * through the <em>new</em> pipeline.
+     *
+     * <p><b>Stateful layers.</b> The new pipeline must either (a) share the
+     * existing stateful layer instances (construct via
+     * {@code oldPipeline.replace(...)} / {@code .addFirst(...)} so the
+     * already-initialised layers carry across), or (b) be designed such that
+     * pre-swap protocol state is no longer needed.
+     *
+     * @param connId      target connection
+     * @param newPipeline replacement pipeline
+     */
     public void switchPipeline(ConnectionId connId, Pipeline newPipeline) {
         var oldConfig = connectionConfig.get(connId);
-        if (oldConfig != null) {
-            connectionConfig.put(connId, new ListenerConfig(
-                    oldConfig.connectionType(), oldConfig.transport(), newPipeline, null));
-        }
+        if (oldConfig == null) return; // connection already closed
+        var newConfig = new ListenerConfig(
+                oldConfig.connectionType(), oldConfig.transport(), newPipeline, null);
+
+        // Dispatch the actual reference swap to the connection's owning worker
+        // loop. Running on any other thread risks a mid-decode race: the loop
+        // thread may be inside fused().decodeInbound() while an external
+        // thread overwrites the config — the half-decoded frame would then be
+        // finalised by the new pipeline, silently corrupting the stream.
+        //
+        // submit() is thread-safe from any producer and is served on the
+        // loop's next cycle, between handleRead invocations. The handler that
+        // initiated the swap (inside @OnMessage) is already running between
+        // frames — decodeInbound returned null to exit the while loop — so
+        // the swap sees a clean boundary.
+        var workerLoop = workerGroup.get(Math.floorMod(connId.index(), workerGroup.size()));
+        workerLoop.submit(() -> connectionConfig.put(connId, newConfig));
     }
 
     public int port(Class<? extends Record> connectionType) {

@@ -27,4 +27,6 @@ public final class Layers {
     public static AckLayer ack() { return new AckLayer(); }
     public static AckLayer ack(long retransmitTimeoutMs) { return new AckLayer(retransmitTimeoutMs); }
     public static HttpLayer http() { return new HttpLayer(); }
+    public static WebSocketLayer webSocketServer() { return new WebSocketLayer(WebSocketLayer.Role.SERVER); }
+    public static WebSocketLayer webSocketClient() { return new WebSocketLayer(WebSocketLayer.Role.CLIENT); }
 }
