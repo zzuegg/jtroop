@@ -195,8 +195,34 @@ class ConcurrencyTest {
         assertTrue(allDone.await(45, TimeUnit.SECONDS), "workers did not finish");
         stop.set(true);
 
-        // Give pending broadcasts + acks time to drain.
-        Thread.sleep(300);
+        // Wait for the server to process all chat messages sent by steady
+        // senders. TCP guarantees delivery, so receivedChat must reach the
+        // total. Only then can we check broadcast delivery to the steady
+        // clients — the server broadcasts on each chat, so once all chats
+        // are processed the corresponding broadcasts have been enqueued.
+        int expectedChats = steady * steadyMessages;
+        long drainDeadline = System.currentTimeMillis() + 10_000;
+        while (handler.receivedChat.get() < expectedChats && System.currentTimeMillis() < drainDeadline) {
+            Thread.sleep(20);
+        }
+
+        // Give in-flight broadcast writes time to arrive at steady clients.
+        // Poll instead of a fixed sleep: wait until every steady client has
+        // received a meaningful fraction, or until a generous timeout expires.
+        int total = steady * steadyMessages; // upper bound of broadcasts triggered by steady senders
+        int threshold = total / 4;
+        drainDeadline = System.currentTimeMillis() + 10_000;
+        boolean allAboveThreshold = false;
+        while (!allAboveThreshold && System.currentTimeMillis() < drainDeadline) {
+            allAboveThreshold = true;
+            for (int i = 0; i < steady; i++) {
+                if (steadyReceived[i].get() <= threshold) {
+                    allAboveThreshold = false;
+                    break;
+                }
+            }
+            if (!allAboveThreshold) Thread.sleep(20);
+        }
 
         assertNull(threadError.get(), "worker thread crashed: " + threadError.get());
         assertNull(handler.firstError.get(), "handler crashed: " + handler.firstError.get());
@@ -206,10 +232,9 @@ class ConcurrencyTest {
         // but every steady client must see a sizable fraction — a buggy
         // implementation that drops a ConcurrentModificationException would
         // typically leave counts at zero for some clients.
-        int total = steady * steadyMessages; // upper bound of broadcasts triggered by steady senders
         for (int i = 0; i < steady; i++) {
             int got = steadyReceived[i].get();
-            assertTrue(got > total / 4,
+            assertTrue(got > threshold,
                     "steady client " + i + " received too few broadcasts: " + got + "/" + total);
         }
 
@@ -237,7 +262,17 @@ class ConcurrencyTest {
         int rounds = 40;
         for (int rr = 0; rr < rounds; rr++) {
             final int r = rr;
-            int before = handler.connects.get();
+            int beforeConnects = handler.connects.get();
+            int beforeDisconnects = handler.disconnects.get();
+
+            // Wait for all previous disconnects to clear from active set
+            // before connecting a new client. Otherwise handler.active may
+            // contain stale entries from prior rounds and we grab the wrong id.
+            long waitDeadline = System.currentTimeMillis() + 3000;
+            while (!handler.active.isEmpty() && System.currentTimeMillis() < waitDeadline) {
+                Thread.sleep(5);
+            }
+
             var client = Client.builder()
                     .connect(GameConn.class, Transport.tcp("localhost", port), new FramingLayer())
                     .addService(Svc.class, GameConn.class)
@@ -245,16 +280,22 @@ class ConcurrencyTest {
             client.start();
 
             // Wait for connect to register on server so we have a ConnectionId.
-            long deadline = System.currentTimeMillis() + 1500;
-            while (handler.connects.get() == before && System.currentTimeMillis() < deadline) {
+            long deadline = System.currentTimeMillis() + 3000;
+            while (handler.connects.get() == beforeConnects && System.currentTimeMillis() < deadline) {
                 Thread.sleep(5);
             }
-            assertTrue(handler.connects.get() > before, "connect did not fire");
+            assertTrue(handler.connects.get() > beforeConnects, "connect did not fire in round " + rr);
+
+            // Wait for exactly one active connection (the one we just connected).
+            deadline = System.currentTimeMillis() + 3000;
+            while (handler.active.size() != 1 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(5);
+            }
 
             // Grab the freshly added ConnectionId.
             ConnectionId target = null;
             for (var id : handler.active) { target = id; break; }
-            if (target == null) continue;
+            assertNotNull(target, "no active connection found in round " + rr);
             final var finalTarget = target;
 
             // Start a sender thread that pumps messages continuously to keep
@@ -275,8 +316,14 @@ class ConcurrencyTest {
             // External-thread close. Must be race-safe.
             assertDoesNotThrow(() -> server.closeConnection(finalTarget));
 
+            // Wait for the disconnect to be processed before moving on.
+            deadline = System.currentTimeMillis() + 3000;
+            while (handler.disconnects.get() == beforeDisconnects && System.currentTimeMillis() < deadline) {
+                Thread.sleep(5);
+            }
+
             senderStop.set(true);
-            sender.join(500);
+            sender.join(1000);
             client.close();
         }
 
