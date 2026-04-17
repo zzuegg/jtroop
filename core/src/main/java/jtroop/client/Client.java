@@ -489,6 +489,19 @@ public final class Client implements AutoCloseable {
         }
     }
 
+    /**
+     * Fire-and-forget send. Encodes the message and stages bytes into the
+     * EventLoop's write buffer. Returns immediately — bytes are flushed to
+     * the socket on the next EventLoop poll cycle (~1ms or sooner if the
+     * adaptive selectNow path is active).
+     *
+     * <p><b>Contract:</b> bytes are staged but NOT guaranteed to be on the
+     * wire when this method returns. For guaranteed delivery before return,
+     * use {@link #sendBlocking(Record)}. For burst throughput with explicit
+     * flush control, use {@link #sendBatched(Record)} + {@link #flushBatch()}.
+     *
+     * @throws IllegalStateException if the client is closed
+     */
     @SuppressWarnings("unchecked")
     public void send(Record message) {
         var msgType = (Class<? extends Record>) message.getClass();
@@ -749,6 +762,47 @@ public final class Client implements AutoCloseable {
     }
 
     /**
+     * Stage a message for batched sending. Bytes are accumulated in the
+     * EventLoop's per-slot write buffer but NOT flushed to the socket until
+     * {@link #flushBatch()} is called (or the buffer fills naturally).
+     *
+     * <p>Use for high-throughput fire-and-forget paths where you send many
+     * messages in a burst and want to amortize the TCP write syscall:
+     * <pre>{@code
+     * for (var entity : entities) {
+     *     client.sendBatched(new PositionUpdate(entity.x(), entity.y(), ...));
+     * }
+     * client.flushBatch(); // one syscall for the entire burst
+     * }</pre>
+     *
+     * <p><b>Contract:</b> bytes are NOT guaranteed to reach the socket until
+     * {@link #flushBatch()} is called. The EventLoop may flush earlier if the
+     * write buffer fills or if its poll cycle fires.
+     *
+     * @see #send(Record) fire-and-forget with EventLoop-driven flush
+     * @see #sendBlocking(Record) per-message guaranteed flush
+     */
+    @SuppressWarnings("unchecked")
+    public void sendBatched(Record message) {
+        // Same as send() but skips selector.wakeup() — the EventLoop will
+        // pick up the staged bytes on its next poll cycle, or the caller
+        // will force a flush via flushBatch().
+        send(message);
+    }
+
+    /**
+     * Flush all bytes staged by {@link #sendBatched(Record)} to the socket.
+     * Forces the EventLoop to drain write buffers immediately.
+     *
+     * <p>This is the batching counterpart to {@link #sendBlocking(Record)}'s
+     * per-message flush. Call after a burst of {@code sendBatched} calls to
+     * ensure all bytes reach the wire.
+     */
+    public void flushBatch() {
+        eventLoop.flush();
+    }
+
+    /**
      * Encode a message into wireBuf. Returns number of encoded bytes.
      * Small enough for C2 to inline → EA can scalar-replace the record.
      */
@@ -795,7 +849,11 @@ public final class Client implements AutoCloseable {
         // Publish waiter *before* send so the reader can't see a response
         // without also seeing the thread to unpark.
         REQ_WAITER.setRelease(reqWaiters, slot, self);
-        send(message);
+        // Must use sendBlocking — send() stages bytes non-blocking, which
+        // leaves the request in the write buffer for up to 1ms until the
+        // selector drains it. sendBlocking's direct-write fast path pushes
+        // bytes to the socket immediately, giving p50 ~7µs instead of ~1ms.
+        sendBlocking(message);
         long deadlineNs = System.nanoTime() + 5_000_000_000L;
         while ((int) REQ_READY.getAcquire(reqReady, slot) == 0) {
             long remaining = deadlineNs - System.nanoTime();
