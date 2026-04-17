@@ -1,7 +1,5 @@
 package jtroop.core;
 
-import jtroop.ConnectionException;
-
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
@@ -53,12 +51,14 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private final boolean[] pendingWrite;
     private final SocketChannel[] writeTargets;
     private final Thread[] waitingThreads;
+    private final int maxConnections;
     private volatile int activeSlots = 0;
 
     public EventLoop(String name, int maxConnections) throws IOException {
         this.selector = Selector.open();
         this.thread = new Thread(this, name);
         this.thread.setDaemon(true);
+        this.maxConnections = maxConnections;
         this.writeBuffers = new ByteBuffer[maxConnections];
         this.pendingWrite = new boolean[maxConnections];
         this.writeTargets = new SocketChannel[maxConnections];
@@ -153,9 +153,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
                             Thread.onSpinWait();
                         }
                     }
-                } catch (IOException e) {
-                    System.err.println("EventLoop: write failed on slot " + slot + ": " + e);
-                }
+                } catch (IOException _) {}
                 return;
             }
         }
@@ -165,7 +163,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
             synchronized (buf) {
                 if (channel != null && channel.isConnected()) {
                     buf.flip();
-                    try { channel.write(buf); } catch (IOException _) { /* best-effort drain */ }
+                    try { channel.write(buf); } catch (IOException _) {}
                     buf.compact();
                     if (buf.position() > 0) {
                         PENDING_WRITE.setRelease(pendingWrite, slot, true);
@@ -179,7 +177,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
             }
             selector.wakeup();
             if (System.nanoTime() > deadlineNs) {
-                throw new ConnectionException(
+                throw new IllegalStateException(
                         "stageWrite back-pressure timeout on slot " + slot +
                         " — receiver consuming too slowly (needed " + need + " bytes)");
             }
@@ -227,15 +225,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
         waitingThreads[slot] = Thread.currentThread();
         stageWrite(slot, data);
         selector.wakeup();
-        long flushDeadlineNs = System.nanoTime() + 5_000_000_000L;
         while ((boolean) PENDING_WRITE.getAcquire(pendingWrite, slot)) {
-            if (System.nanoTime() > flushDeadlineNs) {
-                // Clear waiter so the event loop doesn't fire a stale unpark.
-                waitingThreads[slot] = null;
-                throw new IllegalStateException(
-                        "stageWriteAndFlush back-pressure timeout on slot " + slot +
-                        " — event loop unable to drain within 5s");
-            }
             Thread.onSpinWait();
         }
     }
@@ -268,7 +258,6 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 try { key.cancel(); } catch (Throwable _) {}
                 try { key.channel().close(); } catch (Throwable _) {}
                 System.err.println("EventLoop: handler threw, connection closed: " + t);
-                t.printStackTrace(System.err);
             }
         }
     }
@@ -348,7 +337,6 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 // by another thread (Client.close() during start()). One failing
                 // task must not kill the loop.
                 System.err.println("EventLoop: setup task failed: " + t);
-                t.printStackTrace(System.err);
             }
         }
         // Drain overflow (tasks that arrived while the ring was full).
@@ -358,7 +346,6 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 overflow.run();
             } catch (Throwable t) {
                 System.err.println("EventLoop: setup task failed: " + t);
-                t.printStackTrace(System.err);
             }
         }
     }
@@ -413,15 +400,18 @@ public final class EventLoop implements Runnable, AutoCloseable {
         }
     }
 
+    private volatile boolean closed;
+
     @Override
     public void close() {
+        if (closed) return;
+        closed = true;
         running = false;
         selector.wakeup();
-        try { thread.join(1000); } catch (InterruptedException _) { thread.interrupt(); }
-        // Safety net: if the thread never started or join timed out, the
-        // selector was not closed inside run(). Close it here to avoid
-        // leaking the native file descriptor.
-        if (!thread.isAlive()) {
+        try { thread.join(2000); } catch (InterruptedException _) { thread.interrupt(); }
+        // Safety net: if the loop thread didn't exit (or was never started),
+        // close the selector here to prevent a file-descriptor leak.
+        if (selector.isOpen()) {
             try { selector.close(); } catch (IOException _) {}
         }
     }

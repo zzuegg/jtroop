@@ -1,7 +1,5 @@
 package jtroop.client;
 
-import jtroop.ConfigurationException;
-import jtroop.ConnectionException;
 import jtroop.codec.CodecRegistry;
 import jtroop.core.EventLoop;
 import jtroop.core.ReadBuffer;
@@ -52,6 +50,13 @@ public final class Client implements AutoCloseable {
     private final Map<Class<? extends Record>, SocketChannel> channels = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, Integer> channelSlots = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new ConcurrentHashMap<>();
+    /**
+     * Fast path: message type → UDP channel. Populated lazily on first send so
+     * the hot path is a single {@link ConcurrentHashMap#get(Object)} instead of
+     * {@code resolveConnection → udpChannels.get}. No {@code @Datagram} routing
+     * branch, no service-to-connection indirection.
+     */
+    private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannelByMsgType = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> configByType = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> udpConfigByType = new HashMap<>();
     // Per-connection LayerContext. Allocated on connect, keyed by connection
@@ -167,7 +172,7 @@ public final class Client implements AutoCloseable {
         try {
             this.eventLoop = new EventLoop("client-loop");
         } catch (IOException e) {
-            throw new ConnectionException("Failed to create event loop", e);
+            throw new RuntimeException("Failed to create event loop", e);
         }
     }
 
@@ -198,7 +203,7 @@ public final class Client implements AutoCloseable {
         try {
             var remote = channel.getRemoteAddress();
             if (remote instanceof java.net.InetSocketAddress isa) peer = isa;
-        } catch (IOException _) { /* best-effort peer resolution; null peer is safe */ }
+        } catch (IOException _) {}
         final var connTypeFinal = config.connectionType();
         long packedId = ((long) 1 << 32) | (slot & 0xFFFFFFFFL);
         var ctx = new LayerContext(
@@ -235,7 +240,7 @@ public final class Client implements AutoCloseable {
                             }
                         });
             } catch (IOException e) {
-                throw new ConnectionException("TCP connect failed", e);
+                throw new RuntimeException("TCP connect failed", e);
             }
         });
     }
@@ -287,7 +292,7 @@ public final class Client implements AutoCloseable {
         try {
             var remote = channel.getRemoteAddress();
             if (remote instanceof java.net.InetSocketAddress isa) peer = isa;
-        } catch (IOException _) { /* best-effort peer resolution; null peer is safe */ }
+        } catch (IOException _) {}
         final var connTypeFinal = config.connectionType();
         // Slot index: pack a synthetic id — UDP doesn't use the event loop's
         // channelSlots since it has no SelectionKey here. Use hashCode so
@@ -437,12 +442,7 @@ public final class Client implements AutoCloseable {
                 if (result != null && acceptedType.isInstance(result)) {
                     return (T) result;
                 }
-            } catch (java.util.concurrent.TimeoutException _) {
-                // This future didn't resolve in time — try the next entry.
-            } catch (Exception e) {
-                System.err.println("Client: handshakeResult(" + acceptedType.getSimpleName()
-                        + ") failed for key " + entry.getKey().getSimpleName() + ": " + e);
-            }
+            } catch (Exception _) {}
         }
         return null;
     }
@@ -491,7 +491,6 @@ public final class Client implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public void send(Record message) {
-        Objects.requireNonNull(message, "parameter 'message' must not be null");
         var msgType = (Class<? extends Record>) message.getClass();
         // Fast path: one CHM.get, then pattern-match dispatch.
         var ctx = sendCache.get(msgType);
@@ -514,7 +513,6 @@ public final class Client implements AutoCloseable {
      */
     @SuppressWarnings("unchecked")
     public void sendViaTcp(Record message) {
-        Objects.requireNonNull(message, "parameter 'message' must not be null");
         var msgType = (Class<? extends Record>) message.getClass();
         var ctx = tcpSendCache.get(msgType);
         if (ctx != null) {
@@ -552,7 +550,6 @@ public final class Client implements AutoCloseable {
      */
     @SuppressWarnings("unchecked")
     public void sendViaUdp(Record message) {
-        Objects.requireNonNull(message, "parameter 'message' must not be null");
         var msgType = (Class<? extends Record>) message.getClass();
         var ctx = udpSendCache.get(msgType);
         if (ctx != null) {
@@ -563,7 +560,7 @@ public final class Client implements AutoCloseable {
         var connType = resolveConnection(msgType);
         var ch = udpChannels.get(connType);
         if (ch == null) {
-            throw new ConnectionException("No UDP connection for " + msgType.getName());
+            throw new IllegalStateException("No UDP connection for " + msgType.getName());
         }
         var cfg = udpConfigByType.get(connType);
         boolean hasLayers = cfg != null && cfg.pipeline().size() > 0;
@@ -738,7 +735,6 @@ public final class Client implements AutoCloseable {
      */
     @SuppressWarnings("unchecked")
     public void sendBlocking(Record message) {
-        Objects.requireNonNull(message, "parameter 'message' must not be null");
         // Phase 1: encode — small method, C2 inlines → record is scalar-replaced
         int encodedBytes = encodeToWire(message);
 
@@ -783,8 +779,6 @@ public final class Client implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public <T extends Record> T request(Record message, Class<T> responseType) {
-        Objects.requireNonNull(message, "parameter 'message' must not be null");
-        Objects.requireNonNull(responseType, "parameter 'responseType' must not be null");
         // Zero-alloc request: claim a slot in the flat ring, publish our
         // thread, send, park until reader stashes response bytes + unparks.
         // No CompletableFuture (waiter list alloc), no Map entry, no Integer
@@ -808,7 +802,7 @@ public final class Client implements AutoCloseable {
             if (remaining <= 0) {
                 // Timed out — clear slot so reader doesn't fire a stale unpark.
                 REQ_WAITER.setRelease(reqWaiters, slot, (Thread) null);
-                throw new ConnectionException("Request failed: timeout");
+                throw new RuntimeException("Request failed: timeout");
             }
             LockSupport.parkNanos(remaining);
         }
@@ -849,7 +843,7 @@ public final class Client implements AutoCloseable {
         if (!configByType.isEmpty()) {
             return configByType.keySet().iterator().next();
         }
-        throw new ConfigurationException("Cannot resolve connection for " + messageType.getName());
+        throw new IllegalStateException("Cannot resolve connection for " + messageType.getName());
     }
 
     private final Map<Class<?>, Object> proxyCache = new HashMap<>();
@@ -861,7 +855,6 @@ public final class Client implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public <T> T service(Class<T> serviceInterface) {
-        Objects.requireNonNull(serviceInterface, "parameter 'serviceInterface' must not be null");
         var existing = proxyCache.get(serviceInterface);
         if (existing != null) return (T) existing;
         // Typed hidden-class proxy: each void method becomes a concrete
@@ -894,8 +887,6 @@ public final class Client implements AutoCloseable {
      * @param newPipeline    replacement pipeline
      */
     public void switchPipeline(Class<? extends Record> connectionType, Pipeline newPipeline) {
-        Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
-        Objects.requireNonNull(newPipeline, "parameter 'newPipeline' must not be null");
         var oldConfig = configByType.get(connectionType);
         if (oldConfig == null) return;
         var newConfig = new ConnectionConfig(
@@ -908,9 +899,8 @@ public final class Client implements AutoCloseable {
      * primary connection. Useful in tests and one-connection clients.
      */
     public void switchPipeline(Pipeline newPipeline) {
-        Objects.requireNonNull(newPipeline, "parameter 'newPipeline' must not be null");
         if (configByType.size() != 1) {
-            throw new ConfigurationException(
+            throw new IllegalStateException(
                     "Client has " + configByType.size() + " connections; use switchPipeline(connectionType, pipeline)");
         }
         var connType = configByType.keySet().iterator().next();
@@ -933,36 +923,33 @@ public final class Client implements AutoCloseable {
         var udp = udpChannels.remove(connectionType);
         if (udp != null) {
             try { udp.close(); } catch (IOException _) {}
+            // Drop cached message-type → channel entries pointing at this UDP.
+            udpChannelByMsgType.values().removeIf(ch -> ch == udp);
         }
         contextsByType.remove(connectionType);
     }
 
+    private volatile boolean closed;
+
     @Override
     public void close() {
-        // 1. Close TCP and UDP channels first.
+        if (closed) return;
+        closed = true;
         for (var channel : channels.values()) {
             try { channel.close(); } catch (IOException _) {}
         }
+        channels.clear();
         for (var channel : udpChannels.values()) {
             try { channel.close(); } catch (IOException _) {}
         }
-        // 2. Stop UDP read threads (channel close unblocks blocking read).
+        udpChannels.clear();
+        udpChannelByMsgType.clear();
+        contextsByType.clear();
         for (var t : udpReadThreads) {
             t.interrupt();
             try { t.join(500); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
         }
-        // 3. Close event loop (closes selector).
         eventLoop.close();
-        // 4. Close pipeline layers that hold native resources (Deflater/Inflater).
-        for (var config : connections) {
-            if (config.layers() != null) {
-                for (var layer : config.layers()) {
-                    if (layer instanceof AutoCloseable ac) {
-                        try { ac.close(); } catch (Exception _) {}
-                    }
-                }
-            }
-        }
     }
 
     public static Builder builder() {
@@ -978,15 +965,9 @@ public final class Client implements AutoCloseable {
         private java.util.concurrent.Executor executor;
 
         public Builder connect(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
-            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
-            Objects.requireNonNull(transport, "parameter 'transport' must not be null");
-            Objects.requireNonNull(layers, "parameter 'layers' must not be null");
-            for (int i = 0; i < layers.length; i++) {
-                Objects.requireNonNull(layers[i], "parameter 'layers[" + i + "]' must not be null");
-            }
             if (transport instanceof jtroop.transport.UdpTransport udp
                     && !udp.connected() && layers != null && layers.length > 0) {
-                throw new ConfigurationException(
+                throw new IllegalArgumentException(
                         "Unconnected UDP (Transport.udp(...)) does not support pipeline layers — "
                                 + "per-peer state would be shared across all senders. "
                                 + "Use Transport.udpConnected(...) for filter/reliability layers, "
@@ -998,12 +979,6 @@ public final class Client implements AutoCloseable {
 
         @SuppressWarnings("unchecked")
         public Builder connect(Record handshakeInstance, Transport transport, Layer... layers) {
-            Objects.requireNonNull(handshakeInstance, "parameter 'handshakeInstance' must not be null");
-            Objects.requireNonNull(transport, "parameter 'transport' must not be null");
-            Objects.requireNonNull(layers, "parameter 'layers' must not be null");
-            for (int i = 0; i < layers.length; i++) {
-                Objects.requireNonNull(layers[i], "parameter 'layers[" + i + "]' must not be null");
-            }
             var connType = (Class<? extends Record>) handshakeInstance.getClass();
             codec.register(connType);
             // Register nested Accepted record if present
@@ -1018,8 +993,6 @@ public final class Client implements AutoCloseable {
         }
 
         public Builder addService(Class<?> serviceInterface, Class<? extends Record> connectionType) {
-            Objects.requireNonNull(serviceInterface, "parameter 'serviceInterface' must not be null");
-            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
             for (var method : serviceInterface.getDeclaredMethods()) {
                 for (var paramType : method.getParameterTypes()) {
                     if (Record.class.isAssignableFrom(paramType)) {
@@ -1040,8 +1013,6 @@ public final class Client implements AutoCloseable {
 
         @SuppressWarnings("unchecked")
         public <T extends Record> Builder onMessage(Class<T> type, java.util.function.Consumer<T> handler) {
-            Objects.requireNonNull(type, "parameter 'type' must not be null");
-            Objects.requireNonNull(handler, "parameter 'handler' must not be null");
             codec.register(type);
             messageHandlers.put(type, (java.util.function.Consumer<Record>) (java.util.function.Consumer<?>) handler);
             return this;

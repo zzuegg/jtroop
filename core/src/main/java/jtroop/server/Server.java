@@ -1,7 +1,5 @@
 package jtroop.server;
 
-import jtroop.ConfigurationException;
-import jtroop.ConnectionException;
 import jtroop.codec.CodecRegistry;
 import jtroop.core.EventLoop;
 import jtroop.core.EventLoopGroup;
@@ -21,8 +19,6 @@ import jtroop.session.SessionStore;
 import jtroop.transport.Transport;
 
 import java.io.IOException;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
@@ -30,20 +26,6 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class Server implements AutoCloseable {
-
-    // VarHandle for release/acquire on the flat per-slot channel table.
-    // Writes from the accept loop (acceptClient) must be visible to
-    // broadcast fan-out readers on worker loops. The plain store was
-    // NOT ordered by SessionStore's synchronized edge because it runs
-    // AFTER allocate() returns (outside the monitor).
-    private static final VarHandle SLOT_CHANNELS;
-    static {
-        try {
-            SLOT_CHANNELS = MethodHandles.arrayElementVarHandle(SocketChannel[].class);
-        } catch (Throwable t) {
-            throw new ExceptionInInitializerError(t);
-        }
-    }
 
     private record ListenerConfig(
             Class<? extends Record> connectionType,
@@ -72,7 +54,6 @@ public final class Server implements AutoCloseable {
             ThreadLocal.withInitial(() -> ByteBuffer.allocate(65536));
     // All connection-state maps are mutated on worker/accept loops and read
     // from any loop during broadcast/unicast fan-out. ConcurrentHashMap for safety.
-    private final List<ServerSocketChannel> serverChannels = new ArrayList<>();
     private final Map<Class<? extends Record>, Integer> boundPorts = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, Integer> boundUdpPorts = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new ConcurrentHashMap<>();
@@ -96,10 +77,10 @@ public final class Server implements AutoCloseable {
     //   ConnectionId.of(index, gen) + connectionChannels.get(id)
     // sequence, which allocated a ConnectionId record that escaped into the
     // non-inlined ConcurrentHashMap.get and defeated scalar replacement
-    // (CLAUDE.md rule #3). Array stores use SLOT_CHANNELS VarHandle
-    // (release/acquire) for cross-thread visibility — the SessionStore
-    // monitor edge does NOT cover these stores because they run AFTER
-    // allocate() returns (outside the monitor).
+    // (CLAUDE.md rule #3). The array store is plain; publication is
+    // piggy-backed on SessionStore.allocate / release synchronized edges
+    // which flush the write before a fan-out observer can see active=true
+    // for the slot.
     private final SocketChannel[] slotChannels;
     @SuppressWarnings("rawtypes")
     private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers;
@@ -133,7 +114,7 @@ public final class Server implements AutoCloseable {
             this.acceptLoop = new EventLoop("server-accept");
             this.workerGroup = new EventLoopGroup(workerCount);
         } catch (IOException e) {
-            throw new ConnectionException("Failed to create event loops", e);
+            throw new RuntimeException("Failed to create event loops", e);
         }
         // Wire broadcast and unicast
         serviceRegistry.setBroadcast(this::broadcastImpl);
@@ -157,7 +138,6 @@ public final class Server implements AutoCloseable {
         } catch (Exception e) {
             // Fall back to the 3-stage path if generation fails
             System.err.println("FusedReceiver generation failed, using fallback: " + e);
-            e.printStackTrace(System.err);
         }
     }
 
@@ -238,7 +218,7 @@ public final class Server implements AutoCloseable {
             // costing 24 B/recipient. `generation` is unused here:
             // forEachActiveIndex only yields currently-active slots so the
             // slot→channel mapping is already filtered by liveness.
-            var channel = (SocketChannel) SLOT_CHANNELS.getAcquire(slotChannels, index);
+            var channel = slotChannels[index];
             if (channel == null || !channel.isConnected()) return;
 
             // Rewind the buffer without allocating a duplicate — we own it
@@ -278,7 +258,6 @@ public final class Server implements AutoCloseable {
         serverChannel.bind(config.transport().address());
         int port = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
         boundPorts.put(config.connectionType(), port);
-        serverChannels.add(serverChannel);
 
         acceptLoop.submit(() -> {
             try {
@@ -290,7 +269,7 @@ public final class Server implements AutoCloseable {
                             }
                         });
             } catch (IOException e) {
-                throw new ConnectionException("Failed to register server socket", e);
+                throw new RuntimeException("Failed to register server socket", e);
             }
         });
     }
@@ -361,9 +340,7 @@ public final class Server implements AutoCloseable {
                 if (!channel.isConnected()) {
                     var remoteAddr = channel.receive(readBuf);
                     if (remoteAddr == null) continue;
-                    try { channel.connect(remoteAddr); } catch (IOException e) {
-                        System.err.println("Server: UDP connect to " + remoteAddr + " failed: " + e);
-                    }
+                    try { channel.connect(remoteAddr); } catch (IOException _) {}
                     // Promote peer: allocate a per-connection id + LayerContext
                     // so every layer call sees a stable connectionId, the peer's
                     // InetSocketAddress, and close hooks wired to this channel.
@@ -396,8 +373,7 @@ public final class Server implements AutoCloseable {
         } catch (ClosedChannelException _) {
             // Normal shutdown (includes AsynchronousCloseException)
         } catch (Throwable t) {
-            System.err.println("Server: connected-UDP loop error (connId=" + connId + "): " + t);
-            t.printStackTrace(System.err);
+            System.err.println("Server: connected-UDP loop error: " + t);
         } finally {
             if (connId != null && dispatchedConnect) {
                 try { serviceRegistry.dispatchDisconnect(connId); } catch (Throwable _) {}
@@ -490,7 +466,7 @@ public final class Server implements AutoCloseable {
                             }
                         });
             } catch (IOException e) {
-                throw new ConnectionException("Failed to register UDP socket", e);
+                throw new RuntimeException("Failed to register UDP socket", e);
             }
         });
     }
@@ -521,6 +497,10 @@ public final class Server implements AutoCloseable {
     private void acceptClient(ServerSocketChannel serverChannel, ListenerConfig config) throws IOException {
         var clientChannel = serverChannel.accept();
         if (clientChannel == null) return;
+        if (closed) {
+            try { clientChannel.close(); } catch (IOException _) {}
+            return;
+        }
         clientChannel.configureBlocking(false);
         var connId = sessions.allocate();
         var readBuf = ByteBuffer.allocate(65536);
@@ -549,10 +529,11 @@ public final class Server implements AutoCloseable {
                 /* closeNow */        () -> closeConnection(connId));
         connectionContexts.put(connId, ctx);
         // Publish to the flat per-slot table for zero-lookup broadcast fan-out.
-        // Uses release-store so a concurrent broadcast's acquire-load on the
-        // same slot sees the channel reference. The SessionStore monitor edge
-        // does NOT cover this store (it runs after allocate() returns).
-        SLOT_CHANNELS.setRelease(slotChannels, connId.index(), clientChannel);
+        // Happens-before a concurrent broadcast observer via SessionStore's
+        // synchronized methods: sessions.allocate released the active-bit
+        // write, and any subsequent forEachActiveIndex acquires the same
+        // monitor, flushing this store through the JMM read-of-monitor edge.
+        slotChannels[connId.index()] = clientChannel;
 
         // Assign to a worker loop. switchPipeline dispatches to the loop
         // selected by Math.floorMod(index, size), so this registration must
@@ -578,7 +559,7 @@ public final class Server implements AutoCloseable {
                 keyToConnection.put(selKey, connId);
                 connectionToKey.put(connId, selKey);
             } catch (IOException e) {
-                throw new ConnectionException("Failed to register client channel", e);
+                throw new RuntimeException("Failed to register client channel", e);
             }
         });
 
@@ -622,7 +603,6 @@ public final class Server implements AutoCloseable {
                 // exception reach the EventLoop, since that would cancel the
                 // key for the wrong reason and still leave state inconsistent.
                 System.err.println("Server: malformed input on " + connId + ", closing: " + t);
-                t.printStackTrace(System.err);
                 if (handshakePending.contains(connId)) {
                     // Never dispatched connect → don't dispatch disconnect.
                     rejectConnection(channel, config, key, connId);
@@ -692,7 +672,7 @@ public final class Server implements AutoCloseable {
         // Clear the flat slot BEFORE releasing the session — otherwise a
         // concurrent allocate could reuse the slot and race the null-store,
         // leaking a stale channel ref into fan-out.
-        SLOT_CHANNELS.setRelease(slotChannels, connId.index(), (SocketChannel) null);
+        slotChannels[connId.index()] = null;
         sessions.release(connId);
         keyToConnection.remove(key);
         connectionToKey.remove(connId);
@@ -851,7 +831,7 @@ public final class Server implements AutoCloseable {
 
     public int udpPort(Class<? extends Record> connectionType) {
         var p = boundUdpPorts.get(connectionType);
-        if (p == null) throw new ConfigurationException("No UDP listener for " + connectionType.getName());
+        if (p == null) throw new IllegalArgumentException("No UDP listener for " + connectionType.getName());
         return p;
     }
 
@@ -876,7 +856,7 @@ public final class Server implements AutoCloseable {
         // Clear the flat slot BEFORE releasing the session — otherwise a
         // concurrent allocate could reuse the slot and race the null-store,
         // leaking a stale channel ref into fan-out.
-        SLOT_CHANNELS.setRelease(slotChannels, connId.index(), (SocketChannel) null);
+        slotChannels[connId.index()] = null;
         sessions.release(connId);
         keyToConnection.remove(key);
         connectionToKey.remove(connId);
@@ -910,8 +890,6 @@ public final class Server implements AutoCloseable {
      * @param newPipeline replacement pipeline
      */
     public void switchPipeline(ConnectionId connId, Pipeline newPipeline) {
-        Objects.requireNonNull(connId, "parameter 'connId' must not be null");
-        Objects.requireNonNull(newPipeline, "parameter 'newPipeline' must not be null");
         var oldConfig = connectionConfig.get(connId);
         if (oldConfig == null) return; // connection already closed
         var newConfig = new ListenerConfig(
@@ -934,47 +912,58 @@ public final class Server implements AutoCloseable {
 
     public int port(Class<? extends Record> connectionType) {
         var p = boundPorts.get(connectionType);
-        if (p == null) throw new ConfigurationException("No listener for " + connectionType.getName());
+        if (p == null) throw new IllegalArgumentException("No listener for " + connectionType.getName());
         return p;
     }
 
     public boolean isRunning() {
-        return acceptLoop.isRunning();
+        return !closed && acceptLoop.isRunning();
     }
+
+    private volatile boolean closed;
 
     @Override
     public void close() {
-        // 1. Close per-connection TCP channels first (before selector/loops).
-        for (var ch : connectionChannels.values()) {
-            try { ch.close(); } catch (IOException _) {}
-        }
-        connectionChannels.clear();
-        // 2. Close server (accept) socket channels.
-        for (var ch : serverChannels) {
-            try { ch.close(); } catch (IOException _) {}
-        }
-        serverChannels.clear();
-        // 3. Close event loops (closes selectors).
+        if (closed) return;
+        closed = true;
+
+        // 1. Stop accepting new connections first.
         acceptLoop.close();
+
+        // 2. Fire @OnDisconnect for every active connection and close channels.
+        //    We do this directly (not via worker submit) because we are about to
+        //    shut down the worker group. The worker loops are still running at
+        //    this point so any in-flight reads will see the channel close.
+        var snapshot = new ArrayList<>(connectionChannels.entrySet());
+        for (var entry : snapshot) {
+            var connId = entry.getKey();
+            var channel = entry.getValue();
+            var selKey = connectionToKey.get(connId);
+            if (selKey != null) selKey.cancel();
+            try { channel.close(); } catch (IOException _) {}
+            if (!handshakePending.contains(connId)) {
+                serviceRegistry.dispatchDisconnect(connId);
+            }
+            slotChannels[connId.index()] = null;
+            sessions.release(connId);
+        }
+        keyToConnection.clear();
+        connectionToKey.clear();
+        connectionConfig.clear();
+        connectionChannels.clear();
+        connectionContexts.clear();
+
+        // 3. Now stop worker loops (channels already closed, no more I/O).
         workerGroup.close();
+
         // 4. Shut down connected-UDP dedicated threads. Closing the channel
-        // unblocks the blocking read() with AsynchronousCloseException.
+        //    unblocks the blocking read() with AsynchronousCloseException.
         for (var ch : udpChannels.values()) {
             try { ch.close(); } catch (IOException _) {}
         }
         for (var t : udpConnectedThreads) {
             t.interrupt();
             try { t.join(500); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
-        }
-        // 5. Close pipeline layers that hold native resources (Deflater/Inflater).
-        for (var config : listeners) {
-            if (config.layers() != null) {
-                for (var layer : config.layers()) {
-                    if (layer instanceof AutoCloseable ac) {
-                        try { ac.close(); } catch (Exception _) {}
-                    }
-                }
-            }
         }
     }
 
@@ -993,12 +982,6 @@ public final class Server implements AutoCloseable {
         private int eventLoops = 1;
 
         public Builder listen(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
-            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
-            Objects.requireNonNull(transport, "parameter 'transport' must not be null");
-            Objects.requireNonNull(layers, "parameter 'layers' must not be null");
-            for (int i = 0; i < layers.length; i++) {
-                Objects.requireNonNull(layers[i], "parameter 'layers[" + i + "]' must not be null");
-            }
             // Plan A for unconnected UDP: the pipeline is per-connection
             // (SequencingLayer, AckLayer, DuplicateFilterLayer all hold per-peer
             // state) but an unconnected DatagramChannel sees every peer on the
@@ -1006,7 +989,7 @@ public final class Server implements AutoCloseable {
             // Fail loudly so users don't lose their filter/reliability layers.
             if (transport instanceof jtroop.transport.UdpTransport udp
                     && !udp.connected() && layers != null && layers.length > 0) {
-                throw new ConfigurationException(
+                throw new IllegalArgumentException(
                         "Unconnected UDP (Transport.udp(...)) does not support pipeline layers — "
                                 + "per-peer state would be shared across all senders. "
                                 + "Use Transport.udpConnected(...) for filter/reliability layers, "
@@ -1019,23 +1002,17 @@ public final class Server implements AutoCloseable {
         @SuppressWarnings({"unchecked", "rawtypes"})
         public <T extends Record> Builder onHandshake(Class<T> connectionType,
                                                        java.util.function.Function<T, ? extends Record> handler) {
-            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
-            Objects.requireNonNull(handler, "parameter 'handler' must not be null");
             codec.register(connectionType);
             handshakeHandlers.put(connectionType, (java.util.function.Function) handler);
             return this;
         }
 
         public Builder addService(Class<?> handlerClass, Class<? extends Record> connectionType) {
-            Objects.requireNonNull(handlerClass, "parameter 'handlerClass' must not be null");
-            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
             serviceRegistry.register(handlerClass);
             return this;
         }
 
         public Builder addService(Object handlerInstance, Class<? extends Record> connectionType) {
-            Objects.requireNonNull(handlerInstance, "parameter 'handlerInstance' must not be null");
-            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
             serviceRegistry.register(handlerInstance);
             return this;
         }
