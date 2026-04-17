@@ -95,20 +95,32 @@ public final class SessionStore {
 
     public synchronized void setState(ConnectionId id, int state) {
         int index = id.index();
+        if (index < 0 || index >= capacity) return;
+        if (generations[index] != id.generation()) return; // stale handle
+        if ((stateAndActive[index] & ACTIVE_BIT) == 0L) return; // not active
         // Preserve the active bit, rewrite only the low 32 state bits.
         stateAndActive[index] = (stateAndActive[index] & ~STATE_MASK) | (state & STATE_MASK);
     }
 
     public synchronized int getState(ConnectionId id) {
-        return (int) (stateAndActive[id.index()] & STATE_MASK);
+        int index = id.index();
+        if (index < 0 || index >= capacity) return 0;
+        if (generations[index] != id.generation()) return 0; // stale handle
+        return (int) (stateAndActive[index] & STATE_MASK);
     }
 
     public synchronized void setLastActivity(ConnectionId id, long nanos) {
-        lastActivity[id.index()] = nanos;
+        int index = id.index();
+        if (index < 0 || index >= capacity) return;
+        if (generations[index] != id.generation()) return; // stale handle
+        lastActivity[index] = nanos;
     }
 
     public synchronized long getLastActivity(ConnectionId id) {
-        return lastActivity[id.index()];
+        int index = id.index();
+        if (index < 0 || index >= capacity) return 0L;
+        if (generations[index] != id.generation()) return 0L; // stale handle
+        return lastActivity[index];
     }
 
     public synchronized int activeCount() {
