@@ -227,7 +227,15 @@ public final class EventLoop implements Runnable, AutoCloseable {
         waitingThreads[slot] = Thread.currentThread();
         stageWrite(slot, data);
         selector.wakeup();
+        long flushDeadlineNs = System.nanoTime() + 5_000_000_000L;
         while ((boolean) PENDING_WRITE.getAcquire(pendingWrite, slot)) {
+            if (System.nanoTime() > flushDeadlineNs) {
+                // Clear waiter so the event loop doesn't fire a stale unpark.
+                waitingThreads[slot] = null;
+                throw new IllegalStateException(
+                        "stageWriteAndFlush back-pressure timeout on slot " + slot +
+                        " — event loop unable to drain within 5s");
+            }
             Thread.onSpinWait();
         }
     }
