@@ -63,20 +63,15 @@ public final class ServiceProxyGenerator {
         // The proxy implements serviceInterface, which may be package-private
         // or non-public. Define the hidden class in serviceInterface's own
         // lookup/package so the VM grants access to the superinterface.
-        MethodHandles.Lookup lookup;
-        try {
-            lookup = MethodHandles.privateLookupIn(serviceInterface, MethodHandles.lookup());
-        } catch (IllegalAccessException e) {
-            throw new IllegalArgumentException(
-                    "Cannot access service interface: " + serviceInterface.getName(), e);
-        }
-        var pkg = serviceInterface.getPackageName();
-        var pkgPrefix = pkg.isEmpty() ? "jtroop.generate" : pkg;
+        var lookup = GeneratorSupport.lookupFor(serviceInterface);
         var simpleName = serviceInterface.getName()
                 .substring(serviceInterface.getName().lastIndexOf('.') + 1)
                 .replace('$', '_');
-        var className = pkgPrefix + ".ServiceProxy$" + simpleName + "$"
-                + System.identityHashCode(serviceInterface);
+        // ServiceProxy uses dot-separated names (not slash) because the
+        // ClassDesc.of below expects a fully-qualified class name.
+        var internalName = GeneratorSupport.className(serviceInterface, "ServiceProxy",
+                simpleName + "$" + System.identityHashCode(serviceInterface));
+        var className = internalName.replace('/', '.');
         var thisDesc = ClassDesc.of(className);
         var ifaceDesc = ClassDesc.of(serviceInterface.getName());
 

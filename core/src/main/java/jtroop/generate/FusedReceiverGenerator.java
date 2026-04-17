@@ -14,7 +14,6 @@ import java.lang.classfile.Label;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
 import java.lang.constant.MethodTypeDesc;
-import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 import java.lang.reflect.RecordComponent;
 import java.nio.ByteBuffer;
@@ -175,21 +174,13 @@ public final class FusedReceiverGenerator {
         var firstHandler = bindings.getFirst().handlerInstance();
         var firstHandlerClass = firstHandler.getClass();
 
-        MethodHandles.Lookup lookup;
-        try {
-            lookup = MethodHandles.privateLookupIn(firstHandlerClass, MethodHandles.lookup());
-        } catch (IllegalAccessException e) {
-            throw new IllegalArgumentException(
-                    "Cannot access handler class: " + firstHandlerClass.getName(), e);
-        }
+        var lookup = GeneratorSupport.lookupFor(firstHandlerClass);
 
-        var pkg = firstHandlerClass.getPackageName().replace('.', '/');
-        var pkgPrefix = pkg.isEmpty() ? "jtroop/generate" : pkg;
         var simpleName = firstHandlerClass.getName()
                 .substring(firstHandlerClass.getName().lastIndexOf('.') + 1)
                 .replace('$', '_');
-        var className = pkgPrefix + "/FusedReceiver$" + simpleName + "$"
-                + System.identityHashCode(bindings);
+        var className = GeneratorSupport.className(firstHandlerClass, "FusedReceiver",
+                simpleName + "$" + System.identityHashCode(bindings));
 
         var thisDesc = ClassDesc.of(className.replace('/', '.'));
 
@@ -403,7 +394,7 @@ public final class FusedReceiverGenerator {
         // Build target method descriptor
         var targetParamDescs = new ClassDesc[paramTypes.length];
         for (int i = 0; i < paramTypes.length; i++) {
-            targetParamDescs[i] = classDescFor(paramTypes[i]);
+            targetParamDescs[i] = GeneratorSupport.classDescFor(paramTypes[i]);
         }
         var targetMethodDesc = MethodTypeDesc.of(ConstantDescs.CD_void, targetParamDescs);
 
@@ -423,7 +414,7 @@ public final class FusedReceiverGenerator {
 
         var ctorParamDescs = new ClassDesc[components.length];
         for (int i = 0; i < components.length; i++) {
-            ctorParamDescs[i] = classDescFor(components[i].getType());
+            ctorParamDescs[i] = GeneratorSupport.classDescFor(components[i].getType());
         }
         var ctorDesc = MethodTypeDesc.of(ConstantDescs.CD_void, ctorParamDescs);
         b.invokespecial(recordDesc, ConstantDescs.INIT_NAME, ctorDesc);
@@ -459,15 +450,4 @@ public final class FusedReceiverGenerator {
         }
     }
 
-    private static ClassDesc classDescFor(Class<?> type) {
-        if (type == int.class) return ConstantDescs.CD_int;
-        if (type == float.class) return ConstantDescs.CD_float;
-        if (type == long.class) return ConstantDescs.CD_long;
-        if (type == double.class) return ConstantDescs.CD_double;
-        if (type == byte.class) return ConstantDescs.CD_byte;
-        if (type == short.class) return ConstantDescs.CD_short;
-        if (type == boolean.class) return ConstantDescs.CD_boolean;
-        if (type == String.class) return CD_String;
-        return ClassDesc.of(type.getName());
-    }
 }

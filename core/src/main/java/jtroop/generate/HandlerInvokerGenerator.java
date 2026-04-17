@@ -8,7 +8,6 @@ import java.lang.classfile.ClassFile;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
 import java.lang.constant.MethodTypeDesc;
-import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 
 import static java.lang.classfile.ClassFile.*;
@@ -48,21 +47,13 @@ public final class HandlerInvokerGenerator {
     public static HandlerInvoker generate(Object handlerInstance, Method method,
                                           Class<? extends Record> messageType) {
         var handlerClass = handlerInstance.getClass();
-        MethodHandles.Lookup lookup;
-        try {
-            lookup = MethodHandles.privateLookupIn(handlerClass, MethodHandles.lookup());
-        } catch (IllegalAccessException e) {
-            throw new IllegalArgumentException(
-                    "Cannot access handler class: " + handlerClass.getName(), e);
-        }
+        var lookup = GeneratorSupport.lookupFor(handlerClass);
 
-        var pkg = handlerClass.getPackageName().replace('.', '/');
-        var pkgPrefix = pkg.isEmpty() ? "jtroop/generate" : pkg;
         var simpleOwner = handlerClass.getName()
                 .substring(handlerClass.getName().lastIndexOf('.') + 1)
                 .replace('$', '_');
-        var className = pkgPrefix + "/HandlerInvoker$" + simpleOwner + "$" + method.getName()
-                + "$" + System.identityHashCode(method);
+        var className = GeneratorSupport.className(handlerClass, "HandlerInvoker",
+                simpleOwner + "$" + method.getName() + "$" + System.identityHashCode(method));
 
         var handlerDesc = ClassDesc.of(handlerClass.getName());
         var messageDesc = ClassDesc.of(messageType.getName());
@@ -83,19 +74,7 @@ public final class HandlerInvokerGenerator {
             cb.withInterfaceSymbols(CD_HandlerInvoker);
 
             var thisDesc = ClassDesc.of(className.replace('/', '.'));
-            cb.withField("handler", handlerDesc, ACC_PRIVATE | ACC_FINAL);
-
-            // Constructor: (Object handler) -> void, casts to concrete handler type
-            var ctorDesc = MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object);
-            cb.withMethodBody(ConstantDescs.INIT_NAME, ctorDesc, ACC_PUBLIC, b -> {
-                b.aload(0);
-                b.invokespecial(ConstantDescs.CD_Object, ConstantDescs.INIT_NAME, ConstantDescs.MTD_void);
-                b.aload(0);
-                b.aload(1);
-                b.checkcast(handlerDesc);
-                b.putfield(thisDesc, "handler", handlerDesc);
-                b.return_();
-            });
+            GeneratorSupport.emitHandlerConstructor(cb, thisDesc, handlerDesc);
 
             // invoke(Record, ConnectionId, Broadcast, Unicast): Object
             var invokeDesc = MethodTypeDesc.of(ConstantDescs.CD_Object,
@@ -138,13 +117,7 @@ public final class HandlerInvokerGenerator {
             });
         });
 
-        try {
-            var hiddenClass = lookup.defineHiddenClass(bytes, true);
-            var ctor = hiddenClass.lookupClass().getDeclaredConstructor(Object.class);
-            return (HandlerInvoker) ctor.newInstance(handlerInstance);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to generate HandlerInvoker for "
-                    + handlerClass.getName() + "#" + method.getName(), e);
-        }
+        return GeneratorSupport.defineAndInstantiate(lookup, bytes,
+                HandlerInvoker.class, handlerInstance);
     }
 }
