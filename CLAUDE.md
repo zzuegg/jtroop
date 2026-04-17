@@ -104,30 +104,31 @@ Verify with:
 Users declare intent via annotations. The framework discovers, resolves, and wires everything at runtime. No manual registration of handlers, no boilerplate. The user writes a plain class with annotated methods — the framework does the rest.
 
 ```java
-class MyHandler {
+@Handles(GameService.class)
+class GameHandler {
     @OnMessage
-    void handle(@Read Header h, @Write Mut<Body> body, Res<Config> cfg) { ... }
+    void position(PositionUpdate pos, ConnectionId sender, Broadcast broadcast) { ... }
 }
-// Framework: discovers method, resolves parameter types, generates dispatch
+// Framework: discovers method, resolves parameter types by record type, generates dispatch
 ```
 
 ### Records as data, annotations as metadata
 - All user data types are `record` — immutable, decomposable, EA-friendly
-- Annotations on types for classification (`@Persistent`, `@Compressed`, `@Encrypted`)
-- Annotations on parameters for access mode (`@Read`, `@Write`)
 - Annotations on methods for dispatch (`@OnMessage`, `@OnConnect`, `@OnDisconnect`)
+- `@Datagram` on service interface methods for UDP routing
+- `@Handles(ServiceInterface.class)` on handler classes
 - Read once at startup, zero per-message cost
 
 ### Builder for construction, fluent chaining
 ```java
 var server = Server.builder()
-    .addHandler(MyHandler.class)
-    .addPlugin(compressionPlugin)
-    .port(8080)
+    .listen(GameConn.class, Transport.tcp(8080), new FramingLayer())
+    .addService(new GameHandler(), GameConn.class)
+    .eventLoops(4)
     .build();
 ```
 - `builder()` → mutable config → `build()` → immutable runtime
-- `addPlugin(Plugin)` bundles handlers + resources + config (`@FunctionalInterface void install(Builder)`)
+- `listen()` binds transport + layers; `addService()` registers handlers
 
 ### Identifiers as packed value types
 ```java
