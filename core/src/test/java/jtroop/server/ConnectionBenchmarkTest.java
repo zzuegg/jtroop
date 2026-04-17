@@ -159,6 +159,7 @@ class ConnectionBenchmarkTest {
      * the additional round-trip cost.
      */
     @Test
+    @org.junit.jupiter.api.Timeout(120)
     void timeToFirstMessage() throws Exception {
         // --- No handshake path ---
         var handler = new PingHandler();
