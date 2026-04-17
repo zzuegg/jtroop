@@ -2,142 +2,82 @@
 
 **J**ava **T**yped **R**ecord-**O**riented **O**ptimized **P**rotocol
 
-A zero-dependency networking module for JDK 26+ that minimizes hot-path allocation through EA-friendly design.
+A zero-dependency networking module for JDK 26+ that eliminates hot-path allocation through EA-friendly design and runtime bytecode generation.
 
 ## Benchmark Results
 
-Game scenario: TCP server + client, length-prefix framing, fire-and-forget sends. Position updates (16B payload), chat messages (~70B payload), mixed traffic (80% position + 20% chat, 10 messages per batch).
-
-All benchmarks use fire-and-forget (non-blocking) sends for a fair comparison. JDK 26, JMH with `-prof gc`, single fork, 5 measurement iterations.
+Game scenario: TCP server + client, length-prefix framing, fire-and-forget sends. Position updates (16B payload), chat messages (~70B CharSequence payload), mixed traffic (80% position + 20% chat, 10 messages per batch). JDK 26, JMH with `-prof gc`, single fork, 5 measurement iterations.
 
 ### Throughput (ops/ms) — higher is better
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
-|-----------|--------|----------------|-----------|------------------|
-| positionUpdate | **45,038** | 4,762 | 12,624 | 625 |
-| chatMessage (CharSequence) | **20,820** | 4,067 | 13,314 | 609 |
-| mixedTraffic (10 msg) | **3,772** | — | 1,277 | 61 |
-| requestResponse (RPC) | 945 | — | — | — |
+|-----------|-------:|----------------:|----------:|-----------------:|
+| positionUpdate | **45,938** | 2,619 | 12,639 | 629 |
+| chatMessage | **20,314** | 2,852 | 13,341 | 603 |
+| mixedTraffic (10 msg) | **3,815** | — | 1,286 | 60 |
+| requestResponse (RPC) | 943 | — | — | — |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
-|-----------|--------|----------------|-----------|------------------|
-| positionUpdate | **0.022** | **0.001** | 1,110 | 449 |
-| chatMessage (CharSequence) | **0.048** | — | 1,577 | 840 |
-| mixedTraffic (10 msg) | **304** | — | 12,272 | 6,391 |
-| requestResponse (RPC) | 88 | — | — | — |
+|-----------|-------:|----------------:|----------:|-----------------:|
+| positionUpdate | **0.021** | 0.403 | 1,082 | 443 |
+| chatMessage | **0.049** | 0.369 | 1,611 | 855 |
+| mixedTraffic (10 msg) | **304** | — | 11,155 | 6,139 |
+| requestResponse (RPC) | 1,068 | — | — | — |
 
-### Layer overhead (B/op)
+### HTTP/1.1 throughput (wrk)
 
-| Layer stack | ops/ms | B/op |
-|---|---:|---:|
-| framing only | 31,109 | 64 |
-| framing + compression (Deflater reused) | 940 | **32** |
-| framing + AES-GCM encryption (Cipher reused) | 4,784 | 1,864 |
-
-### HTTP/1.1 throughput (wrk) — higher is better
-
-External load generator, "Hello, World!" responses through the full HTTP pipeline (per-request encoding via `HttpLayer`, no pre-built cheat). Same JDK 26, same box, TCP_NODELAY, SO_REUSEPORT worker fan-out on both sides.
+External load generator, "Hello, World!" responses. Same JDK 26, same box, TCP_NODELAY, SO_REUSEPORT.
 
 | Load | jtroop | Netty 4.2 | jtroop advantage |
 |------|-------:|----------:|-----------------:|
-| `wrk -t4 -c100 -d15s` | 1,105,044 req/s | **1,175,169 req/s** | −6% (client-bottlenecked) |
-| `wrk -t8 -c400 -d15s` | **2,079,014 req/s** | 1,764,029 req/s | +17.8% |
-| `wrk -t16 -c400 -d15s` | **3,235,494 req/s** | 2,676,074 req/s | +20.9% |
-| `wrk -t32 -c400 -d15s` | **3,481,729 req/s** | 2,792,112 req/s | +24.7% |
-
-### Notes
-
-- **positionUpdate 45K ops/ms**: per-message-type cached `TcpSendCtx` reduces 5-7 map lookups per send to 1. For fixed-size primitive records with a single FramingLayer, a single-buffer shortcut writes the 4-byte length prefix + codec.encode directly into wireBuf — skipping the intermediate encodeBuf and the fused pipeline entirely. 64KB write buffers prevent back-pressure stalls at high throughput.
-- **chatMessage 0.048 B/op**: round 4 discovered and fixed a **bytecode-generation bug** in `CodecClassGenerator.emitPut` — String fields emitted a `POP` after `invokestatic` (which returns void), causing stack underflow → silent fallback to reflective decode with `Object[]` + boxing (~312 B/op). The 384 B/op we chased for three rounds was mostly this bug. Combined with `BufferCharSequence` (zero-copy `CharSequence` backed by the wire buffer's heap array), chatMessage allocation dropped from 384 → 0.048 B/op and throughput rose from 13.5K → 20.8K ops/ms.
-- **`FusedReceiverGenerator`**: generates a single hidden class per (pipeline-shape × handler-set) that fuses framing → typeId switch → inline field decode → monomorphic handler call in one method. No intermediate ByteBuffer, no Record, no ReadBuffer. Server read loop is +60% vs the 3-stage path.
-- **Netty**: jtroop beats Netty 4.2 on every JMH benchmark and on HTTP at ≥ 8 wrk threads:
-  - 3.6× throughput, ~50,000× less allocation on `positionUpdate`
-  - 27× throughput on `positionUpdate_blocking`
-  - 1.6× throughput, ~33,000× less allocation on `chatMessage`
-  - 3× throughput, 40× less allocation on `mixedTraffic`
-  - 18–33% more HTTP req/s at `-t8/-t16/-t32 -c400`
-- **SpiderMonkey**: stable but throughput limited by thread-per-kernel model and reflection-based serialization.
-- All JMH benchmarks encode/decode through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
-- The `-t4 -c100` HTTP regression is real: at low concurrency jtroop's SO_REUSEPORT fan-out leaves some workers idle (wrk's threads can't saturate N loops), so per-connection overhead dominates and Netty's queue batching wins narrowly. Past `-t8` the fan-out pays off.
+| `wrk -t8 -c400 -d15s` | **2,066,934 req/s** | 1,466,934 req/s | +41% |
 
 ### UDP (game-shaped workload)
 
-Fire-and-forget position packets. `Transport.udpConnected(...)` pins the server-side peer so the read loop uses `channel.read(buf)` instead of allocation-heavy `channel.receive(buf, addr)`. Reliable variant adds Sequencing + DuplicateFilter + Ack layers.
-
 | Benchmark | ops/ms | B/op |
 |---|---:|---:|
-| `udpPositionUpdate` (connected) | 1,218 | **0.002** |
-| `udpReliable` (seq+dup+ack) | 916 | **0.003** |
+| `udpPositionUpdate` (connected) | 1,202 | **0.937** |
+| `udpReliable` (seq+dup+ack) | 861 | **1.272** |
 
-### Session iteration (N=100 active in 4096-slot store)
+### Latency (SampleTime, nanoseconds)
 
-Used by broadcast fan-out and GC sweeps. Three API shapes, all zero-alloc:
+| Benchmark | p50 | p90 | p99 | p999 |
+|---|---:|---:|---:|---:|
+| positionUpdate (fire-forget) | 60 ns | 90 ns | 120 ns | 2,420 ns |
+| positionUpdate (blocking) | 420 ns | 1,150 ns | 5,984 ns | 39,808 ns |
+| chatMessage (fire-forget) | 100 ns | 160 ns | 410 ns | 5,016 ns |
+| requestResponse (RPC round-trip) | 1.06 ms | 1.07 ms | 1.50 ms | 3.94 ms |
 
-| Benchmark | ops/ms | B/op |
-|---|---:|---:|
-| `forEachActive(Consumer<ConnectionId>)` — record | 1,254 | 0.003 |
-| `forEachActiveLong(LongConsumer)` — packed long | **1,475** | 0.003 |
-| `activeCopyIds(long[] out)` — snapshot | 984 | 0.004 |
-| `forEachActive` + fresh lambda per call | 1,274 | 0.122 |
+### Comparison summary
 
-### Read-loop microbenchmarks (8 frames per op, no sockets)
+| vs Netty 4.2 | Throughput | Allocation |
+|---|---|---|
+| positionUpdate | **3.6×** faster | **51,000×** less |
+| chatMessage | **1.5×** faster | **33,000×** less |
+| mixedTraffic | **3.0×** faster | **37×** less |
+| positionUpdate_blocking | **15×** faster | **2,680×** less |
+| HTTP (wrk t8 c400) | **+41%** | — |
 
-Confirms the inner receive-and-dispatch drain is zero-alloc — any residual would multiply by messages/sec in a real server.
+### Notes
 
-| Benchmark | ops/ms | B/op |
-|---|---:|---:|
-| `readLoop_clientDrain` (decode + primitive field touch) | 18,290 | ~10⁻⁴ |
-| `readLoop_serverDrain` (decode + `ServiceRegistry.dispatch`) | 13,445 | ~10⁻⁴ |
-| `readLoop_serverExecutor` (+ per-frame `executor.execute` lambda) | 13,317 | ~10⁻⁴ |
-
-### Dispatch microbenchmarks (isolated from transport)
-
-`ServiceRegistry.dispatch` through the hidden-class `HandlerInvoker` — no sockets, no framing, no codec.
-
-| Benchmark | ns/op | B/op |
-|---|---:|---:|
-| `dispatchDirect_void` | 3.30 | ~10⁻⁵ |
-| `dispatchDirect_returning` (shared return record) | 3.24 | ~10⁻⁵ |
-| `dispatchDirect_broadcast` (+ `Broadcast` injectable) | 2.82 | ~10⁻⁵ |
-| `dispatchDirect_allInjectables` (+ `Unicast` injectable) | 2.70 | ~10⁻⁵ |
-
-### Codec microbenchmarks (record ↔ ByteBuffer, no I/O)
-
-| Benchmark | ns/op | B/op |
-|---|---:|---:|
-| `encodeOnly` (fresh record per call) | 4.37 | ~10⁻⁵ |
-| `encodeOnly_cachedRecord` | 4.53 | ~10⁻⁵ |
-| `decodeOnly` (returns record) | 8.77 | 32 (record) |
-| `encodeDecodeRoundtrip` | 8.20 | 32 (record) |
-
-### Payload size sweep (`PositionBlob` record with growing `byte[]` field)
-
-| Payload | ops/ms | B/op |
-|---|---:|---:|
-| 16 B small | 28,459 | 80 |
-| 256 B medium | 5,234 | 720 |
-| 4 KB large | 452 | 4,512 |
-
-Allocation scales linearly with payload because the `byte[]` inside the `PositionBlob` record is structurally a fresh heap object per op (and is correctly observed as such).
-
-### Many clients (100 TCP clients, round-robin send)
-
-| Benchmark | ops/ms | B/op |
-|---|---:|---:|
-| `positionUpdate_manyClients` | 14,151 | 38 |
+- **positionUpdate 45.9K ops/ms**: per-message-type `SendCtx` cache reduces 5-7 map lookups per send to 1. For fixed-size primitive records with a single FramingLayer, a single-buffer shortcut writes the 4-byte length prefix + codec.encode directly into wireBuf — skipping the intermediate encodeBuf and the fused pipeline entirely. 64KB write buffers prevent back-pressure stalls at high throughput.
+- **chatMessage 0.049 B/op**: round 4 discovered and fixed a **bytecode-generation bug** in `CodecClassGenerator.emitPut` — String fields emitted a `POP` after `invokestatic` (which returns void), causing stack underflow → silent fallback to reflective decode with `Object[]` + boxing (~312 B/op). Combined with `BufferCharSequence` (zero-copy `CharSequence` backed by the wire buffer's heap array), chatMessage went from 384 → 0.049 B/op and 13.5K → 20.3K ops/ms.
+- **`FusedReceiverGenerator`**: generates a single hidden class per (pipeline-shape × handler-set) that fuses framing → typeId switch → inline field decode → monomorphic handler call. +60% throughput vs the 3-stage path (21.2K vs 13.2K ops/ms on the readLoop microbenchmark).
+- All JMH benchmarks encode/decode through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
 
 ## Design Approach
 
-jtroop minimizes allocation on the hot path through these techniques:
+jtroop minimizes allocation through techniques driven by C2's Escape Analysis capabilities (see `CLAUDE.md` for the 10 rules):
 
-- **Pre-allocated buffer reuse** — encode and wire buffers are allocated once per connection and reused across messages.
-- **stageWrite** — encoded bytes are copied into pre-allocated per-slot write buffers in the EventLoop. No lambda, Runnable, or queue node allocation per send.
-- **Direct ByteBuffer encoding** — codec reads record fields via MethodHandle and writes directly to ByteBuffer with primitive casts, avoiding boxing.
-- **Bytecode-generated codecs** — for public record types, `java.lang.classfile` generates hidden classes with direct field access.
-- **Fused pipeline generation** — `java.lang.classfile` generates a hidden class per unique layer stack, calling each layer via `invokevirtual` on the concrete type.
+- **Per-message-type `SendCtx` cache** — sealed interface with `Tcp` and `Udp` variants. One `ConcurrentHashMap.get` per send, everything pre-resolved.
+- **Single-buffer framing shortcut** — for fixed-size primitive records with FramingLayer, encode directly into wireBuf with pre-known length prefix. Skip the intermediate encodeBuf and fused pipeline entirely.
+- **Bytecode-generated codecs** — `java.lang.classfile` generates hidden classes with direct field access, monomorphic `invokevirtual`. `BufferCharSequence` for zero-copy String/CharSequence decode.
+- **Fused pipeline generation** — hidden class per unique layer stack. `FusedReceiverGenerator` further fuses pipeline + codec + dispatch into one method.
 - **SoA session storage** — connection state in parallel primitive arrays. `ConnectionId` is a packed long (index + generation).
+- **Per-connection `Layer.Context`** — peer address, byte counters, close hooks threaded through every layer call.
+- **Adaptive selector** — `selectNow()` when work is pending, `select(Consumer, timeout)` when idle. The `Consumer` form eliminates `selectedKeys().iterator()` allocation.
 
 ## Quick Start
 
@@ -146,11 +86,9 @@ jtroop minimizes allocation on the hot path through these techniques:
 ```java
 var server = Server.builder()
     .listen(GameConn.class, Transport.tcp(8080),
-        Layers.framing(), Layers.encryption(key), Layers.compression())
-    .listen(GameConn.class, Transport.udp(8081),
-        Layers.encryption(key), Layers.sequencing())
-    .addService(ChatHandler.class, GameConn.class)
-    .addService(MovementHandler.class, GameConn.class)
+        new FramingLayer(), new EncryptionLayer(key), new CompressionLayer())
+    .listen(GameConn.class, Transport.udpConnected(8081))
+    .addService(new GameHandler(), GameConn.class)
     .eventLoops(4)
     .build();
 server.start();
@@ -161,44 +99,46 @@ server.start();
 ```java
 var client = Client.builder()
     .connect(GameConn.class, Transport.tcp("game.example.com", 8080),
-        Layers.framing(), Layers.encryption(key), Layers.compression())
-    .connect(GameConn.class, Transport.udp("game.example.com", 8081),
-        Layers.encryption(key), Layers.sequencing())
-    .addService(ChatService.class, GameConn.class)
-    .addService(MovementService.class, GameConn.class)
+        new FramingLayer(), new EncryptionLayer(key), new CompressionLayer())
+    .connect(GameConn.class, Transport.udpConnected("game.example.com", 8081))
+    .addService(GameService.class, GameConn.class)
     .build();
 client.start();
 
-// Typed proxy
-ChatService chat = client.service(ChatService.class);
-chat.send(new ChatMessage("hello", 1));
+// Typed proxy — transport routing baked into generated bytecode
+GameService game = client.service(GameService.class);
+game.chat(new ChatMessage("hello", 1));                    // → TCP
+game.position(new PositionUpdate(x, y, z, yaw));           // → UDP (@Datagram)
 
-// Request/response
-ChatHistory h = chat.getHistory(new HistoryRequest(1));
-
-// @Datagram routes to UDP
-MovementService move = client.service(MovementService.class);
-move.position(new PositionUpdate(x, y, z, yaw));
+// Request/response (blocking RPC, always TCP)
+ChatHistory h = game.getHistory(new HistoryRequest(1));
 ```
 
 ### Service Contract
 
 ```java
-interface ChatService {
-    void send(ChatMessage msg);                    // fire-and-forget, TCP
-    ChatHistory getHistory(HistoryRequest req);    // request/response, TCP
-    @Datagram void typing(TypingIndicator t);      // fire-and-forget, UDP
+interface GameService {
+    void chat(ChatMessage msg);                         // fire-and-forget, TCP
+    @Datagram void position(PositionUpdate pos);        // fire-and-forget, UDP
+    ChatHistory getHistory(HistoryRequest req);          // request/response, TCP
 }
 ```
+
+`@Datagram` on the interface method tells the generated proxy to route via UDP. The same record type can appear on both TCP and UDP methods — the proxy resolves transport **per method**, not per type. Dispatch on the server is always by record type regardless of transport.
 
 ### Handler
 
 ```java
-@Handles(ChatService.class)
-class ChatHandler {
+@Handles(GameService.class)
+class GameHandler {
     @OnMessage
-    void send(ChatMessage msg, ConnectionId sender, Broadcast broadcast) {
-        broadcast.send(new ServerPush("echo:" + msg.text()));
+    void chat(ChatMessage msg, ConnectionId sender, Broadcast broadcast) {
+        broadcast.send(msg);  // fan-out to all connected clients
+    }
+
+    @OnMessage
+    void position(PositionUpdate pos, ConnectionId sender) {
+        // update world state — arrives via TCP or UDP, handler doesn't care
     }
 
     @OnMessage
@@ -210,6 +150,8 @@ class ChatHandler {
     @OnDisconnect void leave(ConnectionId id) { }
 }
 ```
+
+Handler methods are matched to service interface methods by **record type** (the first `Record` parameter). Method names on the handler are irrelevant — only the record type matters. Injectables (`ConnectionId`, `Broadcast`, `Unicast`) are passed in any order, any subset.
 
 ### Handshake / Capability Negotiation
 
@@ -229,8 +171,33 @@ Server.builder()
 
 Client.builder()
     .connect(new GameConn(2, GameConn.CHAT | GameConn.MOVE),
-        Transport.tcp("game.example.com", 8080), Layers.framing())
+        Transport.tcp("game.example.com", 8080), new FramingLayer())
 ```
+
+### Early Filters
+
+Layers receive a per-connection `Layer.Context` on every call. Filter layers at the front of the pipeline reject bad peers before framing/codec layers see their bytes.
+
+```java
+Server.builder()
+    .listen(GameConn.class, Transport.tcp(8080),
+            new AllowListLayer(allowedIps),     // rejects non-allowed peers
+            new RateLimitLayer(1_000_000),      // bytes/sec budget
+            new FramingLayer());
+```
+
+`Layer.Context`: `connectionId()`, `remoteAddress()`, `bytesRead()`, `bytesWritten()`, `connectedAtNanos()`, `closeAfterFlush()`, `closeNow()`.
+
+### Runtime Pipeline Mutation
+
+For protocols that swap the parser mid-stream (HTTP→WebSocket, STARTTLS, ALPN):
+
+```java
+var wsPipeline = httpPipeline.replace(HttpLayer.class, new WebSocketLayer());
+server.switchPipeline(connId, wsPipeline);
+```
+
+The fused hidden class is shape-indexed and cached — mutation costs one-time codegen on shape miss, pointer write on hit. The swap runs on the connection's owning EventLoop (frame-aligned, race-free).
 
 ### Virtual Thread Dispatch
 
@@ -239,39 +206,6 @@ Server.builder()
     .executor(Executors.newVirtualThreadPerTaskExecutor())
     .listen(...)
 ```
-
-### Early Filters (rate limit, allow-list, slowloris guard)
-
-Layers receive a per-connection `Layer.Context` on every call: peer address, cumulative byte counters, connection timestamp, and graceful/abrupt close hooks. Put a filter layer at the **front** of the pipeline to reject bad peers before the framing/codec layers ever see their bytes.
-
-```java
-var allowList = new AllowListLayer(Set.of(
-        InetAddress.getByName("10.0.0.0/8"),
-        InetAddress.getByName("127.0.0.1")));
-
-var rateLimit = new RateLimitLayer(/* bytes/sec */ 1_000_000);
-
-Server.builder()
-    .listen(GameConn.class, Transport.tcp(8080),
-            allowList,          // ← checked first, closes connection on non-allowed peer
-            rateLimit,          // ← closes on byte budget overrun
-            new FramingLayer(), // ← never sees blocked peers' bytes
-            new HttpLayer());
-```
-
-`Layer.Context` accessors: `connectionId()`, `remoteAddress()`, `bytesRead()`, `bytesWritten()`, `connectedAtNanos()`, `closeAfterFlush()`, `closeNow()`. Writing your own filter is a ~20-line layer (see `AllowListLayer.java`, `RateLimitLayer.java` for templates).
-
-### Runtime Pipeline Mutation (HTTP → WebSocket, STARTTLS, ALPN)
-
-The pipeline shape is normally fixed per connection-type so the fused hidden class can inline every layer call. For protocols that need to swap the parser mid-stream — HTTP→WebSocket upgrade, STARTTLS, HTTP/2 ALPN, PROXY-protocol strip, multi-protocol port sniffing — use `switchPipeline` with an `addFirst`/`remove`/`replace` edit:
-
-```java
-// Inside the HTTP handler, right after writing the 101 response:
-var wsPipeline = httpPipeline.replace(HttpLayer.class, new WebSocketLayer());
-server.switchPipeline(connId, wsPipeline);
-```
-
-The new pipeline's fused hidden class is looked up in a shape-indexed cache (generated on first sighting, reused thereafter) — each unique shape costs one-time codegen, subsequent swaps to the same shape are a pointer write. The swap itself runs on the connection's owning EventLoop so it's race-free with in-flight reads, and is frame-aligned (call from `@OnMessage` or a handshake callback so you're already between frames).
 
 ### Test Forwarder
 
@@ -296,23 +230,22 @@ forwarder.start();
 | UDP reliability layers (sequencing, duplicate filter, ack/retransmit) | Done |
 | Service contracts (shared interfaces) | Done |
 | Annotation-driven handlers (@OnMessage, @OnConnect, @OnDisconnect) | Done |
-| @Datagram routing (TCP default, UDP opt-in) | Done |
+| @Datagram per-method routing (same record on TCP + UDP) | Done |
 | Typed connection groups (multiple servers, mixed transports) | Done |
 | Handshake / capability negotiation | Done |
 | Request/response + fire-and-forget + server push | Done |
 | Typed service proxies (client.service(Interface.class)) | Done |
 | Broadcast / Unicast injectables | Done |
 | Configurable executor (virtual thread support) | Done |
-| Test forwarder (latency, packet loss, reorder) — TCP + UDP | Done |
-| EventLoopGroup (round-robin connection distribution) | Done |
-| Protocol upgrade (server.switchPipeline()) | Done |
-| Bytecode-generated codecs (java.lang.classfile + hidden classes) | Done |
-| Fused pipeline generation (hidden classes) | Done |
-| Runtime pipeline mutation (shape-cached fused class, safe swap) | Done |
-| HTTP → WebSocket upgrade e2e | Done |
 | Per-connection Layer.Context (peer addr, byte counters, close hooks) | Done |
 | Early-filter layers (AllowListLayer, RateLimitLayer) | Done |
+| Runtime pipeline mutation (shape-cached fused class, safe swap) | Done |
+| HTTP/1.1 layer + HTTP → WebSocket upgrade | Done |
+| EventLoopGroup (round-robin connection distribution) | Done |
+| Bytecode-generated codecs (java.lang.classfile + hidden classes) | Done |
+| Fused pipeline + codec + dispatch generation | Done |
 | MPSC ring buffer (lock-free, zero-alloc) | Done |
+| Test forwarder (latency, packet loss, reorder) — TCP + UDP | Done |
 | JMH benchmark suite (vs Netty 4.2, vs SpiderMonkey 3.7) | Done |
 
 ## Architecture
@@ -320,15 +253,19 @@ forwarder.start();
 ```
 jtroop/
 ├── core/           EventLoop, EventLoopGroup, ReadBuffer, WriteBuffer, MpscRingBuffer
-├── transport/      Transport (sealed: TCP, UDP), TcpTransport, UdpTransport
-├── pipeline/       Layer, Pipeline, Layers factory
-│   └── layers/     Framing, Compression, Encryption, Sequencing, DuplicateFilter, Ack
-├── codec/          CodecRegistry (record <-> ByteBuffer, deterministic type IDs)
-├── service/        @OnMessage, @Handles, @Datagram, ServiceRegistry, Broadcast, Unicast
+├── transport/      Transport (sealed: TCP, UDP, UdpConnected)
+├── pipeline/       Layer, Layer.Context, Pipeline, Layers factory
+│   └── layers/     Framing, Compression, Encryption, Sequencing, DuplicateFilter, Ack,
+│                   Http, WebSocket, AllowList, RateLimit
+├── codec/          CodecRegistry (record ↔ ByteBuffer, deterministic type IDs)
+├── service/        @OnMessage, @Handles, @Datagram, @ZeroAlloc, ServiceRegistry,
+│                   Broadcast, Unicast
 ├── session/        ConnectionId (packed long), SessionStore (SoA arrays)
 ├── server/         Server, Server.Builder
-├── client/         Client, Client.Builder, service proxy generation
-├── generate/       CodecClassGenerator, FusedPipelineGenerator (java.lang.classfile)
+├── client/         Client, Client.Builder, SendCtx (sealed: Tcp, Udp)
+├── generate/       CodecClassGenerator, FusedPipelineGenerator, FusedReceiverGenerator,
+│                   HandlerInvokerGenerator, RawHandlerInvokerGenerator, ServiceProxyGenerator
+│                   (all via java.lang.classfile → defineHiddenClass)
 └── testing/        Forwarder (TCP + UDP proxy with impairment profiles)
 ```
 
@@ -342,12 +279,10 @@ jtroop/
 | No boxing | 38 | 8,265 | Direct ByteBuffer writes, no primitive boxing |
 | Generated codecs | 5 | 28,572 | Bytecode codecs via java.lang.classfile + 1ms select |
 | Direct ByteBuffers | 0 | 30,736 | Direct write buffers, spin-wait blocking, encodeToWire split |
-| Agent sweep (9 worktrees) | 0.03 | 27,963 | SoA session store, flat codec table, hidden-class service dispatch, cached framing view, zero-alloc UDP dup filter, back-pressure correctness, large-message path, malformed-input hardening, HTTP/1.1 robustness |
-| Agent sweep II (11 worktrees) | 0.019 | 29,722 | Zero-alloc UTF-8 String codec, MPSC setup queue, blocking-send direct-write fast path, zero-alloc RPC ring + typed proxy, broadcast encode-once fan-out, UDP JMH bench + AckLayer SoA, fused-pipeline wired onto hot paths, primitive-long session iteration |
-| Agent sweep III (10 worktrees) | ~10⁻⁴ | 27,506 | `@ZeroAlloc` handler opt-in (24 B/op chat), Deflater/Cipher pooling, connected-UDP mode (0.004 B/op), flat slot→channel array for broadcast, select(Consumer) eliminates HashIterator, adaptive selectNow, HTTP SO_REUSEPORT, waiter-side RPC decode |
-| Agent sweep IV (20 worktrees) | 0.022 | 45,038 | **CodecClassGenerator bug fix** (String fields silently fell back to reflective decode), BufferCharSequence zero-copy, TcpSendCtx cache (5-7 lookups → 1), single-buffer framing shortcut, 64KB write buffers, FusedReceiverGenerator (pipeline+decode+dispatch in one hidden class), inline executor dispatch, latency profiling |
-
-See [docs/performance-journey.md](docs/performance-journey.md) for details.
+| Agent sweep I (9) | 0.03 | 27,963 | SoA session, flat codec table, hidden-class dispatch, cached framing view, UDP dup filter, back-pressure, large-message, malformed-input, HTTP/1.1 |
+| Agent sweep II (11) | 0.019 | 29,722 | Zero-alloc UTF-8 codec, MPSC setup, direct-write blocking, RPC ring + typed proxy, encode-once broadcast, AckLayer SoA, fused pipeline on hot paths |
+| Agent sweep III (10) | ~10⁻⁴ | 27,506 | Deflater/Cipher pooling, connected-UDP, flat slot→channel, select(Consumer), adaptive selectNow, HTTP SO_REUSEPORT, waiter-side RPC decode |
+| Agent sweep IV (20) | **0.021** | **45,938** | **CodecClassGenerator bug fix**, BufferCharSequence, SendCtx cache, single-buffer framing shortcut, 64KB buffers, FusedReceiverGenerator, inline executor dispatch, per-method @Datagram proxy routing |
 
 ## Requirements
 
