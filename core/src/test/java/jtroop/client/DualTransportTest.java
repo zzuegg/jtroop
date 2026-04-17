@@ -1,5 +1,6 @@
 package jtroop.client;
 
+import jtroop.ConfigurationException;
 import jtroop.pipeline.layers.FramingLayer;
 import jtroop.server.Server;
 import jtroop.service.*;
@@ -102,7 +103,7 @@ class DualTransportTest {
                 .addService(BadService.class, GameConn.class)
                 .build();
 
-        var ex = assertThrows(IllegalArgumentException.class,
+        var ex = assertThrows(ConfigurationException.class,
                 () -> client.service(BadService.class));
         assertTrue(ex.getMessage().contains("UDP"),
                 "Error should mention UDP; was: " + ex.getMessage());

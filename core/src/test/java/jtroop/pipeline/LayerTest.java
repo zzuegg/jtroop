@@ -1,5 +1,6 @@
 package jtroop.pipeline;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.layers.FramingLayer;
 import org.junit.jupiter.api.Test;
 
@@ -296,6 +297,6 @@ class LayerTest {
         wire.putInt(0);
         wire.flip();
 
-        assertThrows(IllegalStateException.class, () -> framing.decodeInbound(wire));
+        assertThrows(ProtocolException.class, () -> framing.decodeInbound(wire));
     }
 }

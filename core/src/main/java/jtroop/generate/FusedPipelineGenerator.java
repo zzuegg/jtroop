@@ -1,5 +1,6 @@
 package jtroop.generate;
 
+import jtroop.ConfigurationException;
 import jtroop.pipeline.Layer;
 
 import java.lang.classfile.*;
@@ -121,7 +122,7 @@ public final class FusedPipelineGenerator {
         try {
             return (FusedPipeline) ctor.newInstance((Object) layers);
         } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Failed to instantiate fused pipeline", e);
+            throw new ConfigurationException("Failed to instantiate fused pipeline", e);
         }
     }
 
@@ -260,7 +261,7 @@ public final class FusedPipelineGenerator {
             var hiddenClass = lookup.defineHiddenClass(bytes, true);
             return hiddenClass.lookupClass().getDeclaredConstructor(Layer[].class);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to generate fused pipeline", e);
+            throw new ConfigurationException("Failed to generate fused pipeline", e);
         }
     }
 

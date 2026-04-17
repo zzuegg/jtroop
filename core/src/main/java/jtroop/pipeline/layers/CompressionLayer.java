@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
@@ -120,7 +121,7 @@ public final class CompressionLayer implements Layer, AutoCloseable {
         try {
             produced = inflater.inflate(outArr, 0, originalSize);
         } catch (DataFormatException e) {
-            throw new RuntimeException("Decompression failed", e);
+            throw new ProtocolException("Decompression failed", e);
         }
 
         ByteBuffer view = outputView;

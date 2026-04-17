@@ -1,5 +1,6 @@
 package jtroop.session;
 
+import jtroop.ConnectionException;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -98,7 +99,7 @@ class SessionTest {
         var store = new SessionStore(2);
         store.allocate();
         store.allocate();
-        assertThrows(IllegalStateException.class, store::allocate);
+        assertThrows(ConnectionException.class, store::allocate);
     }
 
     @Test
@@ -151,7 +152,7 @@ class SessionTest {
         var a = store.allocate();
         var b = store.allocate();
         var c = store.allocate();
-        assertThrows(IllegalStateException.class, store::allocate);
+        assertThrows(ConnectionException.class, store::allocate);
 
         // Release two, re-allocate — should succeed and then fail on the fourth.
         store.release(a);
@@ -161,7 +162,7 @@ class SessionTest {
         assertTrue(store.isActive(c));
         assertTrue(store.isActive(d));
         assertTrue(store.isActive(e));
-        assertThrows(IllegalStateException.class, store::allocate);
+        assertThrows(ConnectionException.class, store::allocate);
     }
 
     @Test
@@ -275,7 +276,7 @@ class SessionTest {
     void sessionStore_zeroCapacity_allocateThrows() {
         var store = new SessionStore(0);
         assertEquals(0, store.activeCount());
-        assertThrows(IllegalStateException.class, store::allocate);
+        assertThrows(ConnectionException.class, store::allocate);
     }
 
     @Test

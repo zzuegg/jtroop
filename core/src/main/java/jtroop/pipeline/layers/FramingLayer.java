@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
@@ -20,9 +21,8 @@ public final class FramingLayer implements Layer {
 
     /**
      * Thrown when the peer sends a negative or oversized length prefix.
-     * Alias kept for back-compat with older call sites.
      */
-    public static final class FramingException extends IllegalStateException {
+    public static final class FramingException extends ProtocolException {
         public FramingException(String msg) { super(msg); }
     }
 

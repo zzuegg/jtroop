@@ -1,5 +1,6 @@
 package jtroop.pipeline;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.layers.CompressionLayer;
 import jtroop.pipeline.layers.EncryptionLayer;
 import jtroop.pipeline.layers.FramingLayer;
@@ -121,7 +122,7 @@ class CompressionEncryptionLayerTest {
         int tamperIdx = wire.position() + 12 + 4 + 2;
         wire.put(tamperIdx, (byte) (wire.get(tamperIdx) ^ 0x01));
 
-        assertThrows(RuntimeException.class, () -> decLayer.decodeInbound(wire),
+        assertThrows(ProtocolException.class, () -> decLayer.decodeInbound(wire),
                 "MAC must detect tampered ciphertext");
     }
 

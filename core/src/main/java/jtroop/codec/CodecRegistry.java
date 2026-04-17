@@ -1,5 +1,7 @@
 package jtroop.codec;
 
+import jtroop.ConfigurationException;
+import jtroop.ProtocolException;
 import jtroop.core.ReadBuffer;
 import jtroop.core.WriteBuffer;
 
@@ -126,13 +128,13 @@ public final class CodecRegistry {
 
     public int typeId(Class<? extends Record> type) {
         var entry = byClass.get(type);
-        if (entry == null) throw new IllegalArgumentException("Unregistered type: " + type.getName());
+        if (entry == null) throw new ConfigurationException("Unregistered type: " + type.getName());
         return entry.typeId();
     }
 
     public Class<? extends Record> classForTypeId(int typeId) {
         var entry = byId[typeId];
-        if (entry == null) throw new IllegalArgumentException("Unknown type id: " + typeId);
+        if (entry == null) throw new ProtocolException("Unknown type id: " + typeId);
         return entry.type();
     }
 
@@ -160,7 +162,7 @@ public final class CodecRegistry {
                 try {
                     entry.components().get(i).encodeDirect(entry.accessors().get(i), msg, buf);
                 } catch (Throwable e) {
-                    throw new RuntimeException("Failed to encode component " + i, e);
+                    throw new ProtocolException("Failed to encode component " + i, e);
                 }
             }
         }
@@ -172,7 +174,7 @@ public final class CodecRegistry {
         var buf = rb.buffer();
         int typeId = buf.getShort() & 0xFFFF;
         var entry = byId[typeId];
-        if (entry == null) throw new IllegalArgumentException("Unknown type id: " + typeId);
+        if (entry == null) throw new ProtocolException("Unknown type id: " + typeId);
         var generated = entry.generatedCodec();
         if (generated != null) {
             return generated.decode(buf);
@@ -184,7 +186,7 @@ public final class CodecRegistry {
         try {
             return (Record) entry.constructor().invokeWithArguments(args);
         } catch (Throwable e) {
-            throw new RuntimeException("Failed to construct " + entry.type().getName(), e);
+            throw new ProtocolException("Failed to construct " + entry.type().getName(), e);
         }
     }
 
@@ -215,7 +217,7 @@ public final class CodecRegistry {
                     try {
                         components.get(i).encodeDirect(accessors.get(i), msg, buf);
                     } catch (Throwable e) {
-                        throw new RuntimeException("Failed to encode component " + i, e);
+                        throw new ProtocolException("Failed to encode component " + i, e);
                     }
                 }
             }
@@ -273,7 +275,7 @@ public final class CodecRegistry {
     public jtroop.generate.CodecClassGenerator.GeneratedCodec generatedCodecFor(
             Class<? extends Record> type) {
         var entry = byClass.get(type);
-        if (entry == null) throw new IllegalArgumentException("Unregistered type: " + type.getName());
+        if (entry == null) throw new ConfigurationException("Unregistered type: " + type.getName());
         return entry.generatedCodec();
     }
 
@@ -295,7 +297,7 @@ public final class CodecRegistry {
         if (type == boolean.class || type == Boolean.class) return new BooleanCodec();
         if (type == String.class) return new StringCodec();
         if (type == CharSequence.class) return new CharSequenceCodec();
-        throw new IllegalArgumentException("Unsupported component type: " + type.getName());
+        throw new ConfigurationException("Unsupported component type: " + type.getName());
     }
 
     private List<MethodHandle> buildAccessors(Class<? extends Record> type) {
@@ -307,7 +309,7 @@ public final class CodecRegistry {
                 accessor.setAccessible(true);
                 result.add(lookup.unreflect(accessor));
             } catch (IllegalAccessException e) {
-                throw new RuntimeException("Cannot access component: " + rc.getName(), e);
+                throw new ConfigurationException("Cannot access component: " + rc.getName(), e);
             }
         }
         return List.copyOf(result);
@@ -324,7 +326,7 @@ public final class CodecRegistry {
             ctor.setAccessible(true);
             return MethodHandles.lookup().unreflectConstructor(ctor);
         } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Cannot find canonical constructor for " + type.getName(), e);
+            throw new ConfigurationException("Cannot find canonical constructor for " + type.getName(), e);
         }
     }
 }

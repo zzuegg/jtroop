@@ -1,5 +1,7 @@
 package jtroop.server;
 
+import jtroop.ConfigurationException;
+import jtroop.ConnectionException;
 import jtroop.codec.CodecRegistry;
 import jtroop.core.EventLoop;
 import jtroop.core.EventLoopGroup;
@@ -114,7 +116,7 @@ public final class Server implements AutoCloseable {
             this.acceptLoop = new EventLoop("server-accept");
             this.workerGroup = new EventLoopGroup(workerCount);
         } catch (IOException e) {
-            throw new RuntimeException("Failed to create event loops", e);
+            throw new ConnectionException("Failed to create event loops", e);
         }
         // Wire broadcast and unicast
         serviceRegistry.setBroadcast(this::broadcastImpl);
@@ -269,7 +271,7 @@ public final class Server implements AutoCloseable {
                             }
                         });
             } catch (IOException e) {
-                throw new RuntimeException("Failed to register server socket", e);
+                throw new ConnectionException("Failed to register server socket", e);
             }
         });
     }
@@ -466,7 +468,7 @@ public final class Server implements AutoCloseable {
                             }
                         });
             } catch (IOException e) {
-                throw new RuntimeException("Failed to register UDP socket", e);
+                throw new ConnectionException("Failed to register UDP socket", e);
             }
         });
     }
@@ -555,7 +557,7 @@ public final class Server implements AutoCloseable {
                 keyToConnection.put(selKey, connId);
                 connectionToKey.put(connId, selKey);
             } catch (IOException e) {
-                throw new RuntimeException("Failed to register client channel", e);
+                throw new ConnectionException("Failed to register client channel", e);
             }
         });
 
@@ -827,7 +829,7 @@ public final class Server implements AutoCloseable {
 
     public int udpPort(Class<? extends Record> connectionType) {
         var p = boundUdpPorts.get(connectionType);
-        if (p == null) throw new IllegalArgumentException("No UDP listener for " + connectionType.getName());
+        if (p == null) throw new ConfigurationException("No UDP listener for " + connectionType.getName());
         return p;
     }
 
@@ -908,7 +910,7 @@ public final class Server implements AutoCloseable {
 
     public int port(Class<? extends Record> connectionType) {
         var p = boundPorts.get(connectionType);
-        if (p == null) throw new IllegalArgumentException("No listener for " + connectionType.getName());
+        if (p == null) throw new ConfigurationException("No listener for " + connectionType.getName());
         return p;
     }
 
@@ -953,7 +955,7 @@ public final class Server implements AutoCloseable {
             // Fail loudly so users don't lose their filter/reliability layers.
             if (transport instanceof jtroop.transport.UdpTransport udp
                     && !udp.connected() && layers != null && layers.length > 0) {
-                throw new IllegalArgumentException(
+                throw new ConfigurationException(
                         "Unconnected UDP (Transport.udp(...)) does not support pipeline layers — "
                                 + "per-peer state would be shared across all senders. "
                                 + "Use Transport.udpConnected(...) for filter/reliability layers, "

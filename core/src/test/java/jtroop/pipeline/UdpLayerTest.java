@@ -1,5 +1,6 @@
 package jtroop.pipeline;
 
+import jtroop.ConfigurationException;
 import jtroop.pipeline.layers.SequencingLayer;
 import jtroop.pipeline.layers.DuplicateFilterLayer;
 import org.junit.jupiter.api.Test;
@@ -174,8 +175,8 @@ class UdpLayerTest {
 
     @Test
     void duplicateFilterLayer_rejectsZeroCapacity() {
-        assertThrows(IllegalArgumentException.class, () -> new DuplicateFilterLayer(0));
-        assertThrows(IllegalArgumentException.class, () -> new DuplicateFilterLayer(-1));
+        assertThrows(ConfigurationException.class, () -> new DuplicateFilterLayer(0));
+        assertThrows(ConfigurationException.class, () -> new DuplicateFilterLayer(-1));
     }
 
     @Test

@@ -1,5 +1,7 @@
 package jtroop.generate;
 
+import jtroop.ConfigurationException;
+
 import java.lang.classfile.*;
 import java.lang.constant.*;
 import java.lang.invoke.MethodHandles;
@@ -104,7 +106,7 @@ public final class CodecClassGenerator {
                     .getDeclaredConstructor()
                     .newInstance();
         } catch (Exception e) {
-            throw new RuntimeException("Failed to generate codec for " + recordType.getName(), e);
+            throw new ConfigurationException("Failed to generate codec for " + recordType.getName(), e);
         }
     }
 

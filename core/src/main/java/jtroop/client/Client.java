@@ -1,5 +1,7 @@
 package jtroop.client;
 
+import jtroop.ConfigurationException;
+import jtroop.ConnectionException;
 import jtroop.codec.CodecRegistry;
 import jtroop.core.EventLoop;
 import jtroop.core.ReadBuffer;
@@ -165,7 +167,7 @@ public final class Client implements AutoCloseable {
         try {
             this.eventLoop = new EventLoop("client-loop");
         } catch (IOException e) {
-            throw new RuntimeException("Failed to create event loop", e);
+            throw new ConnectionException("Failed to create event loop", e);
         }
     }
 
@@ -233,7 +235,7 @@ public final class Client implements AutoCloseable {
                             }
                         });
             } catch (IOException e) {
-                throw new RuntimeException("TCP connect failed", e);
+                throw new ConnectionException("TCP connect failed", e);
             }
         });
     }
@@ -553,7 +555,7 @@ public final class Client implements AutoCloseable {
         var connType = resolveConnection(msgType);
         var ch = udpChannels.get(connType);
         if (ch == null) {
-            throw new IllegalStateException("No UDP connection for " + msgType.getName());
+            throw new ConnectionException("No UDP connection for " + msgType.getName());
         }
         var cfg = udpConfigByType.get(connType);
         boolean hasLayers = cfg != null && cfg.pipeline().size() > 0;
@@ -795,7 +797,7 @@ public final class Client implements AutoCloseable {
             if (remaining <= 0) {
                 // Timed out — clear slot so reader doesn't fire a stale unpark.
                 REQ_WAITER.setRelease(reqWaiters, slot, (Thread) null);
-                throw new RuntimeException("Request failed: timeout");
+                throw new ConnectionException("Request failed: timeout");
             }
             LockSupport.parkNanos(remaining);
         }
@@ -836,7 +838,7 @@ public final class Client implements AutoCloseable {
         if (!configByType.isEmpty()) {
             return configByType.keySet().iterator().next();
         }
-        throw new IllegalStateException("Cannot resolve connection for " + messageType.getName());
+        throw new ConfigurationException("Cannot resolve connection for " + messageType.getName());
     }
 
     private final Map<Class<?>, Object> proxyCache = new HashMap<>();
@@ -893,7 +895,7 @@ public final class Client implements AutoCloseable {
      */
     public void switchPipeline(Pipeline newPipeline) {
         if (configByType.size() != 1) {
-            throw new IllegalStateException(
+            throw new ConfigurationException(
                     "Client has " + configByType.size() + " connections; use switchPipeline(connectionType, pipeline)");
         }
         var connType = configByType.keySet().iterator().next();
@@ -950,7 +952,7 @@ public final class Client implements AutoCloseable {
         public Builder connect(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
             if (transport instanceof jtroop.transport.UdpTransport udp
                     && !udp.connected() && layers != null && layers.length > 0) {
-                throw new IllegalArgumentException(
+                throw new ConfigurationException(
                         "Unconnected UDP (Transport.udp(...)) does not support pipeline layers — "
                                 + "per-peer state would be shared across all senders. "
                                 + "Use Transport.udpConnected(...) for filter/reliability layers, "

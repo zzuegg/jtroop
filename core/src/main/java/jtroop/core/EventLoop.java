@@ -1,5 +1,7 @@
 package jtroop.core;
 
+import jtroop.ConnectionException;
+
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
@@ -175,7 +177,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
             }
             selector.wakeup();
             if (System.nanoTime() > deadlineNs) {
-                throw new IllegalStateException(
+                throw new ConnectionException(
                         "stageWrite back-pressure timeout on slot " + slot +
                         " — receiver consuming too slowly (needed " + need + " bytes)");
             }

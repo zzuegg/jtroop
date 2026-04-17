@@ -1,5 +1,7 @@
 package jtroop.session;
 
+import jtroop.ConnectionException;
+
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 
@@ -64,7 +66,7 @@ public final class SessionStore {
 
     public synchronized ConnectionId allocate() {
         if (freeHead == END_OF_FREE) {
-            throw new IllegalStateException("SessionStore full (capacity=" + capacity + ")");
+            throw new ConnectionException("SessionStore full (capacity=" + capacity + ")");
         }
         int index = freeHead;
         freeHead = nextFree[index];

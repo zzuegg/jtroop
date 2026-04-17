@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
@@ -38,7 +39,7 @@ public final class HttpLayer implements Layer {
      * Content-Length on a body-bearing method). The {@link #status()} value is
      * the HTTP status code the caller should emit before closing the connection.
      */
-    public static final class HttpProtocolException extends RuntimeException {
+    public static final class HttpProtocolException extends ProtocolException {
         private final int status;
         public HttpProtocolException(int status, String msg) { super(msg); this.status = status; }
         public int status() { return status; }

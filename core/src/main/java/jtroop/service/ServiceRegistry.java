@@ -1,5 +1,7 @@
 package jtroop.service;
 
+import jtroop.ConfigurationException;
+import jtroop.JtroopException;
 import jtroop.codec.CodecRegistry;
 import jtroop.generate.HandlerInvokerGenerator;
 import jtroop.generate.HandlerInvokerGenerator.HandlerInvoker;
@@ -45,7 +47,7 @@ public final class ServiceRegistry {
             var instance = ctor.newInstance();
             register(instance);
         } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Cannot instantiate handler: " + handlerClass.getName(), e);
+            throw new ConfigurationException("Cannot instantiate handler: " + handlerClass.getName(), e);
         }
     }
 
@@ -54,7 +56,7 @@ public final class ServiceRegistry {
         var handlerClass = handlerInstance.getClass();
         var handles = handlerClass.getAnnotation(Handles.class);
         if (handles == null) {
-            throw new IllegalArgumentException(handlerClass.getName() + " missing @Handles annotation");
+            throw new ConfigurationException(handlerClass.getName() + " missing @Handles annotation");
         }
         handlerInstanceList.add(handlerInstance);
         var serviceInterface = handles.value();
@@ -81,7 +83,7 @@ public final class ServiceRegistry {
                 // types further.
                 for (var paramType : m.getParameterTypes()) {
                     if (Record.class.isAssignableFrom(paramType) && paramType != ConnectionId.class) {
-                        throw new IllegalArgumentException(
+                        throw new ConfigurationException(
                                 "@ZeroAlloc method " + m.getName()
                                         + " must not declare a Record parameter; takes ByteBuffer instead");
                     }
@@ -96,7 +98,7 @@ public final class ServiceRegistry {
                     }
                 }
                 if (found == null) {
-                    throw new IllegalArgumentException("@OnMessage method " + m.getName()
+                    throw new ConfigurationException("@OnMessage method " + m.getName()
                             + " has no Record parameter");
                 }
                 msgType = found;
@@ -136,7 +138,7 @@ public final class ServiceRegistry {
                     disconnectHandlers.add(new LifecycleEntry(handlerInstance, lookup.unreflect(m)));
                 }
             } catch (IllegalAccessException e) {
-                throw new RuntimeException("Cannot access lifecycle method: " + m.getName(), e);
+                throw new ConfigurationException("Cannot access lifecycle method: " + m.getName(), e);
             }
         }
     }
@@ -174,7 +176,7 @@ public final class ServiceRegistry {
         } catch (RuntimeException e) {
             throw e;
         } catch (Throwable e) {
-            throw new RuntimeException("Raw dispatch failed for type id " + typeId, e);
+            throw new JtroopException("Raw dispatch failed for type id " + typeId, e);
         }
     }
 
@@ -189,14 +191,14 @@ public final class ServiceRegistry {
         // verified by NetGameBenchmark.dispatchDirect_* at ≈ 0 B/op.
         var invoker = handlers.get(message.getClass());
         if (invoker == null) {
-            throw new IllegalArgumentException("No handler for message type: " + message.getClass().getName());
+            throw new ConfigurationException("No handler for message type: " + message.getClass().getName());
         }
         try {
             return invoker.invoke(message, sender, broadcast, unicast);
         } catch (RuntimeException e) {
             throw e;
         } catch (Throwable e) {
-            throw new RuntimeException("Dispatch failed for " + message.getClass().getName(), e);
+            throw new JtroopException("Dispatch failed for " + message.getClass().getName(), e);
         }
     }
 
@@ -205,7 +207,7 @@ public final class ServiceRegistry {
             try {
                 entry.method().invoke(entry.instance(), id);
             } catch (Throwable e) {
-                throw new RuntimeException("OnConnect dispatch failed", e);
+                throw new JtroopException("OnConnect dispatch failed", e);
             }
         }
     }
@@ -215,7 +217,7 @@ public final class ServiceRegistry {
             try {
                 entry.method().invoke(entry.instance(), id);
             } catch (Throwable e) {
-                throw new RuntimeException("OnDisconnect dispatch failed", e);
+                throw new JtroopException("OnDisconnect dispatch failed", e);
             }
         }
     }

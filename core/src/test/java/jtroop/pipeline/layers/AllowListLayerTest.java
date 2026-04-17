@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ConnectionException;
 import jtroop.client.Client;
 import jtroop.pipeline.Layer;
 import jtroop.pipeline.LayerContext;
@@ -149,7 +150,7 @@ class AllowListLayerTest {
         Thread.sleep(200);
 
         // Key assertion: denied peer gets no response; request times out.
-        assertThrows(RuntimeException.class,
+        assertThrows(ConnectionException.class,
                 () -> client.request(new Ping(1), Pong.class),
                 "denied peer request must not succeed");
 

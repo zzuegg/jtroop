@@ -1,5 +1,6 @@
 package jtroop.pipeline;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.layers.FramingLayer;
 import org.junit.jupiter.api.Test;
 
@@ -24,7 +25,7 @@ class FramingLayerBoundaryTest {
         var wire = ByteBuffer.allocate(16);
         wire.putInt(-1);
         wire.flip();
-        assertThrows(IllegalStateException.class, () -> framing.decodeInbound(wire));
+        assertThrows(ProtocolException.class, () -> framing.decodeInbound(wire));
     }
 
     @Test
@@ -35,7 +36,7 @@ class FramingLayerBoundaryTest {
         var wire = ByteBuffer.allocate(16);
         wire.putInt(FramingLayer.MAX_FRAME_LENGTH + 1);
         wire.flip();
-        assertThrows(IllegalStateException.class, () -> framing.decodeInbound(wire));
+        assertThrows(ProtocolException.class, () -> framing.decodeInbound(wire));
     }
 
     @Test
@@ -44,7 +45,7 @@ class FramingLayerBoundaryTest {
         var wire = ByteBuffer.allocate(16);
         wire.putInt(Integer.MAX_VALUE);
         wire.flip();
-        assertThrows(IllegalStateException.class, () -> framing.decodeInbound(wire));
+        assertThrows(ProtocolException.class, () -> framing.decodeInbound(wire));
     }
 
     @Test

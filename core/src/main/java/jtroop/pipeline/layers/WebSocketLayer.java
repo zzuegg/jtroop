@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
@@ -108,7 +109,7 @@ public final class WebSocketLayer implements Layer {
             headerLen = 4;
         } else {
             // 127: 64-bit length — not supported in this minimal codec.
-            throw new IllegalStateException("WebSocket 64-bit length not supported");
+            throw new ProtocolException("WebSocket 64-bit length not supported");
         }
 
         int maskStart = start + headerLen;
@@ -118,13 +119,13 @@ public final class WebSocketLayer implements Layer {
 
         // Per RFC 6455 §5.1, server MUST reject unmasked client→server frames.
         if (role == Role.SERVER && !masked) {
-            throw new IllegalStateException("Expected masked WebSocket frame from client");
+            throw new ProtocolException("Expected masked WebSocket frame from client");
         }
         // For the minimal test we only need text frames and treat non-fin /
         // non-text as errors. Ping/Pong (9/10) and Close (8) would go here in
         // a full implementation.
         if (!fin || opcode != OPCODE_TEXT) {
-            throw new IllegalStateException("Unsupported WebSocket frame: fin=" + fin + " opcode=" + opcode);
+            throw new ProtocolException("Unsupported WebSocket frame: fin=" + fin + " opcode=" + opcode);
         }
 
         decoded.clear();
@@ -160,7 +161,7 @@ public final class WebSocketLayer implements Layer {
             out.put((byte) ((len >> 8) & 0xFF));
             out.put((byte) (len & 0xFF));
         } else {
-            throw new IllegalStateException(
+            throw new ProtocolException(
                     "Payload too large for this minimal WebSocket layer (len=" + len + ")");
         }
         if (mask) {

@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ConfigurationException;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
@@ -32,7 +33,7 @@ public final class RateLimitLayer implements Layer {
     }
 
     public RateLimitLayer(long maxBytesPerSecond, long graceNanos) {
-        if (maxBytesPerSecond <= 0) throw new IllegalArgumentException("maxBytesPerSecond must be positive");
+        if (maxBytesPerSecond <= 0) throw new ConfigurationException("maxBytesPerSecond must be positive");
         this.maxBytesPerSecond = maxBytesPerSecond;
         this.graceNanos = graceNanos;
     }

@@ -1,5 +1,6 @@
 package jtroop.core;
 
+import jtroop.ConnectionException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -245,7 +246,7 @@ class EventLoopBackPressureTest {
                             fillFrame(frame, seq);
                             try {
                                 loop.stageWrite(slot, frame);
-                            } catch (IllegalStateException backPressureTimeout) {
+                            } catch (ConnectionException backPressureTimeout) {
                                 // Acceptable for the slow slot: producer gave up.
                                 break;
                             }

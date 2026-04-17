@@ -1,5 +1,6 @@
 package jtroop.pipeline;
 
+import jtroop.ConfigurationException;
 import jtroop.generate.FusedPipelineGenerator;
 import jtroop.generate.FusedPipelineGenerator.FusedPipeline;
 
@@ -165,7 +166,7 @@ public final class Pipeline {
     public Pipeline replace(Class<? extends Layer> oldType, Layer newLayer) {
         int idx = indexOf(oldType);
         if (idx < 0) {
-            throw new IllegalArgumentException(
+            throw new ConfigurationException(
                     "No layer of type " + oldType.getName() + " in pipeline");
         }
         var out = layers.clone();

@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ConfigurationException;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
@@ -25,7 +26,7 @@ public final class DuplicateFilterLayer implements Layer {
     private int size;
 
     public DuplicateFilterLayer(int capacity) {
-        if (capacity <= 0) throw new IllegalArgumentException("capacity must be positive");
+        if (capacity <= 0) throw new ConfigurationException("capacity must be positive");
         this.seen = new int[capacity];
         // Fill with sentinel — sequence numbers are non-negative in normal use,
         // so EMPTY (Integer.MIN_VALUE) never collides with a real seq.

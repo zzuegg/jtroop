@@ -1,5 +1,6 @@
 package jtroop.pipeline;
 
+import jtroop.ConfigurationException;
 import jtroop.generate.FusedPipelineGenerator;
 import jtroop.pipeline.layers.CompressionLayer;
 import jtroop.pipeline.layers.FramingLayer;
@@ -64,7 +65,7 @@ class PipelineMutationTest {
     @Test
     void replace_throwsWhenLayerAbsent() {
         var base = new Pipeline(new FramingLayer());
-        assertThrows(IllegalArgumentException.class,
+        assertThrows(ConfigurationException.class,
                 () -> base.replace(HttpLayer.class, new HttpLayer()));
     }
 

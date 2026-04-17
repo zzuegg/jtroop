@@ -1,5 +1,6 @@
 package jtroop.codec;
 
+import jtroop.ConfigurationException;
 import jtroop.core.ReadBuffer;
 import jtroop.core.WriteBuffer;
 import org.junit.jupiter.api.Test;
@@ -33,7 +34,7 @@ class CodecRegistryTest {
     @Test
     void typeId_throwsForUnregisteredType() {
         var registry = new CodecRegistry();
-        assertThrows(IllegalArgumentException.class, () -> registry.typeId(SimpleMessage.class));
+        assertThrows(ConfigurationException.class, () -> registry.typeId(SimpleMessage.class));
     }
 
     @Test

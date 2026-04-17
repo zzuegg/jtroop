@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.Layer;
 
 import javax.crypto.Cipher;
@@ -119,7 +120,7 @@ public final class EncryptionLayer implements Layer {
                 out.put(cipherBytes, 0, written);
             }
         } catch (Exception e) {
-            throw new RuntimeException("Encryption failed", e);
+            throw new ProtocolException("Encryption failed", e);
         }
     }
 
@@ -131,7 +132,7 @@ public final class EncryptionLayer implements Layer {
         int start = wire.position();
         int encLen = wire.getInt(start + IV_LENGTH);
         if (encLen < GCM_TAG_BYTES || encLen > FramingLayer.MAX_FRAME_LENGTH) {
-            throw new RuntimeException("Invalid encrypted frame length: " + encLen);
+            throw new ProtocolException("Invalid encrypted frame length: " + encLen);
         }
         if (wire.remaining() - IV_LENGTH - LENGTH_PREFIX_BYTES < encLen) return null;
 
@@ -180,7 +181,7 @@ public final class EncryptionLayer implements Layer {
                 return view;
             }
         } catch (Exception e) {
-            throw new RuntimeException("Decryption failed", e);
+            throw new ProtocolException("Decryption failed", e);
         }
     }
 

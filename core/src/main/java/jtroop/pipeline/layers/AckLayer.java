@@ -1,5 +1,6 @@
 package jtroop.pipeline.layers;
 
+import jtroop.ProtocolException;
 import jtroop.pipeline.Layer;
 
 import java.nio.ByteBuffer;
@@ -80,7 +81,7 @@ public final class AckLayer implements Layer {
         int base = slot * MAX_PAYLOAD_PER_SLOT;
         // Use bulk get into the flat store so no temporary byte[] is allocated.
         if (payloadLen > MAX_PAYLOAD_PER_SLOT) {
-            throw new IllegalStateException("AckLayer payload exceeds MTU slot size: " + payloadLen);
+            throw new ProtocolException("AckLayer payload exceeds MTU slot size: " + payloadLen);
         }
         payload.get(unackPayloads, base, payloadLen);
         // Restore read position once more — we moved it by the bulk get above.

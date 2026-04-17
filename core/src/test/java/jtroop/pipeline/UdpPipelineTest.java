@@ -1,5 +1,6 @@
 package jtroop.pipeline;
 
+import jtroop.ConfigurationException;
 import jtroop.client.Client;
 import jtroop.pipeline.layers.AckLayer;
 import jtroop.pipeline.layers.AllowListLayer;
@@ -240,13 +241,13 @@ class UdpPipelineTest {
     void unconnectedUdpWithLayers_buildFails() {
         // Plan A: unconnected UDP cannot carry pipeline layers — state would
         // be shared across all peers. Builder must reject loudly.
-        var ex = assertThrows(IllegalArgumentException.class, () -> Server.builder()
+        var ex = assertThrows(ConfigurationException.class, () -> Server.builder()
                 .listen(GameConn.class, Transport.udp(0), new SequencingLayer())
                 .build());
         assertTrue(ex.getMessage().toLowerCase().contains("udpconnected"),
                 "error should point users at Transport.udpConnected; was: " + ex.getMessage());
 
-        var ex2 = assertThrows(IllegalArgumentException.class, () -> Client.builder()
+        var ex2 = assertThrows(ConfigurationException.class, () -> Client.builder()
                 .connect(GameConn.class, Transport.udp("localhost", 1), new SequencingLayer())
                 .build());
         assertTrue(ex2.getMessage().toLowerCase().contains("udpconnected"),
