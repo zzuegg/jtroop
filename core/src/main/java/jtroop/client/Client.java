@@ -198,7 +198,7 @@ public final class Client implements AutoCloseable {
         try {
             var remote = channel.getRemoteAddress();
             if (remote instanceof java.net.InetSocketAddress isa) peer = isa;
-        } catch (IOException _) {}
+        } catch (IOException _) { /* best-effort peer resolution; null peer is safe */ }
         final var connTypeFinal = config.connectionType();
         long packedId = ((long) 1 << 32) | (slot & 0xFFFFFFFFL);
         var ctx = new LayerContext(
@@ -287,7 +287,7 @@ public final class Client implements AutoCloseable {
         try {
             var remote = channel.getRemoteAddress();
             if (remote instanceof java.net.InetSocketAddress isa) peer = isa;
-        } catch (IOException _) {}
+        } catch (IOException _) { /* best-effort peer resolution; null peer is safe */ }
         final var connTypeFinal = config.connectionType();
         // Slot index: pack a synthetic id — UDP doesn't use the event loop's
         // channelSlots since it has no SelectionKey here. Use hashCode so
@@ -437,7 +437,12 @@ public final class Client implements AutoCloseable {
                 if (result != null && acceptedType.isInstance(result)) {
                     return (T) result;
                 }
-            } catch (Exception _) {}
+            } catch (java.util.concurrent.TimeoutException _) {
+                // This future didn't resolve in time — try the next entry.
+            } catch (Exception e) {
+                System.err.println("Client: handshakeResult(" + acceptedType.getSimpleName()
+                        + ") failed for key " + entry.getKey().getSimpleName() + ": " + e);
+            }
         }
         return null;
     }

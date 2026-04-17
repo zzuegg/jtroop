@@ -153,7 +153,9 @@ public final class EventLoop implements Runnable, AutoCloseable {
                             Thread.onSpinWait();
                         }
                     }
-                } catch (IOException _) {}
+                } catch (IOException e) {
+                    System.err.println("EventLoop: write failed on slot " + slot + ": " + e);
+                }
                 return;
             }
         }
@@ -163,7 +165,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
             synchronized (buf) {
                 if (channel != null && channel.isConnected()) {
                     buf.flip();
-                    try { channel.write(buf); } catch (IOException _) {}
+                    try { channel.write(buf); } catch (IOException _) { /* best-effort drain */ }
                     buf.compact();
                     if (buf.position() > 0) {
                         PENDING_WRITE.setRelease(pendingWrite, slot, true);
@@ -258,6 +260,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 try { key.cancel(); } catch (Throwable _) {}
                 try { key.channel().close(); } catch (Throwable _) {}
                 System.err.println("EventLoop: handler threw, connection closed: " + t);
+                t.printStackTrace(System.err);
             }
         }
     }
@@ -337,6 +340,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 // by another thread (Client.close() during start()). One failing
                 // task must not kill the loop.
                 System.err.println("EventLoop: setup task failed: " + t);
+                t.printStackTrace(System.err);
             }
         }
         // Drain overflow (tasks that arrived while the ring was full).
@@ -346,6 +350,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 overflow.run();
             } catch (Throwable t) {
                 System.err.println("EventLoop: setup task failed: " + t);
+                t.printStackTrace(System.err);
             }
         }
     }

@@ -126,7 +126,9 @@ public final class Forwarder implements AutoCloseable {
             scheduler.schedule(() -> {
                 try {
                     state.targetChannel().send(ByteBuffer.wrap(data), state.targetAddr());
-                } catch (IOException _) {}
+                } catch (IOException e) {
+                    System.err.println("Forwarder: delayed UDP send to " + state.targetAddr() + " failed: " + e);
+                }
             }, delayMs, TimeUnit.MILLISECONDS);
         } else {
             state.targetChannel().send(ByteBuffer.wrap(data), state.targetAddr());
@@ -192,7 +194,9 @@ public final class Forwarder implements AutoCloseable {
                 scheduler.schedule(() -> {
                     try {
                         target.write(ByteBuffer.wrap(data));
-                    } catch (IOException _) {}
+                    } catch (IOException e) {
+                        System.err.println("Forwarder: delayed TCP write failed: " + e);
+                    }
                 }, delayMs, TimeUnit.MILLISECONDS);
             } else {
                 pipe.target().write(ByteBuffer.wrap(data));

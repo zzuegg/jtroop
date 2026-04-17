@@ -140,6 +140,7 @@ public final class Server implements AutoCloseable {
         } catch (Exception e) {
             // Fall back to the 3-stage path if generation fails
             System.err.println("FusedReceiver generation failed, using fallback: " + e);
+            e.printStackTrace(System.err);
         }
     }
 
@@ -342,7 +343,9 @@ public final class Server implements AutoCloseable {
                 if (!channel.isConnected()) {
                     var remoteAddr = channel.receive(readBuf);
                     if (remoteAddr == null) continue;
-                    try { channel.connect(remoteAddr); } catch (IOException _) {}
+                    try { channel.connect(remoteAddr); } catch (IOException e) {
+                        System.err.println("Server: UDP connect to " + remoteAddr + " failed: " + e);
+                    }
                     // Promote peer: allocate a per-connection id + LayerContext
                     // so every layer call sees a stable connectionId, the peer's
                     // InetSocketAddress, and close hooks wired to this channel.
@@ -375,7 +378,8 @@ public final class Server implements AutoCloseable {
         } catch (ClosedChannelException _) {
             // Normal shutdown (includes AsynchronousCloseException)
         } catch (Throwable t) {
-            System.err.println("Server: connected-UDP loop error: " + t);
+            System.err.println("Server: connected-UDP loop error (connId=" + connId + "): " + t);
+            t.printStackTrace(System.err);
         } finally {
             if (connId != null && dispatchedConnect) {
                 try { serviceRegistry.dispatchDisconnect(connId); } catch (Throwable _) {}
@@ -601,6 +605,7 @@ public final class Server implements AutoCloseable {
                 // exception reach the EventLoop, since that would cancel the
                 // key for the wrong reason and still leave state inconsistent.
                 System.err.println("Server: malformed input on " + connId + ", closing: " + t);
+                t.printStackTrace(System.err);
                 if (handshakePending.contains(connId)) {
                     // Never dispatched connect → don't dispatch disconnect.
                     rejectConnection(channel, config, key, connId);
