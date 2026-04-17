@@ -10,8 +10,8 @@ Game scenario: TCP server + client, length-prefix framing, fire-and-forget sends
 
 ### Throughput (ops/ms) — higher is better
 
-| Benchmark | jtroop | jtroop blocking | Netty 4.2 | Netty blocking | SM 3.7 (blocking) |
-|-----------|-------:|----------------:|----------:|---------------:|-------------------:|
+| Benchmark | jtroop | jtroop blocking | Netty 4.2 | Netty blocking | SpiderMonkey 3.7 |
+|-----------|-------:|----------------:|----------:|---------------:|-----------------:|
 | positionUpdate | **45,672** | **747** | 12,701 | 174 | 629 |
 | chatMessage | **20,593** | **735** | 13,272 | 175 | 603 |
 | mixedTraffic (10 msg) | **3,835** | — | 1,295 | — | 60 |
@@ -19,8 +19,8 @@ Game scenario: TCP server + client, length-prefix framing, fire-and-forget sends
 
 ### Allocation (B/op) — lower is better
 
-| Benchmark | jtroop | jtroop blocking | Netty 4.2 | Netty blocking | SM 3.7 (blocking) |
-|-----------|-------:|----------------:|----------:|---------------:|-------------------:|
+| Benchmark | jtroop | jtroop blocking | Netty 4.2 | Netty blocking | SpiderMonkey 3.7 |
+|-----------|-------:|----------------:|----------:|---------------:|-----------------:|
 | positionUpdate | **0.021** | **1.4** | 1,109 | 785 | 443 |
 | chatMessage | **0.048** | **57** | 1,606 | 1,096 | 855 |
 | mixedTraffic (10 msg) | **304** | — | 11,220 | — | 6,139 |
@@ -77,7 +77,7 @@ External load generator, "Hello, World!" responses. Same JDK 26, same box, TCP_N
 - **positionUpdate 45.9K ops/ms**: per-message-type `SendCtx` cache reduces 5-7 map lookups per send to 1. For fixed-size primitive records with a single FramingLayer, a single-buffer shortcut writes the 4-byte length prefix + codec.encode directly into wireBuf — skipping the intermediate encodeBuf and the fused pipeline entirely. 64KB write buffers prevent back-pressure stalls at high throughput.
 - **chatMessage 0.049 B/op**: round 4 discovered and fixed a **bytecode-generation bug** in `CodecClassGenerator.emitPut` — String fields emitted a `POP` after `invokestatic` (which returns void), causing stack underflow → silent fallback to reflective decode with `Object[]` + boxing (~312 B/op). Combined with `BufferCharSequence` (zero-copy `CharSequence` backed by the wire buffer's heap array), chatMessage went from 384 → 0.049 B/op and 13.5K → 20.3K ops/ms.
 - **`FusedReceiverGenerator`**: generates a single hidden class per (pipeline-shape × handler-set) that fuses framing → typeId switch → inline field decode → monomorphic handler call. +60% throughput vs the 3-stage path (21.2K vs 13.2K ops/ms on the readLoop microbenchmark).
-- **SpiderMonkey** uses blocking I/O internally — `client.send()` serializes + writes to the socket synchronously. Its throughput (~629 ops/ms) is comparable to jtroop/Netty blocking, not fire-and-forget.
+- **SpiderMonkey** is fire-and-forget (`client.send()` queues into a `BlockingQueue`, background `SelectorThread` flushes via NIO). Its low throughput (~629 ops/ms) is due to reflection-based serialization, per-message ByteBuffer allocation, and queue node overhead — not blocking I/O.
 - All JMH benchmarks encode/decode through the full pipeline. Netty uses `MessageToByteEncoder`/`ByteToMessageDecoder`, jtroop uses its codec+pipeline, SpiderMonkey uses its `Serializer`.
 
 ## Design Approach
