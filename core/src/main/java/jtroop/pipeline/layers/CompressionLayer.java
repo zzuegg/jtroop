@@ -9,13 +9,22 @@ import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 /**
- * zlib compression layer.
+ * zlib compression layer with small-payload bypass.
  *
  * <p><b>Zero-allocation hot path.</b> The {@link Deflater}, {@link Inflater}
  * and scratch {@code byte[]} buffers are held as instance fields and reused
  * across every call. {@link #encodeOutbound} allocates nothing once the
  * scratch arrays have grown to the working set size; {@link #decodeInbound}
  * returns a cached {@link ByteBuffer} view over the output scratch.
+ *
+ * <p><b>Small-payload bypass.</b> For payloads smaller than
+ * {@link #minCompressSize()} bytes (default 64), zlib is skipped entirely
+ * and the payload is written raw. A 1-byte flag prefix distinguishes
+ * compressed ({@code 0x01}) from raw ({@code 0x00}) frames. This avoids
+ * the CPU cost of deflate/inflate on tiny payloads where zlib's 11-byte
+ * header overhead often <em>increases</em> wire size. The crossover point
+ * where zlib becomes beneficial depends on data entropy but is typically
+ * around 64-128 bytes for game-style payloads (low-entropy floats).
  *
  * <p><b>Threading contract.</b> Same as {@link FramingLayer}: the caller
  * MUST fully consume the decoded {@link ByteBuffer} before invoking
@@ -31,8 +40,17 @@ import java.util.zip.Inflater;
  */
 public final class CompressionLayer implements Layer, AutoCloseable {
 
+    /** Wire flag: payload is raw (not compressed). */
+    private static final byte FLAG_RAW = 0x00;
+    /** Wire flag: payload is zlib-compressed. */
+    private static final byte FLAG_COMPRESSED = 0x01;
+
+    /** Default minimum payload size before compression is attempted. */
+    private static final int DEFAULT_MIN_COMPRESS_SIZE = 64;
+
     private final Deflater deflater;
     private final Inflater inflater;
+    private final int minCompressSize;
 
     // Input side scratch arrays. Grow on demand; never shrink. After warmup
     // these stabilise to the hot-path working set, giving zero allocation.
@@ -55,13 +73,36 @@ public final class CompressionLayer implements Layer, AutoCloseable {
      *              payloads a level of 1 often wins.
      */
     public CompressionLayer(int level) {
+        this(level, DEFAULT_MIN_COMPRESS_SIZE);
+    }
+
+    /**
+     * @param level           deflate level (0..9, or {@link Deflater#DEFAULT_COMPRESSION}).
+     * @param minCompressSize payloads smaller than this (bytes) are passed through
+     *                        raw without zlib. Set to 0 to always compress.
+     */
+    public CompressionLayer(int level, int minCompressSize) {
         this.deflater = new Deflater(level);
         this.inflater = new Inflater();
+        this.minCompressSize = minCompressSize;
+    }
+
+    /** Returns the minimum payload size (bytes) that triggers compression. */
+    public int minCompressSize() {
+        return minCompressSize;
     }
 
     @Override
     public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         int len = payload.remaining();
+
+        // Small-payload bypass: skip zlib entirely, write raw with flag.
+        if (len < minCompressSize) {
+            out.put(FLAG_RAW);
+            out.put(payload);
+            return;
+        }
+
         byte[] in = inputScratch;
         if (in.length < len) {
             in = new byte[Math.max(len, in.length * 2)];
@@ -91,12 +132,33 @@ public final class CompressionLayer implements Layer, AutoCloseable {
             compressedLen += deflater.deflate(comp, compressedLen, comp.length - compressedLen);
         }
 
+        out.put(FLAG_COMPRESSED);
         out.putInt(len); // original size for inflate
         out.put(comp, 0, compressedLen);
     }
 
     @Override
     public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
+        if (wire.remaining() < 1) return null;
+        byte flag = wire.get();
+
+        // Raw (uncompressed) frame: copy into outputScratch for consistent
+        // return type, reusing the cached view.
+        if (flag == FLAG_RAW) {
+            int rawLen = wire.remaining();
+            byte[] outArr = outputScratch;
+            if (outArr.length < rawLen) {
+                outArr = new byte[Math.max(rawLen, outArr.length * 2)];
+                outputScratch = outArr;
+                outputView = ByteBuffer.wrap(outArr);
+            }
+            wire.get(outArr, 0, rawLen);
+            ByteBuffer view = outputView;
+            view.clear();
+            view.limit(rawLen);
+            return view;
+        }
+
         if (wire.remaining() < 4) return null;
         int originalSize = wire.getInt();
         int compLen = wire.remaining();
@@ -125,8 +187,7 @@ public final class CompressionLayer implements Layer, AutoCloseable {
         }
 
         ByteBuffer view = outputView;
-        view.limit(view.capacity());
-        view.position(0);
+        view.clear();
         view.limit(produced);
         return view;
     }
