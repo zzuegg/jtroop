@@ -62,11 +62,15 @@ public final class ServiceRegistry {
         handlerToInterface.put(handlerClass, serviceInterface);
         var messageTypes = interfaceToMessageTypes.computeIfAbsent(serviceInterface, _ -> new HashSet<>());
 
-        // Scan service interface for @Datagram annotations
-        var datagramMethods = new HashSet<String>();
+        // Scan service interface for @Datagram annotations — collect the first
+        // Record parameter TYPE (not the method name). This binds transport
+        // routing to the message record type, keeping the entire dispatch model
+        // uniform: record type → handler, record type → codec, record type →
+        // transport. Handler method names are irrelevant.
+        var datagramRecordTypes = new HashSet<Class<?>>();
         for (Method m : serviceInterface.getDeclaredMethods()) {
-            if (m.isAnnotationPresent(Datagram.class)) {
-                datagramMethods.add(m.getName());
+            if (m.isAnnotationPresent(Datagram.class) && m.getParameterCount() > 0) {
+                datagramRecordTypes.add(m.getParameterTypes()[0]);
             }
         }
 
@@ -119,8 +123,8 @@ public final class ServiceRegistry {
                 codec.register((Class<? extends Record>) m.getReturnType());
             }
 
-            // Check if this method name matches a @Datagram method on the interface
-            if (datagramMethods.contains(m.getName())) {
+            // Check if this message's record type is @Datagram on the interface
+            if (datagramRecordTypes.contains(msgType)) {
                 datagramTypes.add(msgType);
             }
 
