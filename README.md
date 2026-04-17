@@ -12,18 +12,18 @@ Game scenario: TCP server + client, length-prefix framing, fire-and-forget sends
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | Netty blocking | SpiderMonkey 3.7 |
 |-----------|-------:|----------------:|----------:|---------------:|-----------------:|
-| positionUpdate | **45,672** | **747** | 12,701 | 174 | 629 |
-| chatMessage | **20,593** | **735** | 13,272 | 175 | 603 |
-| mixedTraffic (10 msg) | **3,835** | — | 1,295 | — | 60 |
+| positionUpdate | **58,429** | **747** | 12,701 | 174 | 629 |
+| chatMessage | **20,492** | **735** | 13,272 | 175 | 603 |
+| mixedTraffic (10 msg) | **4,232** | — | 1,295 | — | 60 |
 | requestResponse (RPC) | **146** | — | — | — | — |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | Netty blocking | SpiderMonkey 3.7 |
 |-----------|-------:|----------------:|----------:|---------------:|-----------------:|
-| positionUpdate | **0.021** | **1.4** | 1,109 | 785 | 443 |
-| chatMessage | **0.048** | **57** | 1,606 | 1,096 | 855 |
-| mixedTraffic (10 msg) | **304** | — | 11,220 | — | 6,139 |
+| positionUpdate | **0.017** | **1.4** | 1,109 | 785 | 443 |
+| chatMessage | **24** | **57** | 1,606 | 1,096 | 855 |
+| mixedTraffic (10 msg) | **0.24** | — | 11,220 | — | 6,139 |
 | requestResponse (RPC) | **71** | — | — | — | — |
 
 ### HTTP/1.1 throughput (wrk)
@@ -64,11 +64,11 @@ External load generator, "Hello, World!" responses. Same JDK 26, same box, TCP_N
 
 | vs Netty 4.2 | Throughput | Allocation |
 |---|---|---|
-| positionUpdate | **3.6×** faster | **53,000×** less |
+| positionUpdate | **4.6×** faster | **65,000×** less |
 | positionUpdate (blocking) | **4.3×** faster | **560×** less |
-| chatMessage | **1.6×** faster | **33,000×** less |
+| chatMessage | **1.5×** faster | **67×** less |
 | chatMessage (blocking) | **4.2×** faster | **19×** less |
-| mixedTraffic | **3.0×** faster | **37×** less |
+| mixedTraffic | **3.3×** faster | **47,000×** less |
 | HTTP (wrk t8 c400) | **+15%** | — |
 | HTTP (wrk t32 c400) | **+28%** | — |
 
@@ -115,6 +115,7 @@ var client = Client.builder()
         new FramingLayer(), new EncryptionLayer(key), new CompressionLayer())
     .connect(GameConn.class, Transport.udpConnected("game.example.com", 8081))
     .addService(GameService.class, GameConn.class)
+    .addHandler(new ClientHandler(), GameConn.class)   // inbound handler
     .build();
 client.start();
 
@@ -165,6 +166,23 @@ class GameHandler {
 ```
 
 Handler methods are matched to service interface methods by **record type** (the first `Record` parameter). Method names on the handler are irrelevant — only the record type matters. Injectables (`ConnectionId`, `Broadcast`, `Unicast`) are passed in any order, any subset.
+
+### Client Handler (receive server pushes + lifecycle)
+
+```java
+@Handles(GameService.class)
+class ClientHandler {
+    @OnMessage
+    void onBroadcast(PositionUpdate pos, ConnectionId sender) {
+        // handle server-sent position broadcast
+    }
+
+    @OnConnect void connected(ConnectionId id) { /* connection established */ }
+    @OnDisconnect void disconnected(ConnectionId id) { /* connection lost */ }
+}
+```
+
+Same annotation-driven pattern as the server handler. Register via `Client.builder().addHandler(handler, connType)`. Works alongside the existing `onMessage(Class, Consumer)` lambda API.
 
 ### Handshake / Capability Negotiation
 
