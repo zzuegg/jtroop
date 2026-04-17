@@ -12,19 +12,19 @@ Game scenario: TCP server + client, length-prefix framing, fire-and-forget sends
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|-------:|----------------:|----------:|-----------------:|
-| positionUpdate | **45,938** | 2,619 | 12,639 | 629 |
-| chatMessage | **20,314** | 2,852 | 13,341 | 603 |
-| mixedTraffic (10 msg) | **3,815** | — | 1,286 | 60 |
-| requestResponse (RPC) | 943 | — | — | — |
+| positionUpdate | **45,672** | — | 12,701 | 629 |
+| chatMessage | **20,593** | — | 13,272 | 603 |
+| mixedTraffic (10 msg) | **3,835** | — | 1,295 | 60 |
+| requestResponse (RPC) | **146** | — | — | — |
 
 ### Allocation (B/op) — lower is better
 
 | Benchmark | jtroop | jtroop blocking | Netty 4.2 | SpiderMonkey 3.7 |
 |-----------|-------:|----------------:|----------:|-----------------:|
-| positionUpdate | **0.021** | 0.403 | 1,082 | 443 |
-| chatMessage | **0.049** | 0.369 | 1,611 | 855 |
-| mixedTraffic (10 msg) | **304** | — | 11,155 | 6,139 |
-| requestResponse (RPC) | 1,068 | — | — | — |
+| positionUpdate | **0.021** | — | 1,109 | 443 |
+| chatMessage | **0.048** | — | 1,606 | 855 |
+| mixedTraffic (10 msg) | **304** | — | 11,220 | 6,139 |
+| requestResponse (RPC) | **71** | — | — | — |
 
 ### HTTP/1.1 throughput (wrk)
 
@@ -51,16 +51,22 @@ External load generator, "Hello, World!" responses. Same JDK 26, same box, TCP_N
 | positionUpdate (fire-forget) | 60 ns | 90 ns | 120 ns | 2,420 ns |
 | positionUpdate (blocking) | 420 ns | 1,150 ns | 5,984 ns | 39,808 ns |
 | chatMessage (fire-forget) | 100 ns | 160 ns | 410 ns | 5,016 ns |
-| requestResponse (RPC round-trip) | 1.06 ms | 1.07 ms | 1.50 ms | 3.94 ms |
+| requestResponse (RPC round-trip) | **7.5 µs** | 8.8 µs | 13.5 µs | 54 µs |
+
+### Game simulation (100 TCP clients, 4 event loops)
+
+| Benchmark | Ticks/sec | B/op | 60Hz headroom |
+|---|---:|---:|---:|
+| gameTick (100 pos + broadcast) | **110,000** | 261 | 1,833× |
+| gameTickWithChat (+ 5 chat broadcasts) | **2,200** | 22,195 | 36× |
 
 ### Comparison summary
 
 | vs Netty 4.2 | Throughput | Allocation |
 |---|---|---|
-| positionUpdate | **3.6×** faster | **51,000×** less |
-| chatMessage | **1.5×** faster | **33,000×** less |
+| positionUpdate | **3.6×** faster | **53,000×** less |
+| chatMessage | **1.6×** faster | **33,000×** less |
 | mixedTraffic | **3.0×** faster | **37×** less |
-| positionUpdate_blocking | **15×** faster | **2,680×** less |
 | HTTP (wrk t8 c400) | **+15%** | — |
 | HTTP (wrk t32 c400) | **+28%** | — |
 
@@ -287,6 +293,8 @@ jtroop/
 | Agent sweep II (11) | 0.019 | 29,722 | Zero-alloc UTF-8 codec, MPSC setup, direct-write blocking, RPC ring + typed proxy, encode-once broadcast, AckLayer SoA, fused pipeline on hot paths |
 | Agent sweep III (10) | ~10⁻⁴ | 27,506 | Deflater/Cipher pooling, connected-UDP, flat slot→channel, select(Consumer), adaptive selectNow, HTTP SO_REUSEPORT, waiter-side RPC decode |
 | Agent sweep IV (20) | **0.021** | **45,938** | **CodecClassGenerator bug fix**, BufferCharSequence, SendCtx cache, single-buffer framing shortcut, 64KB buffers, FusedReceiverGenerator, inline executor dispatch, per-method @Datagram proxy routing |
+| Review sweep (20) | 0.021 | 45,672 | Production hardening: 5 resource leaks, 3 thread-safety races, exception hierarchy, graceful shutdown, SessionStore security, flaky tests stabilized, 34 null checks, 214 javadocs, dead code removal |
+| Agent sweep V (20) | **0.021** | **45,672** | request() sendBlocking fix (RPC p50 1ms→7µs), compression small-payload bypass, per-loop broadcast dispatch, lazy write buffers, decodeConsumer 0 B/op, TCP_NODELAY on accept/connect, game simulation benchmark |
 
 ## Requirements
 
