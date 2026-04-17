@@ -52,24 +52,29 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private final SocketChannel[] writeTargets;
     private final Thread[] waitingThreads;
     private final int maxConnections;
+    private final int writeBufferSize;
     private volatile int activeSlots = 0;
 
-    public EventLoop(String name, int maxConnections) throws IOException {
+    public EventLoop(String name, int maxConnections, int writeBufferSize) throws IOException {
         this.selector = Selector.open();
         this.thread = new Thread(this, name);
         this.thread.setDaemon(true);
         this.maxConnections = maxConnections;
+        this.writeBufferSize = writeBufferSize;
         this.writeBuffers = new ByteBuffer[maxConnections];
         this.pendingWrite = new boolean[maxConnections];
         this.writeTargets = new SocketChannel[maxConnections];
         this.waitingThreads = new Thread[maxConnections];
-        for (int i = 0; i < maxConnections; i++) {
-            writeBuffers[i] = ByteBuffer.allocateDirect(65536);
-        }
+        // Lazy allocation: writeBuffers[i] is allocated on first stageWrite.
+        // Most connections may be read-heavy and never need the buffer.
+    }
+
+    public EventLoop(String name, int maxConnections) throws IOException {
+        this(name, maxConnections, 65536);
     }
 
     public EventLoop(String name) throws IOException {
-        this(name, 64);
+        this(name, 64, 65536);
     }
 
     public void start() {
@@ -120,8 +125,22 @@ public final class EventLoop implements Runnable, AutoCloseable {
      * buf lock, flush whatever's staged, then write the oversized payload
      * directly to the channel. Prevents BufferOverflowException on large frames.
      */
-    public void stageWrite(int slot, ByteBuffer data) {
+    /**
+     * Lazily allocate the per-slot write buffer on first use. Direct buffers
+     * cost 64KB+ of native memory each; connections that never write (read-heavy
+     * protocols, idle connections) skip the allocation entirely.
+     */
+    private ByteBuffer ensureWriteBuffer(int slot) {
         var buf = writeBuffers[slot];
+        if (buf == null) {
+            buf = ByteBuffer.allocateDirect(writeBufferSize);
+            writeBuffers[slot] = buf;
+        }
+        return buf;
+    }
+
+    public void stageWrite(int slot, ByteBuffer data) {
+        var buf = ensureWriteBuffer(slot);
         var channel = (SocketChannel) WRITE_TARGETS.getAcquire(writeTargets, slot);
         int need = data.remaining();
         // Fast path: enough room, just put.
@@ -202,7 +221,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
      * correctness is preserved.
      */
     public void stageWriteAndFlush(int slot, ByteBuffer data) {
-        var buf = writeBuffers[slot];
+        var buf = ensureWriteBuffer(slot);
         var channel = (SocketChannel) WRITE_TARGETS.getAcquire(writeTargets, slot);
         if (channel != null && channel.isConnected()) {
             synchronized (buf) {
@@ -360,7 +379,8 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private void flushPendingWrites() {
         for (int i = 0; i < activeSlots; i++) {
             if ((boolean) PENDING_WRITE.getAcquire(pendingWrite, i)) {
-                var buf = writeBuffers[i];
+                var buf = writeBuffers[i]; // never null here: stageWrite ensures allocation before setting pendingWrite
+                if (buf == null) { PENDING_WRITE.setRelease(pendingWrite, i, false); continue; }
                 var channel = (SocketChannel) WRITE_TARGETS.getAcquire(writeTargets, i);
                 boolean fullyDrained = false;
                 synchronized (buf) {
@@ -418,6 +438,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
 
     public boolean isRunning() { return running; }
     public Selector selector() { return selector; }
+    public int writeBufferSize() { return writeBufferSize; }
 
     public interface KeyHandler {
         void handle(SelectionKey key) throws IOException;

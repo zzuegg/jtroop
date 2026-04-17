@@ -8,11 +8,15 @@ public final class EventLoopGroup implements AutoCloseable {
     private final EventLoop[] loops;
     private final AtomicInteger index = new AtomicInteger(0);
 
-    public EventLoopGroup(int size) throws IOException {
+    public EventLoopGroup(int size, int writeBufferSize) throws IOException {
         loops = new EventLoop[size];
         for (int i = 0; i < size; i++) {
-            loops[i] = new EventLoop("event-loop-" + i);
+            loops[i] = new EventLoop("event-loop-" + i, 64, writeBufferSize);
         }
+    }
+
+    public EventLoopGroup(int size) throws IOException {
+        this(size, 65536);
     }
 
     public EventLoopGroup() throws IOException {

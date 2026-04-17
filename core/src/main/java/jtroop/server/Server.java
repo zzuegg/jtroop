@@ -101,7 +101,8 @@ public final class Server implements AutoCloseable {
     private Server(List<ListenerConfig> listeners, ServiceRegistry serviceRegistry,
                    CodecRegistry codec,
                    Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers,
-                   java.util.concurrent.Executor executor, int workerCount) {
+                   java.util.concurrent.Executor executor, int workerCount,
+                   int writeBufferSize) {
         this.listeners = listeners;
         this.serviceRegistry = serviceRegistry;
         this.codec = codec;
@@ -111,8 +112,8 @@ public final class Server implements AutoCloseable {
         this.sessions = new SessionStore(4096);
         this.slotChannels = new SocketChannel[sessions.capacity()];
         try {
-            this.acceptLoop = new EventLoop("server-accept");
-            this.workerGroup = new EventLoopGroup(workerCount);
+            this.acceptLoop = new EventLoop("server-accept", 64, writeBufferSize);
+            this.workerGroup = new EventLoopGroup(workerCount, writeBufferSize);
         } catch (IOException e) {
             throw new RuntimeException("Failed to create event loops", e);
         }
@@ -955,6 +956,18 @@ public final class Server implements AutoCloseable {
         private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers = new HashMap<>();
         private java.util.concurrent.Executor executor;
         private int eventLoops = 1;
+        private int writeBufferSize = 65536;
+
+        /**
+         * Set the per-connection write buffer size in bytes. Default: 65536 (64KB).
+         * Smaller values reduce memory for connections that send small messages.
+         * The buffer is allocated lazily on first write.
+         */
+        public Builder writeBufferSize(int bytes) {
+            if (bytes < 256) throw new IllegalArgumentException("writeBufferSize must be >= 256");
+            this.writeBufferSize = bytes;
+            return this;
+        }
 
         public Builder listen(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
             // Plan A for unconnected UDP: the pipeline is per-connection
@@ -1004,7 +1017,8 @@ public final class Server implements AutoCloseable {
 
         public Server build() {
             return new Server(List.copyOf(listeners), serviceRegistry, codec,
-                    Map.copyOf(handshakeHandlers), executor, eventLoops);
+                    Map.copyOf(handshakeHandlers), executor, eventLoops,
+                    writeBufferSize);
         }
     }
 }
