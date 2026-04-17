@@ -131,7 +131,9 @@ public final class Client implements AutoCloseable {
                    jtroop.generate.FusedPipelineGenerator.FusedPipeline fused,
                    Layer.Context layerCtx,
                    int fixedPayloadSize,
-                   boolean singleFraming) implements SendCtx {}
+                   boolean singleFraming,
+                   int typeId,
+                   jtroop.generate.CodecClassGenerator.GeneratedCodec encoder) implements SendCtx {}
         record Udp(java.nio.channels.DatagramChannel channel,
                    jtroop.generate.FusedPipelineGenerator.FusedPipeline fused,
                    Layer.Context layerCtx,
@@ -550,7 +552,9 @@ public final class Client implements AutoCloseable {
                         && config.layers()[0] instanceof jtroop.pipeline.layers.FramingLayer;
                 tcpSendCache.put(msgType, new SendCtx.Tcp(
                         slot, config.pipeline().fused(), lc,
-                        encoder.fixedPayloadSize(), singleFraming));
+                        encoder.fixedPayloadSize(), singleFraming,
+                        codec.typeId((Class<? extends Record>) msgType),
+                        encoder.generatedCodec()));
             }
         }
     }
@@ -606,10 +610,15 @@ public final class Client implements AutoCloseable {
     private void sendTcpFast(Record message, SendCtx.Tcp ctx) {
         if (ctx.singleFraming() && ctx.fixedPayloadSize() >= 0) {
             // Phase 1: encode into heap buffer (EA-friendly, no sync).
+            // Uses the cached encoder directly — monomorphic invokevirtual
+            // per SendCtx.Tcp (one per message type). This avoids the
+            // bimorphic CodecRegistry.encode(message, wire) callsite that
+            // defeats C2 EA in mixed-type workloads (CLAUDE.md rule #3).
             var wire = wireBuf.get();
             wire.clear();
             wire.putInt(ctx.fixedPayloadSize()); // FramingLayer length prefix
-            codec.encode(message, wire);
+            wire.putShort((short) ctx.typeId());
+            ctx.encoder().encode(message, wire);
             wire.flip();
             // Phase 2: stage into write buffer.
             if (ctx.layerCtx() instanceof LayerContext lc) lc.addBytesWritten(wire.remaining());
@@ -618,7 +627,9 @@ public final class Client implements AutoCloseable {
             var encode = encodeBuf.get();
             var wire = wireBuf.get();
             encode.clear();
-            codec.encode(message, encode);
+            // Use cached encoder for monomorphic dispatch
+            encode.putShort((short) ctx.typeId());
+            ctx.encoder().encode(message, encode);
             encode.flip();
             wire.clear();
             ctx.fused().encodeOutbound(ctx.layerCtx(), encode, wire);
@@ -651,7 +662,9 @@ public final class Client implements AutoCloseable {
                         && config.layers()[0] instanceof jtroop.pipeline.layers.FramingLayer;
                 sendCache.put(msgType, new SendCtx.Tcp(
                         slot, config.pipeline().fused(), lc,
-                        encoder.fixedPayloadSize(), singleFraming));
+                        encoder.fixedPayloadSize(), singleFraming,
+                        codec.typeId((Class<? extends Record>) msgType),
+                        encoder.generatedCodec()));
             }
         }
     }

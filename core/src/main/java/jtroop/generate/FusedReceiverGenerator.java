@@ -131,7 +131,8 @@ public final class FusedReceiverGenerator {
                 var t = rc.getType();
                 if (t != int.class && t != float.class && t != long.class
                         && t != double.class && t != byte.class && t != short.class
-                        && t != boolean.class && t != String.class) {
+                        && t != boolean.class && t != String.class
+                        && t != CharSequence.class) {
                     supported = false;
                     break;
                 }
@@ -447,6 +448,10 @@ public final class FusedReceiverGenerator {
             b.invokestatic(ClassDesc.of("jtroop.generate.CodecClassGenerator"),
                     "readString",
                     MethodTypeDesc.of(CD_String, CD_ByteBuffer));
+        } else if (type == CharSequence.class) {
+            b.invokestatic(ClassDesc.of("jtroop.core.ReadBuffer"),
+                    "readUtf8CharSequence",
+                    MethodTypeDesc.of(ClassDesc.of("java.lang.CharSequence"), CD_ByteBuffer));
         }
     }
 
