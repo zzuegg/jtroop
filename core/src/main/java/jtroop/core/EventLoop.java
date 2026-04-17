@@ -410,6 +410,12 @@ public final class EventLoop implements Runnable, AutoCloseable {
         running = false;
         selector.wakeup();
         try { thread.join(1000); } catch (InterruptedException _) { thread.interrupt(); }
+        // Safety net: if the thread never started or join timed out, the
+        // selector was not closed inside run(). Close it here to avoid
+        // leaking the native file descriptor.
+        if (!thread.isAlive()) {
+            try { selector.close(); } catch (IOException _) {}
+        }
     }
 
     public boolean isRunning() { return running; }

@@ -56,6 +56,7 @@ public final class Server implements AutoCloseable {
             ThreadLocal.withInitial(() -> ByteBuffer.allocate(65536));
     // All connection-state maps are mutated on worker/accept loops and read
     // from any loop during broadcast/unicast fan-out. ConcurrentHashMap for safety.
+    private final List<ServerSocketChannel> serverChannels = new ArrayList<>();
     private final Map<Class<? extends Record>, Integer> boundPorts = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, Integer> boundUdpPorts = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new ConcurrentHashMap<>();
@@ -261,6 +262,7 @@ public final class Server implements AutoCloseable {
         serverChannel.bind(config.transport().address());
         int port = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
         boundPorts.put(config.connectionType(), port);
+        serverChannels.add(serverChannel);
 
         acceptLoop.submit(() -> {
             try {
@@ -927,9 +929,20 @@ public final class Server implements AutoCloseable {
 
     @Override
     public void close() {
+        // 1. Close per-connection TCP channels first (before selector/loops).
+        for (var ch : connectionChannels.values()) {
+            try { ch.close(); } catch (IOException _) {}
+        }
+        connectionChannels.clear();
+        // 2. Close server (accept) socket channels.
+        for (var ch : serverChannels) {
+            try { ch.close(); } catch (IOException _) {}
+        }
+        serverChannels.clear();
+        // 3. Close event loops (closes selectors).
         acceptLoop.close();
         workerGroup.close();
-        // Shut down the connected-UDP dedicated threads. Closing the channel
+        // 4. Shut down connected-UDP dedicated threads. Closing the channel
         // unblocks the blocking read() with AsynchronousCloseException.
         for (var ch : udpChannels.values()) {
             try { ch.close(); } catch (IOException _) {}
@@ -937,6 +950,16 @@ public final class Server implements AutoCloseable {
         for (var t : udpConnectedThreads) {
             t.interrupt();
             try { t.join(500); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
+        }
+        // 5. Close pipeline layers that hold native resources (Deflater/Inflater).
+        for (var config : listeners) {
+            if (config.layers() != null) {
+                for (var layer : config.layers()) {
+                    if (layer instanceof AutoCloseable ac) {
+                        try { ac.close(); } catch (Exception _) {}
+                    }
+                }
+            }
         }
     }
 

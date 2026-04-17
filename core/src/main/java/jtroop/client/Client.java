@@ -939,17 +939,30 @@ public final class Client implements AutoCloseable {
 
     @Override
     public void close() {
+        // 1. Close TCP and UDP channels first.
         for (var channel : channels.values()) {
             try { channel.close(); } catch (IOException _) {}
         }
         for (var channel : udpChannels.values()) {
             try { channel.close(); } catch (IOException _) {}
         }
+        // 2. Stop UDP read threads (channel close unblocks blocking read).
         for (var t : udpReadThreads) {
             t.interrupt();
             try { t.join(500); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
         }
+        // 3. Close event loop (closes selector).
         eventLoop.close();
+        // 4. Close pipeline layers that hold native resources (Deflater/Inflater).
+        for (var config : connections) {
+            if (config.layers() != null) {
+                for (var layer : config.layers()) {
+                    if (layer instanceof AutoCloseable ac) {
+                        try { ac.close(); } catch (Exception _) {}
+                    }
+                }
+            }
+        }
     }
 
     public static Builder builder() {

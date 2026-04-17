@@ -213,11 +213,20 @@ public final class Forwarder implements AutoCloseable {
         running = false;
         if (selector != null) selector.wakeup();
         try { acceptThread.join(2000); } catch (InterruptedException _) {}
+        // Close all channels registered with the selector (TCP pipes, UDP
+        // listen/target channels) before closing the selector itself.
+        if (selector != null) {
+            for (var key : selector.keys()) {
+                try { key.channel().close(); } catch (IOException _) {}
+            }
+        }
         for (var ch : serverChannels) {
             try { ch.close(); } catch (IOException _) {}
         }
         scheduler.shutdownNow();
-        try { selector.close(); } catch (IOException _) {}
+        if (selector != null) {
+            try { selector.close(); } catch (IOException _) {}
+        }
     }
 
     public static Builder builder() {
