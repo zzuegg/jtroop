@@ -104,7 +104,6 @@ public class NetGameBenchmark {
     private Server server;
     private Client client;
     private EchoService echo;
-    private GameService game;
 
     // --- sessionIteration state ---
     // N=100 active connections sparsely distributed in a 4096-slot store,
@@ -141,14 +140,8 @@ public class NetGameBenchmark {
         Thread.sleep(500); // wait for connection
 
         echo = client.service(EchoService.class);
-        game = client.service(GameService.class);
         // warm up request/response path
         for (int i = 0; i < 100; i++) echo.echo(new EchoMsg(i));
-        // warm up mixed-traffic proxy path
-        for (int i = 0; i < 1000; i++) {
-            game.position(new PositionUpdate(0, 0, 0, 0));
-            game.chat(new ChatMessage("", 0));
-        }
 
         // Seed the TcpSendCtx cache — the first send resolves and caches the
         // slot, pipeline, codec, etc. Subsequent sends take the zero-lookup
@@ -240,16 +233,12 @@ public class NetGameBenchmark {
 
     @Benchmark
     public void mixedTraffic() {
-        // 80% position updates, 20% chat (typical game workload).
-        // Uses the typed service proxy so each method is a monomorphic
-        // callsite — C2 inlines codec.encode per-type and EA scalar-replaces
-        // the record. Without the proxy, the bimorphic client.send() callsite
-        // defeats EA and allocates 304 B/op (8×32 + 2×24).
+        // 80% position updates, 20% chat (typical game workload)
         for (int i = 0; i < 10; i++) {
             if (i < 8) {
-                game.position(new PositionUpdate(i * 0.1f, i * 0.2f, i * 0.3f, i * 0.01f));
+                client.send(new PositionUpdate(i * 0.1f, i * 0.2f, i * 0.3f, i * 0.01f));
             } else {
-                game.chat(new ChatMessage(GameMessages.CHAT_TEXT, i));
+                client.send(new ChatMessage(GameMessages.CHAT_TEXT, i));
             }
         }
     }

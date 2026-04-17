@@ -19,20 +19,25 @@ import static java.lang.classfile.ClassFile.*;
  */
 public final class CodecClassGenerator {
 
-    public interface GeneratedCodec {
-        void encode(Record msg, ByteBuffer buf);
-        Record decode(ByteBuffer buf);
+    /**
+     * Abstract class (not interface) so call sites emit {@code invokevirtual}
+     * instead of {@code invokeinterface}. C2 devirtualizes {@code invokevirtual}
+     * on hidden-class receivers, enabling EA of the Record parameter — each
+     * per-type SendCtx.Tcp sees one concrete codec, so the call is monomorphic.
+     * An {@code invokeinterface} callsite stays megamorphic regardless of
+     * profiling (CLAUDE.md rule #4).
+     */
+    public static abstract class GeneratedCodec {
+        public abstract void encode(Record msg, ByteBuffer buf);
+        public abstract Record decode(ByteBuffer buf);
 
         /**
          * Decode fields from the buffer and pass the constructed record to the
          * consumer. If C2 inlines the monomorphic consumer, the record is
          * constructed inside the accept() call and never escapes — enabling
          * scalar replacement (0 B/op).
-         *
-         * <p>Default implementation falls back to {@link #decode(ByteBuffer)}
-         * for codecs generated before this method existed.
          */
-        default void decodeConsumer(ByteBuffer buf, Consumer<Record> consumer) {
+        public void decodeConsumer(ByteBuffer buf, Consumer<Record> consumer) {
             consumer.accept(decode(buf));
         }
     }
@@ -54,12 +59,12 @@ public final class CodecClassGenerator {
 
         byte[] bytes = ClassFile.of().build(ClassDesc.of(className.replace('/', '.')), cb -> {
             cb.withFlags(ACC_PUBLIC | ACC_FINAL);
-            cb.withInterfaceSymbols(CD_GeneratedCodec);
+            cb.withSuperclass(CD_GeneratedCodec);
 
-            // Default constructor
+            // Default constructor — calls GeneratedCodec.<init>()
             cb.withMethodBody(ConstantDescs.INIT_NAME, ConstantDescs.MTD_void, ACC_PUBLIC, b -> {
                 b.aload(0);
-                b.invokespecial(ConstantDescs.CD_Object, ConstantDescs.INIT_NAME, ConstantDescs.MTD_void);
+                b.invokespecial(CD_GeneratedCodec, ConstantDescs.INIT_NAME, ConstantDescs.MTD_void);
                 b.return_();
             });
 
