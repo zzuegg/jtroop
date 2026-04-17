@@ -18,8 +18,7 @@ public final class Forwarder implements AutoCloseable {
             int targetPort,
             Duration latencyMin,
             Duration latencyMax,
-            double packetLoss,
-            double reorderRate
+            double packetLoss
     ) {}
 
     private final List<ForwardConfig> forwards;
@@ -229,7 +228,6 @@ public final class Forwarder implements AutoCloseable {
         private Duration latencyMin;
         private Duration latencyMax;
         private double packetLoss;
-        private double reorderRate;
 
         public Builder forward(Transport listenTransport, String targetHost, int targetPort) {
             flushCurrent();
@@ -239,7 +237,6 @@ public final class Forwarder implements AutoCloseable {
             this.latencyMin = null;
             this.latencyMax = null;
             this.packetLoss = 0;
-            this.reorderRate = 0;
             return this;
         }
 
@@ -254,16 +251,11 @@ public final class Forwarder implements AutoCloseable {
             return this;
         }
 
-        public Builder reorder(double rate) {
-            this.reorderRate = rate;
-            return this;
-        }
-
         private void flushCurrent() {
             if (currentListenTransport != null) {
                 forwards.add(new ForwardConfig(
                         currentListenTransport, currentTargetHost, currentTargetPort,
-                        latencyMin, latencyMax, packetLoss, reorderRate));
+                        latencyMin, latencyMax, packetLoss));
             }
         }
 

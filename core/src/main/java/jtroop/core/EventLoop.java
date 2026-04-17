@@ -51,14 +51,12 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private final boolean[] pendingWrite;
     private final SocketChannel[] writeTargets;
     private final Thread[] waitingThreads;
-    private final int maxConnections;
     private volatile int activeSlots = 0;
 
     public EventLoop(String name, int maxConnections) throws IOException {
         this.selector = Selector.open();
         this.thread = new Thread(this, name);
         this.thread.setDaemon(true);
-        this.maxConnections = maxConnections;
         this.writeBuffers = new ByteBuffer[maxConnections];
         this.pendingWrite = new boolean[maxConnections];
         this.writeTargets = new SocketChannel[maxConnections];

@@ -101,8 +101,6 @@ public final class CodecRegistry {
     // Type IDs are u16 (see stableTypeId) — worst case 65536 slots × 8 B reference = 512 KB.
     // Allocation-free access (no HashMap.get → Integer.valueOf), monomorphic aaload.
     private final CodecEntry[] byId = new CodecEntry[65536];
-    private int nextId = 0;
-
     public void register(Class<? extends Record> type) {
         if (byClass.containsKey(type)) return;
         int id = stableTypeId(type);

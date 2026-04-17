@@ -1,10 +1,8 @@
 package jtroop.generate;
 
 import java.lang.classfile.*;
-import java.lang.classfile.attribute.SourceFileAttribute;
 import java.lang.constant.*;
 import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
 import java.lang.reflect.RecordComponent;
 import java.nio.ByteBuffer;
 

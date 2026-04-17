@@ -50,13 +50,6 @@ public final class Client implements AutoCloseable {
     private final Map<Class<? extends Record>, SocketChannel> channels = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, Integer> channelSlots = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannels = new ConcurrentHashMap<>();
-    /**
-     * Fast path: message type → UDP channel. Populated lazily on first send so
-     * the hot path is a single {@link ConcurrentHashMap#get(Object)} instead of
-     * {@code resolveConnection → udpChannels.get}. No {@code @Datagram} routing
-     * branch, no service-to-connection indirection.
-     */
-    private final Map<Class<? extends Record>, java.nio.channels.DatagramChannel> udpChannelByMsgType = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> configByType = new HashMap<>();
     private final Map<Class<? extends Record>, ConnectionConfig> udpConfigByType = new HashMap<>();
     // Per-connection LayerContext. Allocated on connect, keyed by connection
@@ -923,8 +916,6 @@ public final class Client implements AutoCloseable {
         var udp = udpChannels.remove(connectionType);
         if (udp != null) {
             try { udp.close(); } catch (IOException _) {}
-            // Drop cached message-type → channel entries pointing at this UDP.
-            udpChannelByMsgType.values().removeIf(ch -> ch == udp);
         }
         contextsByType.remove(connectionType);
     }

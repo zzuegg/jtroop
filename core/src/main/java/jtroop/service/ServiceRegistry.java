@@ -229,14 +229,6 @@ public final class ServiceRegistry {
                 interfaceToMessageTypes.getOrDefault(serviceInterface, Set.of()));
     }
 
-    public boolean hasHandler(Class<? extends Record> messageType) {
-        return handlers.containsKey(messageType);
-    }
-
-    public CodecRegistry codec() {
-        return codec;
-    }
-
     /** Returns all registered handler instances (distinct). Used by the fused
      *  receiver generator to collect @OnMessage bindings at build time. */
     public List<Object> handlerInstances() {
