@@ -1,5 +1,7 @@
 package jtroop.pipeline;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.net.InetSocketAddress;
 
 /**
@@ -14,15 +16,31 @@ import java.net.InetSocketAddress;
  */
 public final class LayerContext implements Layer.Context {
 
+    // VarHandles for atomic add on byte counters. volatile read-modify-write
+    // (+=) is not atomic — concurrent addBytesWritten from broadcast fan-out
+    // on different worker loops would lose updates. VarHandle.getAndAdd is
+    // a single atomic RMW instruction (lock xadd on x86).
+    private static final VarHandle BYTES_READ;
+    private static final VarHandle BYTES_WRITTEN;
+    static {
+        try {
+            var lookup = MethodHandles.lookup();
+            BYTES_READ = lookup.findVarHandle(LayerContext.class, "bytesRead", long.class);
+            BYTES_WRITTEN = lookup.findVarHandle(LayerContext.class, "bytesWritten", long.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
     private final long connectionId;
     private volatile InetSocketAddress remoteAddress;
     private final long connectedAtNanos;
     private final Runnable closeAfterFlushAction;
     private final Runnable closeNowAction;
 
-    // Byte counters. {@code volatile} because {@code handleRead} is serialised
-    // on one loop but a broadcast/unicast write may come from a different
-    // worker loop. Rate-limit filters read across threads.
+    // Byte counters. Accessed via VarHandle for atomic read-modify-write.
+    // Reads serialised on one loop, writes may come from broadcast fan-out
+    // on different worker loops.
     private volatile long bytesRead;
     private volatile long bytesWritten;
 
@@ -61,7 +79,9 @@ public final class LayerContext implements Layer.Context {
     @Override public void closeNow() { closeNowAction.run(); }
 
     // Package-private mutators used by Server/Client I/O paths.
-    public void addBytesRead(long delta) { this.bytesRead += delta; }
-    public void addBytesWritten(long delta) { this.bytesWritten += delta; }
+    // Atomic RMW via VarHandle — safe when broadcast fan-out calls
+    // addBytesWritten from multiple worker loops concurrently.
+    public void addBytesRead(long delta) { BYTES_READ.getAndAdd(this, delta); }
+    public void addBytesWritten(long delta) { BYTES_WRITTEN.getAndAdd(this, delta); }
     public void setRemoteAddress(InetSocketAddress addr) { this.remoteAddress = addr; }
 }

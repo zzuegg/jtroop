@@ -21,6 +21,8 @@ import jtroop.session.SessionStore;
 import jtroop.transport.Transport;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
@@ -28,6 +30,20 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class Server implements AutoCloseable {
+
+    // VarHandle for release/acquire on the flat per-slot channel table.
+    // Writes from the accept loop (acceptClient) must be visible to
+    // broadcast fan-out readers on worker loops. The plain store was
+    // NOT ordered by SessionStore's synchronized edge because it runs
+    // AFTER allocate() returns (outside the monitor).
+    private static final VarHandle SLOT_CHANNELS;
+    static {
+        try {
+            SLOT_CHANNELS = MethodHandles.arrayElementVarHandle(SocketChannel[].class);
+        } catch (Throwable t) {
+            throw new ExceptionInInitializerError(t);
+        }
+    }
 
     private record ListenerConfig(
             Class<? extends Record> connectionType,
@@ -80,10 +96,10 @@ public final class Server implements AutoCloseable {
     //   ConnectionId.of(index, gen) + connectionChannels.get(id)
     // sequence, which allocated a ConnectionId record that escaped into the
     // non-inlined ConcurrentHashMap.get and defeated scalar replacement
-    // (CLAUDE.md rule #3). The array store is plain; publication is
-    // piggy-backed on SessionStore.allocate / release synchronized edges
-    // which flush the write before a fan-out observer can see active=true
-    // for the slot.
+    // (CLAUDE.md rule #3). Array stores use SLOT_CHANNELS VarHandle
+    // (release/acquire) for cross-thread visibility — the SessionStore
+    // monitor edge does NOT cover these stores because they run AFTER
+    // allocate() returns (outside the monitor).
     private final SocketChannel[] slotChannels;
     @SuppressWarnings("rawtypes")
     private final Map<Class<? extends Record>, java.util.function.Function> handshakeHandlers;
@@ -222,7 +238,7 @@ public final class Server implements AutoCloseable {
             // costing 24 B/recipient. `generation` is unused here:
             // forEachActiveIndex only yields currently-active slots so the
             // slot→channel mapping is already filtered by liveness.
-            var channel = slotChannels[index];
+            var channel = (SocketChannel) SLOT_CHANNELS.getAcquire(slotChannels, index);
             if (channel == null || !channel.isConnected()) return;
 
             // Rewind the buffer without allocating a duplicate — we own it
@@ -533,11 +549,10 @@ public final class Server implements AutoCloseable {
                 /* closeNow */        () -> closeConnection(connId));
         connectionContexts.put(connId, ctx);
         // Publish to the flat per-slot table for zero-lookup broadcast fan-out.
-        // Happens-before a concurrent broadcast observer via SessionStore's
-        // synchronized methods: sessions.allocate released the active-bit
-        // write, and any subsequent forEachActiveIndex acquires the same
-        // monitor, flushing this store through the JMM read-of-monitor edge.
-        slotChannels[connId.index()] = clientChannel;
+        // Uses release-store so a concurrent broadcast's acquire-load on the
+        // same slot sees the channel reference. The SessionStore monitor edge
+        // does NOT cover this store (it runs after allocate() returns).
+        SLOT_CHANNELS.setRelease(slotChannels, connId.index(), clientChannel);
 
         // Assign to a worker loop. switchPipeline dispatches to the loop
         // selected by Math.floorMod(index, size), so this registration must
@@ -677,7 +692,7 @@ public final class Server implements AutoCloseable {
         // Clear the flat slot BEFORE releasing the session — otherwise a
         // concurrent allocate could reuse the slot and race the null-store,
         // leaking a stale channel ref into fan-out.
-        slotChannels[connId.index()] = null;
+        SLOT_CHANNELS.setRelease(slotChannels, connId.index(), (SocketChannel) null);
         sessions.release(connId);
         keyToConnection.remove(key);
         connectionToKey.remove(connId);
@@ -861,7 +876,7 @@ public final class Server implements AutoCloseable {
         // Clear the flat slot BEFORE releasing the session — otherwise a
         // concurrent allocate could reuse the slot and race the null-store,
         // leaking a stale channel ref into fan-out.
-        slotChannels[connId.index()] = null;
+        SLOT_CHANNELS.setRelease(slotChannels, connId.index(), (SocketChannel) null);
         sessions.release(connId);
         keyToConnection.remove(key);
         connectionToKey.remove(connId);
