@@ -119,23 +119,31 @@ public final class Client implements AutoCloseable {
     private final AtomicInteger requestIdCounter = new AtomicInteger(0);
 
     /**
-     * Pre-resolved send context for a specific message type. Caches the slot
-     * index, fused pipeline, layer context, and fixed-payload-size. Resolving
-     * these once eliminates 5-7 HashMap/ConcurrentHashMap lookups from the
-     * hot send path. Published via ConcurrentHashMap for safe visibility.
+     * Pre-resolved send context for a specific message type. Caches everything
+     * needed by the hot send path — slot/channel, fused pipeline, layer
+     * context, and transport-specific fast-path flags. Resolving these once
+     * eliminates 5-7 HashMap/ConcurrentHashMap lookups per send.
+     *
+     * <p>Sealed with two permits so {@code switch(ctx)} in {@link #send} is
+     * exhaustive and C2 can profile both branches independently.
      */
-    private record TcpSendCtx(
-            int slot,
-            jtroop.generate.FusedPipelineGenerator.FusedPipeline fused,
-            Layer.Context layerCtx,
-            int fixedPayloadSize,
-            boolean singleFraming
-    ) {}
+    private sealed interface SendCtx {
+        record Tcp(int slot,
+                   jtroop.generate.FusedPipelineGenerator.FusedPipeline fused,
+                   Layer.Context layerCtx,
+                   int fixedPayloadSize,
+                   boolean singleFraming) implements SendCtx {}
+        record Udp(java.nio.channels.DatagramChannel channel,
+                   jtroop.generate.FusedPipelineGenerator.FusedPipeline fused,
+                   Layer.Context layerCtx,
+                   boolean hasLayers,
+                   Class<? extends Record> connType) implements SendCtx {}
+    }
 
     // Per-message-type cached send context. ConcurrentHashMap for safe
     // publication from the first-send thread; subsequent reads are a single
     // volatile load + pointer chase (no hashing, no equals).
-    private final ConcurrentHashMap<Class<? extends Record>, TcpSendCtx> tcpSendCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Class<? extends Record>, SendCtx> sendCache = new ConcurrentHashMap<>();
 
     private int nextSlot = 0;
 
@@ -482,21 +490,16 @@ public final class Client implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public void send(Record message) {
         var msgType = (Class<? extends Record>) message.getClass();
-        // Fast path: pre-resolved TCP send context (zero map lookups).
-        var ctx = tcpSendCache.get(msgType);
+        // Fast path: one CHM.get, then pattern-match dispatch.
+        var ctx = sendCache.get(msgType);
         if (ctx != null) {
-            sendTcpFast(message, ctx);
+            switch (ctx) {
+                case SendCtx.Tcp tcp -> sendTcpFast(message, tcp);
+                case SendCtx.Udp udp -> sendUdpFast(message, udp);
+            }
             return;
         }
-        // Two monomorphic fast paths, one branch each — kept compact so C2
-        // inlines send() end-to-end and EA scalar-replaces the caller's
-        // fresh record.
-        var udpChannel = udpChannelByMsgType.get(msgType);
-        if (udpChannel != null) {
-            sendUdpFast(message, udpChannel, msgType);
-            return;
-        }
-        sendTcpOrCold(message, msgType);
+        sendCold(message, msgType);
     }
 
     /**
@@ -516,7 +519,7 @@ public final class Client implements AutoCloseable {
      * <p>Variable-size or complex-pipeline messages fall back to the full
      * two-buffer encode + pipeline + stageWrite path.
      */
-    private void sendTcpFast(Record message, TcpSendCtx ctx) {
+    private void sendTcpFast(Record message, SendCtx.Tcp ctx) {
         if (ctx.singleFraming() && ctx.fixedPayloadSize() >= 0) {
             // Phase 1: encode into heap buffer (EA-friendly, no sync).
             var wire = wireBuf.get();
@@ -541,9 +544,28 @@ public final class Client implements AutoCloseable {
         }
     }
 
-    /** Slow path: first-time TCP cache population or UDP. */
+    /** Slow path: first-time cache population for TCP or UDP. Runs once per
+     *  message type; subsequent sends hit the unified {@link #sendCache}. */
     @SuppressWarnings("unchecked")
-    private void sendTcpOrCold(Record message, Class<? extends Record> msgType) {
+    private void sendCold(Record message, Class<? extends Record> msgType) {
+        // Try UDP first (datagram types are known at build time).
+        if (datagramMessageTypes.contains(msgType)) {
+            var connType = resolveConnection(msgType);
+            var ch = udpChannels.get(connType);
+            if (ch == null) {
+                throw new IllegalStateException("No UDP connection for " + msgType.getName());
+            }
+            var cfg = udpConfigByType.get(connType);
+            boolean hasLayers = cfg != null && cfg.pipeline().size() > 0;
+            var lctx = contextsByType.get(connType);
+            Layer.Context lc = lctx != null ? lctx : LayerContext.NOOP;
+            var fused = cfg != null ? cfg.pipeline().fused() : null;
+            var udpCtx = new SendCtx.Udp(ch, fused, lc, hasLayers, connType);
+            sendCache.put(msgType, udpCtx);
+            sendUdpFast(message, udpCtx);
+            return;
+        }
+        // TCP path.
         int encodedBytes = encodeToWire(message);
         if (encodedBytes > 0) {
             var connType = resolveConnection(msgType);
@@ -559,20 +581,10 @@ public final class Client implements AutoCloseable {
                         && config.layers() != null
                         && config.layers().length == 1
                         && config.layers()[0] instanceof jtroop.pipeline.layers.FramingLayer;
-                tcpSendCache.put(msgType, new TcpSendCtx(
+                sendCache.put(msgType, new SendCtx.Tcp(
                         slot, config.pipeline().fused(), lc,
                         encoder.fixedPayloadSize(), singleFraming));
             }
-            return;
-        }
-        if (datagramMessageTypes.contains(msgType)) {
-            var connType = resolveConnection(msgType);
-            var ch = udpChannels.get(connType);
-            if (ch == null) {
-                throw new IllegalStateException("No UDP connection for " + msgType.getName());
-            }
-            udpChannelByMsgType.put(msgType, ch);
-            sendUdpFast(message, ch, msgType);
         }
     }
 
@@ -595,18 +607,19 @@ public final class Client implements AutoCloseable {
         return encode.remaining();
     }
 
-    private void sendUdpFast(Record message, java.nio.channels.DatagramChannel udpChannel,
-                              Class<? extends Record> msgType) {
+    private void sendUdpFast(Record message, SendCtx.Udp ctx) {
         if (encodeUdpInline(message) > 0) {
-            // Connected UDP with a pipeline runs encode through the layer
-            // stack (framing, sequencing, ack, compression, ...). No-layer
-            // connections keep the zero-alloc direct write path.
-            var connType = serviceToConnection.getOrDefault(msgType, msgType);
-            var cfg = udpConfigByType.get(connType);
-            if (cfg != null && cfg.pipeline().size() > 0) {
-                writeUdpThroughPipeline(udpChannel, cfg, connType);
+            if (ctx.hasLayers()) {
+                // Connected UDP with a pipeline: encode through the layer
+                // stack (framing, sequencing, ack, compression, ...).
+                var cfg = udpConfigByType.get(ctx.connType());
+                if (cfg != null) {
+                    writeUdpThroughPipeline(ctx.channel(), cfg, ctx.connType());
+                } else {
+                    writeUdpEncoded(ctx.channel());
+                }
             } else {
-                writeUdpEncoded(udpChannel);
+                writeUdpEncoded(ctx.channel());
             }
         }
     }
