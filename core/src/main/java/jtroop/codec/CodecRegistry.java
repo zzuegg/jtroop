@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 public final class CodecRegistry {
 
@@ -180,6 +181,41 @@ public final class CodecRegistry {
         if (generated != null) {
             return generated.decode(buf);
         }
+        var args = new Object[entry.components().size()];
+        for (int i = 0; i < args.length; i++) {
+            args[i] = entry.components().get(i).decode(rb);
+        }
+        try {
+            return (Record) entry.constructor().invokeWithArguments(args);
+        } catch (Throwable e) {
+            throw new ProtocolException("Failed to construct " + entry.type().getName(), e);
+        }
+    }
+
+    /**
+     * Decode a message and pass it to the consumer without returning it.
+     * The generated codec constructs the record inside {@code consumer.accept()},
+     * keeping it in the same inlining scope. If C2 inlines the monomorphic
+     * consumer, the record is scalar-replaced — 0 B/op.
+     *
+     * <p>Falls back to {@link #decode(ReadBuffer)} + accept for types without
+     * a generated codec.
+     */
+    public void decodeConsumer(ReadBuffer rb, Consumer<Record> consumer) {
+        var buf = rb.buffer();
+        int typeId = buf.getShort() & 0xFFFF;
+        var entry = byId[typeId];
+        if (entry == null) throw new ProtocolException("Unknown type id: " + typeId);
+        var generated = entry.generatedCodec();
+        if (generated != null) {
+            generated.decodeConsumer(buf, consumer);
+            return;
+        }
+        // Reflective fallback — still allocates
+        consumer.accept(decodeReflective(entry, rb));
+    }
+
+    private Record decodeReflective(CodecEntry entry, ReadBuffer rb) {
         var args = new Object[entry.components().size()];
         for (int i = 0; i < args.length; i++) {
             args[i] = entry.components().get(i).decode(rb);

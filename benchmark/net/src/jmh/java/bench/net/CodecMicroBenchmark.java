@@ -91,6 +91,33 @@ public class CodecMicroBenchmark {
         return codec.decode(new ReadBuffer(decodeBuf));
     }
 
+    // Cached consumer that reads primitive fields from the decoded record
+    // and sinks them individually. Caching avoids per-call lambda allocation;
+    // consuming primitives lets C2 scalar-replace the record itself.
+    private Blackhole cachedBh;
+    private final java.util.function.Consumer<Record> decodeConsumer = msg -> {
+        var pos = (PositionUpdate) msg;
+        cachedBh.consume(pos.x());
+        cachedBh.consume(pos.y());
+        cachedBh.consume(pos.z());
+        cachedBh.consume(pos.yaw());
+    };
+
+    /**
+     * Decode via consumer callback — the record is constructed inside
+     * {@code accept()} so C2 may scalar-replace it if the consumer is
+     * monomorphic and inlined. Consumes primitive fields individually so
+     * the record itself never escapes. Target: 0 B/op.
+     */
+    @Benchmark
+    public void decodeOnly_consumer(Blackhole bh) {
+        cachedBh = bh;
+        decodeBuf.clear();
+        decodeBuf.put(prebuilt);
+        decodeBuf.flip();
+        codec.decodeConsumer(new ReadBuffer(decodeBuf), decodeConsumer);
+    }
+
     /** encode → decode in-memory, no pipeline, no network. */
     @Benchmark
     public Object encodeDecodeRoundtrip() {

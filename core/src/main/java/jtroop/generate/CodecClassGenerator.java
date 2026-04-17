@@ -7,6 +7,7 @@ import java.lang.constant.*;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.RecordComponent;
 import java.nio.ByteBuffer;
+import java.util.function.Consumer;
 
 import static java.lang.classfile.ClassFile.*;
 
@@ -21,12 +22,26 @@ public final class CodecClassGenerator {
     public interface GeneratedCodec {
         void encode(Record msg, ByteBuffer buf);
         Record decode(ByteBuffer buf);
+
+        /**
+         * Decode fields from the buffer and pass the constructed record to the
+         * consumer. If C2 inlines the monomorphic consumer, the record is
+         * constructed inside the accept() call and never escapes — enabling
+         * scalar replacement (0 B/op).
+         *
+         * <p>Default implementation falls back to {@link #decode(ByteBuffer)}
+         * for codecs generated before this method existed.
+         */
+        default void decodeConsumer(ByteBuffer buf, Consumer<Record> consumer) {
+            consumer.accept(decode(buf));
+        }
     }
 
     private static final ClassDesc CD_Record = ClassDesc.of("java.lang.Record");
     private static final ClassDesc CD_ByteBuffer = ClassDesc.of("java.nio.ByteBuffer");
     private static final ClassDesc CD_String = ClassDesc.of("java.lang.String");
     private static final ClassDesc CD_CharSequence = ClassDesc.of("java.lang.CharSequence");
+    private static final ClassDesc CD_Consumer = ClassDesc.of("java.util.function.Consumer");
     private static final ClassDesc CD_GeneratedCodec = ClassDesc.of(
             "jtroop.generate.CodecClassGenerator$GeneratedCodec");
 
@@ -97,6 +112,33 @@ public final class CodecClassGenerator {
 
                         b.invokespecial(recordDesc, ConstantDescs.INIT_NAME, ctorDesc);
                         b.areturn();
+                    });
+
+            // decodeConsumer(ByteBuffer, Consumer<Record>)
+            // Constructs the record and passes it to consumer.accept() in a
+            // single call frame. If C2 inlines the monomorphic consumer, the
+            // record is constructed on the stack inside accept() and EA can
+            // scalar-replace it — 0 B/op.
+            cb.withMethodBody("decodeConsumer",
+                    MethodTypeDesc.of(ConstantDescs.CD_void, CD_ByteBuffer, CD_Consumer),
+                    ACC_PUBLIC, b -> {
+                        // Push consumer first (it's the receiver of accept())
+                        b.aload(2); // Consumer
+
+                        // Construct the record: new T(buf.getXxx(), buf.getXxx(), ...)
+                        b.new_(recordDesc);
+                        b.dup();
+
+                        for (RecordComponent rc : components) {
+                            b.aload(1); // ByteBuffer
+                            emitGet(b, rc.getType());
+                        }
+
+                        b.invokespecial(recordDesc, ConstantDescs.INIT_NAME, ctorDesc);
+                        // Stack: [Consumer, Record]
+                        b.invokeinterface(CD_Consumer, "accept",
+                                MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object));
+                        b.return_();
                     });
         });
 
