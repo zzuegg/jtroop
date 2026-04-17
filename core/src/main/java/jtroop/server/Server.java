@@ -141,30 +141,18 @@ public final class Server implements AutoCloseable {
         }
     }
 
-    // Reusable fan-out walker. broadcastImpl is serialized by broadcastLock
-    // below so a single instance is safe across worker loops — no per-call
-    // allocation (CLAUDE.md rule #7), and the call site at
-    // forEachActiveIndex(walker) stays monomorphic (CLAUDE.md rule #4).
-    private final BroadcastWalker broadcastWalker = new BroadcastWalker();
-    // Broadcast fan-out lock. Serializes broadcastImpl across worker loops
-    // for two reasons:
-    //   1. Pipeline.tempBuffers is shared state — concurrent encodeOutbound
-    //      races on it. The original code only worked because sendResponse
-    //      was called from inside SessionStore.forEachActive's synchronized
-    //      block, which unintentionally serialized the encode too. Moving
-    //      encode out of that lock (to encode once, not N times) removes
-    //      that implicit protection, so we add an explicit one.
-    //   2. We reuse a single broadcastWalker + the ThreadLocal wireBuf of
-    //      whichever thread got the lock. A single encode + fan-out fills
-    //      the buffer, then per-recipient writeFully rewinds and sends.
+    // Serializes broadcastImpl's encode phase: Pipeline.tempBuffers is shared
+    // state, so concurrent encodeOutbound calls must not overlap.
     private final Object broadcastLock = new Object();
 
     private void broadcastImpl(Record message) {
+        byte[] snapshot;
+        int len;
         synchronized (broadcastLock) {
-            // Encode once — not per recipient. The wire bytes are identical
-            // for every destination. All active sessions share the same
-            // ListenerConfig (one pipeline per connectionType), so we pick
-            // any active config and encode against that pipeline.
+            // Encode once — not per recipient. Pipeline.encodeOutbound uses
+            // shared tempBuffers and is not thread-safe, so the encode phase
+            // must be serialized. The fan-out (per-loop submit) runs outside
+            // the lock.
             ListenerConfig anyConfig = null;
             for (var cfg : connectionConfig.values()) {
                 anyConfig = cfg;
@@ -179,57 +167,43 @@ public final class Server implements AutoCloseable {
             encodeBuf.flip();
 
             wireBuf.clear();
-            // Broadcast encodes once against any active pipeline — there is no
-            // single Context to pin. NOOP is fine: bundled layers that actually
-            // observe the ctx (AllowListLayer, RateLimitLayer) are early-decode
-            // filters, not encoders.
             anyConfig.pipeline().encodeOutbound(LayerContext.NOOP, encodeBuf, wireBuf);
             wireBuf.flip();
 
-            // Fan out the pre-encoded bytes. No lambda capture.
-            broadcastWalker.prepare(wireBuf);
-            sessions.forEachActiveIndex(broadcastWalker);
-        }
-    }
-
-    /**
-     * Stateful primitive-spec visitor used by {@link #broadcastImpl}. Holds
-     * the pre-encoded wire bytes for the current broadcast and writes them
-     * to every active connection's channel. Shared single instance guarded
-     * by {@link #broadcastLock} — no per-call alloc.
-     */
-    private final class BroadcastWalker implements SessionStore.IndexVisitor {
-        private ByteBuffer wire;
-        private int wireStart;
-        private int wireEnd;
-
-        void prepare(ByteBuffer wireBuf) {
-            this.wire = wireBuf;
-            this.wireStart = wireBuf.position();
-            this.wireEnd = wireBuf.limit();
+            // Snapshot into a byte[] — each loop gets an independent read view
+            // via ByteBuffer.wrap. The byte[] is immutable after this point.
+            len = wireBuf.remaining();
+            if (len == 0) return;
+            snapshot = new byte[len];
+            wireBuf.get(snapshot);
         }
 
-        @Override
-        public void visit(int index, int generation) {
-            // Zero-alloc lookup: plain aaload on a primitive-indexed array.
-            // Previously this did ConnectionId.of(index, generation) +
-            // ConcurrentHashMap.get — the record escaped into the non-inlined
-            // CHM.get and could not be scalar-replaced (CLAUDE.md rule #3),
-            // costing 24 B/recipient. `generation` is unused here:
-            // forEachActiveIndex only yields currently-active slots so the
-            // slot→channel mapping is already filtered by liveness.
-            var channel = slotChannels[index];
-            if (channel == null || !channel.isConnected()) return;
-
-            // Rewind the buffer without allocating a duplicate — we own it
-            // for the whole fan-out and each writeFully consumes position→limit.
-            // limit() must be widened before position() is set if the buffer
-            // was fully consumed by the previous iteration.
-            wire.limit(wireEnd);
-            wire.position(wireStart);
-            synchronized (channel) {
-                writeFully(channel, wire);
-            }
+        // Submit to each worker loop outside the lock. Each loop writes only
+        // to its own connections (slot % loopCount == loopIndex). No cross-thread
+        // channel access, no broadcastLock contention during writes.
+        //
+        // Each submit creates a lambda capturing (snapshot, len, loopIndex,
+        // loopCount). That's one small Runnable per loop per broadcast —
+        // constant cost (e.g. 2-4), NOT per-recipient. Each lambda is
+        // independent, so back-to-back broadcasts never clobber each other.
+        int loopCount = workerGroup.size();
+        var slots = slotChannels;
+        int cap = sessions.capacity();
+        for (int li = 0; li < loopCount; li++) {
+            final int loopIndex = li;
+            final byte[] data = snapshot;
+            final int dataLen = len;
+            workerGroup.get(li).submit(() -> {
+                var buf = ByteBuffer.wrap(data, 0, dataLen);
+                for (int i = loopIndex; i < cap; i += loopCount) {
+                    var channel = slots[i];
+                    if (channel == null || !channel.isConnected()) continue;
+                    buf.position(0).limit(dataLen);
+                    synchronized (channel) {
+                        writeFully(channel, buf);
+                    }
+                }
+            });
         }
     }
 
