@@ -189,6 +189,7 @@ public final class Client implements AutoCloseable {
 
     private void connectTcp(ConnectionConfig config) throws IOException {
         var channel = SocketChannel.open();
+        channel.setOption(java.net.StandardSocketOptions.TCP_NODELAY, true);
         channel.configureBlocking(true);
         channel.connect(config.transport().address());
         channel.configureBlocking(false);

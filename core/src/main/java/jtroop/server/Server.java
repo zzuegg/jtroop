@@ -502,6 +502,7 @@ public final class Server implements AutoCloseable {
             return;
         }
         clientChannel.configureBlocking(false);
+        clientChannel.setOption(java.net.StandardSocketOptions.TCP_NODELAY, true);
         var connId = sessions.allocate();
         var readBuf = ByteBuffer.allocate(65536);
 
