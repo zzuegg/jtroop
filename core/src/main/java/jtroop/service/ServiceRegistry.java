@@ -37,10 +37,11 @@ public final class ServiceRegistry {
     private final List<LifecycleEntry> disconnectHandlers = new ArrayList<>();
 
     public ServiceRegistry(CodecRegistry codec) {
-        this.codec = codec;
+        this.codec = Objects.requireNonNull(codec, "parameter 'codec' must not be null");
     }
 
     public void register(Class<?> handlerClass) {
+        Objects.requireNonNull(handlerClass, "parameter 'handlerClass' must not be null");
         try {
             var ctor = handlerClass.getDeclaredConstructor();
             ctor.setAccessible(true);
@@ -53,6 +54,7 @@ public final class ServiceRegistry {
 
     @SuppressWarnings("unchecked")
     public void register(Object handlerInstance) {
+        Objects.requireNonNull(handlerInstance, "parameter 'handlerInstance' must not be null");
         var handlerClass = handlerInstance.getClass();
         var handles = handlerClass.getAnnotation(Handles.class);
         if (handles == null) {

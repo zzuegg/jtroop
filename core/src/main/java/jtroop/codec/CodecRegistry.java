@@ -104,6 +104,7 @@ public final class CodecRegistry {
     // Allocation-free access (no HashMap.get → Integer.valueOf), monomorphic aaload.
     private final CodecEntry[] byId = new CodecEntry[65536];
     public void register(Class<? extends Record> type) {
+        java.util.Objects.requireNonNull(type, "parameter 'type' must not be null");
         if (byClass.containsKey(type)) return;
         int id = stableTypeId(type);
         var components = buildComponentCodecs(type);

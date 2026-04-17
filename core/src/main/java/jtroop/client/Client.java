@@ -491,6 +491,7 @@ public final class Client implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public void send(Record message) {
+        Objects.requireNonNull(message, "parameter 'message' must not be null");
         var msgType = (Class<? extends Record>) message.getClass();
         // Fast path: one CHM.get, then pattern-match dispatch.
         var ctx = sendCache.get(msgType);
@@ -513,6 +514,7 @@ public final class Client implements AutoCloseable {
      */
     @SuppressWarnings("unchecked")
     public void sendViaTcp(Record message) {
+        Objects.requireNonNull(message, "parameter 'message' must not be null");
         var msgType = (Class<? extends Record>) message.getClass();
         var ctx = tcpSendCache.get(msgType);
         if (ctx != null) {
@@ -550,6 +552,7 @@ public final class Client implements AutoCloseable {
      */
     @SuppressWarnings("unchecked")
     public void sendViaUdp(Record message) {
+        Objects.requireNonNull(message, "parameter 'message' must not be null");
         var msgType = (Class<? extends Record>) message.getClass();
         var ctx = udpSendCache.get(msgType);
         if (ctx != null) {
@@ -735,6 +738,7 @@ public final class Client implements AutoCloseable {
      */
     @SuppressWarnings("unchecked")
     public void sendBlocking(Record message) {
+        Objects.requireNonNull(message, "parameter 'message' must not be null");
         // Phase 1: encode — small method, C2 inlines → record is scalar-replaced
         int encodedBytes = encodeToWire(message);
 
@@ -779,6 +783,8 @@ public final class Client implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public <T extends Record> T request(Record message, Class<T> responseType) {
+        Objects.requireNonNull(message, "parameter 'message' must not be null");
+        Objects.requireNonNull(responseType, "parameter 'responseType' must not be null");
         // Zero-alloc request: claim a slot in the flat ring, publish our
         // thread, send, park until reader stashes response bytes + unparks.
         // No CompletableFuture (waiter list alloc), no Map entry, no Integer
@@ -855,6 +861,7 @@ public final class Client implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public <T> T service(Class<T> serviceInterface) {
+        Objects.requireNonNull(serviceInterface, "parameter 'serviceInterface' must not be null");
         var existing = proxyCache.get(serviceInterface);
         if (existing != null) return (T) existing;
         // Typed hidden-class proxy: each void method becomes a concrete
@@ -887,6 +894,8 @@ public final class Client implements AutoCloseable {
      * @param newPipeline    replacement pipeline
      */
     public void switchPipeline(Class<? extends Record> connectionType, Pipeline newPipeline) {
+        Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
+        Objects.requireNonNull(newPipeline, "parameter 'newPipeline' must not be null");
         var oldConfig = configByType.get(connectionType);
         if (oldConfig == null) return;
         var newConfig = new ConnectionConfig(
@@ -899,6 +908,7 @@ public final class Client implements AutoCloseable {
      * primary connection. Useful in tests and one-connection clients.
      */
     public void switchPipeline(Pipeline newPipeline) {
+        Objects.requireNonNull(newPipeline, "parameter 'newPipeline' must not be null");
         if (configByType.size() != 1) {
             throw new ConfigurationException(
                     "Client has " + configByType.size() + " connections; use switchPipeline(connectionType, pipeline)");
@@ -955,6 +965,12 @@ public final class Client implements AutoCloseable {
         private java.util.concurrent.Executor executor;
 
         public Builder connect(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
+            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
+            Objects.requireNonNull(transport, "parameter 'transport' must not be null");
+            Objects.requireNonNull(layers, "parameter 'layers' must not be null");
+            for (int i = 0; i < layers.length; i++) {
+                Objects.requireNonNull(layers[i], "parameter 'layers[" + i + "]' must not be null");
+            }
             if (transport instanceof jtroop.transport.UdpTransport udp
                     && !udp.connected() && layers != null && layers.length > 0) {
                 throw new ConfigurationException(
@@ -969,6 +985,12 @@ public final class Client implements AutoCloseable {
 
         @SuppressWarnings("unchecked")
         public Builder connect(Record handshakeInstance, Transport transport, Layer... layers) {
+            Objects.requireNonNull(handshakeInstance, "parameter 'handshakeInstance' must not be null");
+            Objects.requireNonNull(transport, "parameter 'transport' must not be null");
+            Objects.requireNonNull(layers, "parameter 'layers' must not be null");
+            for (int i = 0; i < layers.length; i++) {
+                Objects.requireNonNull(layers[i], "parameter 'layers[" + i + "]' must not be null");
+            }
             var connType = (Class<? extends Record>) handshakeInstance.getClass();
             codec.register(connType);
             // Register nested Accepted record if present
@@ -983,6 +1005,8 @@ public final class Client implements AutoCloseable {
         }
 
         public Builder addService(Class<?> serviceInterface, Class<? extends Record> connectionType) {
+            Objects.requireNonNull(serviceInterface, "parameter 'serviceInterface' must not be null");
+            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
             for (var method : serviceInterface.getDeclaredMethods()) {
                 for (var paramType : method.getParameterTypes()) {
                     if (Record.class.isAssignableFrom(paramType)) {
@@ -1003,6 +1027,8 @@ public final class Client implements AutoCloseable {
 
         @SuppressWarnings("unchecked")
         public <T extends Record> Builder onMessage(Class<T> type, java.util.function.Consumer<T> handler) {
+            Objects.requireNonNull(type, "parameter 'type' must not be null");
+            Objects.requireNonNull(handler, "parameter 'handler' must not be null");
             codec.register(type);
             messageHandlers.put(type, (java.util.function.Consumer<Record>) (java.util.function.Consumer<?>) handler);
             return this;

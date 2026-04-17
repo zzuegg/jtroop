@@ -33,6 +33,7 @@ public final class AllowListLayer implements Layer {
     private final ConcurrentHashMap<Long, Boolean> decisions = new ConcurrentHashMap<>();
 
     public AllowListLayer(Set<InetAddress> allowed) {
+        java.util.Objects.requireNonNull(allowed, "parameter 'allowed' must not be null");
         this.allowed = Set.copyOf(allowed);
     }
 

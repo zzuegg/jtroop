@@ -65,6 +65,7 @@ public final class EncryptionLayer implements Layer {
     private final ThreadLocal<State> state = ThreadLocal.withInitial(State::new);
 
     public EncryptionLayer(SecretKey key) {
+        java.util.Objects.requireNonNull(key, "parameter 'key' must not be null");
         this.key = key;
         new SecureRandom().nextBytes(ivSalt);
     }

@@ -893,6 +893,8 @@ public final class Server implements AutoCloseable {
      * @param newPipeline replacement pipeline
      */
     public void switchPipeline(ConnectionId connId, Pipeline newPipeline) {
+        Objects.requireNonNull(connId, "parameter 'connId' must not be null");
+        Objects.requireNonNull(newPipeline, "parameter 'newPipeline' must not be null");
         var oldConfig = connectionConfig.get(connId);
         if (oldConfig == null) return; // connection already closed
         var newConfig = new ListenerConfig(
@@ -953,6 +955,12 @@ public final class Server implements AutoCloseable {
         private int eventLoops = 1;
 
         public Builder listen(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
+            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
+            Objects.requireNonNull(transport, "parameter 'transport' must not be null");
+            Objects.requireNonNull(layers, "parameter 'layers' must not be null");
+            for (int i = 0; i < layers.length; i++) {
+                Objects.requireNonNull(layers[i], "parameter 'layers[" + i + "]' must not be null");
+            }
             // Plan A for unconnected UDP: the pipeline is per-connection
             // (SequencingLayer, AckLayer, DuplicateFilterLayer all hold per-peer
             // state) but an unconnected DatagramChannel sees every peer on the
@@ -973,17 +981,23 @@ public final class Server implements AutoCloseable {
         @SuppressWarnings({"unchecked", "rawtypes"})
         public <T extends Record> Builder onHandshake(Class<T> connectionType,
                                                        java.util.function.Function<T, ? extends Record> handler) {
+            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
+            Objects.requireNonNull(handler, "parameter 'handler' must not be null");
             codec.register(connectionType);
             handshakeHandlers.put(connectionType, (java.util.function.Function) handler);
             return this;
         }
 
         public Builder addService(Class<?> handlerClass, Class<? extends Record> connectionType) {
+            Objects.requireNonNull(handlerClass, "parameter 'handlerClass' must not be null");
+            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
             serviceRegistry.register(handlerClass);
             return this;
         }
 
         public Builder addService(Object handlerInstance, Class<? extends Record> connectionType) {
+            Objects.requireNonNull(handlerInstance, "parameter 'handlerInstance' must not be null");
+            Objects.requireNonNull(connectionType, "parameter 'connectionType' must not be null");
             serviceRegistry.register(handlerInstance);
             return this;
         }

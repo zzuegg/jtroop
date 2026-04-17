@@ -6,6 +6,7 @@ import jtroop.generate.FusedPipelineGenerator.FusedPipeline;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Objects;
 
 /**
  * Ordered chain of {@link Layer}s applied to inbound / outbound bytes.
@@ -51,6 +52,10 @@ public final class Pipeline {
     private final FusedPipeline fused;
 
     public Pipeline(Layer... layers) {
+        Objects.requireNonNull(layers, "parameter 'layers' must not be null");
+        for (int i = 0; i < layers.length; i++) {
+            Objects.requireNonNull(layers[i], "parameter 'layers[" + i + "]' must not be null");
+        }
         this.layers = layers.clone();
         // Pre-allocate temp buffers for pipeline stages (one per layer)
         this.tempBuffers = new ByteBuffer[layers.length];
@@ -125,6 +130,7 @@ public final class Pipeline {
      * after STARTTLS negotiation.
      */
     public Pipeline addFirst(Layer layer) {
+        Objects.requireNonNull(layer, "parameter 'layer' must not be null");
         var out = new Layer[layers.length + 1];
         out[0] = layer;
         System.arraycopy(layers, 0, out, 1, layers.length);
@@ -137,6 +143,7 @@ public final class Pipeline {
      * stack.
      */
     public Pipeline addLast(Layer layer) {
+        Objects.requireNonNull(layer, "parameter 'layer' must not be null");
         var out = Arrays.copyOf(layers, layers.length + 1);
         out[layers.length] = layer;
         return new Pipeline(out);
@@ -148,6 +155,7 @@ public final class Pipeline {
      * returned unchanged.
      */
     public Pipeline remove(Class<? extends Layer> layerType) {
+        Objects.requireNonNull(layerType, "parameter 'layerType' must not be null");
         int idx = indexOf(layerType);
         if (idx < 0) return this;
         var out = new Layer[layers.length - 1];
@@ -164,6 +172,8 @@ public final class Pipeline {
      * {@link #addFirst}/{@link #addLast} for insertion).
      */
     public Pipeline replace(Class<? extends Layer> oldType, Layer newLayer) {
+        Objects.requireNonNull(oldType, "parameter 'oldType' must not be null");
+        Objects.requireNonNull(newLayer, "parameter 'newLayer' must not be null");
         int idx = indexOf(oldType);
         if (idx < 0) {
             throw new ConfigurationException(
