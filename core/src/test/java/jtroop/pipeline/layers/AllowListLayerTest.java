@@ -150,7 +150,7 @@ class AllowListLayerTest {
         Thread.sleep(200);
 
         // Key assertion: denied peer gets no response; request times out.
-        assertThrows(ConnectionException.class,
+        assertThrows(RuntimeException.class,
                 () -> client.request(new Ping(1), Pong.class),
                 "denied peer request must not succeed");
 

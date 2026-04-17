@@ -103,7 +103,7 @@ class DualTransportTest {
                 .addService(BadService.class, GameConn.class)
                 .build();
 
-        var ex = assertThrows(ConfigurationException.class,
+        var ex = assertThrows(IllegalArgumentException.class,
                 () -> client.service(BadService.class));
         assertTrue(ex.getMessage().contains("UDP"),
                 "Error should mention UDP; was: " + ex.getMessage());
