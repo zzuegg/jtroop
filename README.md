@@ -32,7 +32,10 @@ External load generator, "Hello, World!" responses. Same JDK 26, same box, TCP_N
 
 | Load | jtroop | Netty 4.2 | jtroop advantage |
 |------|-------:|----------:|-----------------:|
-| `wrk -t8 -c400 -d15s` | **2,066,934 req/s** | 1,466,934 req/s | +41% |
+| `wrk -t4 -c100 -d15s` | **1,179,032 req/s** | 1,099,491 req/s | +7.2% |
+| `wrk -t8 -c400 -d15s` | **2,022,389 req/s** | 1,756,998 req/s | +15.1% |
+| `wrk -t16 -c400 -d15s` | **3,267,139 req/s** | 2,660,802 req/s | +22.8% |
+| `wrk -t32 -c400 -d15s` | **3,560,165 req/s** | 2,777,301 req/s | +28.2% |
 
 ### UDP (game-shaped workload)
 
@@ -58,7 +61,8 @@ External load generator, "Hello, World!" responses. Same JDK 26, same box, TCP_N
 | chatMessage | **1.5×** faster | **33,000×** less |
 | mixedTraffic | **3.0×** faster | **37×** less |
 | positionUpdate_blocking | **15×** faster | **2,680×** less |
-| HTTP (wrk t8 c400) | **+41%** | — |
+| HTTP (wrk t8 c400) | **+15%** | — |
+| HTTP (wrk t32 c400) | **+28%** | — |
 
 ### Notes
 
