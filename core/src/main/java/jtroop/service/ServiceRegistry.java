@@ -26,6 +26,11 @@ public final class ServiceRegistry {
     // C2 to inline the full chain and scalar-replace injectables (CLAUDE.md
     // rule #3).
     private final Map<Class<? extends Record>, HandlerInvoker> handlers = new HashMap<>();
+    // Multi-handler support: when multiple handler classes register for the
+    // same message type, all invokers are collected here. dispatchAll() fans
+    // out to every registered invoker for a given type. The single-handler
+    // fast path (dispatch) still uses the primary handlers map above.
+    private final Map<Class<? extends Record>, List<HandlerInvoker>> multiHandlers = new HashMap<>();
     // Raw-buffer handlers opt-in via @ZeroAlloc. Indexed by u16 type id for a
     // direct aaload lookup on the inbound hot path (no HashMap, no autoboxing).
     // Size matches CodecRegistry.byId — 65536 refs = 512 KB worst case; unused
@@ -126,6 +131,7 @@ public final class ServiceRegistry {
                 // and scalar-replaced across.
                 var invoker = HandlerInvokerGenerator.generate(handlerInstance, m, msgType);
                 handlers.put(msgType, invoker);
+                multiHandlers.computeIfAbsent(msgType, _ -> new ArrayList<>()).add(invoker);
             }
         }
 
@@ -185,6 +191,33 @@ public final class ServiceRegistry {
     /** @return true iff a raw-buffer handler is registered for this type id */
     public boolean hasRawHandler(int typeId) {
         return rawHandlersById[typeId] != null;
+    }
+
+    /** @return true iff a record-path handler is registered for this message type */
+    public boolean hasHandler(Class<? extends Record> messageType) {
+        return handlers.containsKey(messageType);
+    }
+
+    /**
+     * Fan-out dispatch: invokes ALL registered handlers for the message type.
+     * Used by the client where multiple handler classes may register for the
+     * same message type. The server's hot path uses {@link #dispatch} which
+     * hits the single-handler fast path.
+     */
+    public void dispatchAll(Record message, ConnectionId sender) {
+        var invokers = multiHandlers.get(message.getClass());
+        if (invokers == null || invokers.isEmpty()) {
+            throw new ConfigurationException("No handler for message type: " + message.getClass().getName());
+        }
+        for (int i = 0, size = invokers.size(); i < size; i++) {
+            try {
+                invokers.get(i).invoke(message, sender, broadcast, unicast);
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Throwable e) {
+                throw new JtroopException("Dispatch failed for " + message.getClass().getName(), e);
+            }
+        }
     }
 
     public Object dispatch(Record message, ConnectionId sender) {

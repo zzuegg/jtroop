@@ -7,6 +7,8 @@ import jtroop.core.WriteBuffer;
 import jtroop.pipeline.Layer;
 import jtroop.pipeline.LayerContext;
 import jtroop.pipeline.Pipeline;
+import jtroop.service.ServiceRegistry;
+import jtroop.session.ConnectionId;
 import jtroop.transport.Transport;
 
 import java.io.IOException;
@@ -112,6 +114,10 @@ public final class Client implements AutoCloseable {
     private final ConcurrentHashMap<Class<? extends Record>, jtroop.generate.CodecClassGenerator.GeneratedCodec>
             responseCodecCache = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers;
+    private final ServiceRegistry handlerRegistry;
+    // Per-connection-type ConnectionId. Assigned during connect, used for
+    // injectable dispatch and lifecycle callbacks.
+    private final Map<Class<? extends Record>, ConnectionId> connectionIds = new ConcurrentHashMap<>();
     private final Map<Class<? extends Record>, Record> handshakeInstances;
     private final Map<Class<? extends Record>, CompletableFuture<Record>> handshakeResults = new ConcurrentHashMap<>();
     private final Set<Class<? extends Record>> handshakePending = ConcurrentHashMap.newKeySet();
@@ -157,11 +163,13 @@ public final class Client implements AutoCloseable {
                    Map<Class<? extends Record>, Class<? extends Record>> serviceToConnection,
                    Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers,
                    Map<Class<? extends Record>, Record> handshakeInstances,
+                   ServiceRegistry handlerRegistry,
                    java.util.concurrent.Executor executor) {
         this.connections = connections;
         this.codec = codec;
         this.serviceToConnection = serviceToConnection;
         this.messageHandlers = messageHandlers;
+        this.handlerRegistry = handlerRegistry;
         this.handshakeInstances = handshakeInstances;
         this.executor = executor != null ? executor : Runnable::run; // default: same thread
         for (var conn : connections) {
@@ -209,6 +217,8 @@ public final class Client implements AutoCloseable {
         } catch (IOException _) {}
         final var connTypeFinal = config.connectionType();
         long packedId = ((long) 1 << 32) | (slot & 0xFFFFFFFFL);
+        var connId = new ConnectionId(packedId);
+        connectionIds.put(connTypeFinal, connId);
         var ctx = new LayerContext(
                 packedId,
                 peer,
@@ -216,6 +226,11 @@ public final class Client implements AutoCloseable {
                 /* closeAfterFlush */ () -> closeConnection(connTypeFinal),
                 /* closeNow */        () -> closeConnection(connTypeFinal));
         contextsByType.put(connTypeFinal, ctx);
+
+        // Fire @OnConnect handlers
+        if (handlerRegistry != null) {
+            handlerRegistry.dispatchConnect(connId);
+        }
 
         // Send handshake if we have a handshake instance
         var hsInstance = handshakeInstances.get(config.connectionType());
@@ -358,6 +373,11 @@ public final class Client implements AutoCloseable {
                     var rb = new ReadBuffer(frame);
                     var message = codec.decode(rb);
                     pushHandler.accept(message);
+                } else if (handlerRegistry != null && handlerRegistry.hasHandler(msgType)) {
+                    var rb = new ReadBuffer(frame);
+                    var message = codec.decode(rb);
+                    var connId = connectionIds.get(config.connectionType());
+                    handlerRegistry.dispatchAll(message, connId != null ? connId : ConnectionId.INVALID);
                 } else {
                     // No push handler — stash frame bytes for a pending waiter
                     // (request/response over UDP).
@@ -377,6 +397,13 @@ public final class Client implements AutoCloseable {
         if (n == -1) {
             key.cancel();
             channel.close();
+            // Fire @OnDisconnect handlers
+            if (handlerRegistry != null) {
+                var connId = connectionIds.get(config.connectionType());
+                if (connId != null) {
+                    handlerRegistry.dispatchDisconnect(connId);
+                }
+            }
             return;
         }
         if (n > 0) {
@@ -410,6 +437,13 @@ public final class Client implements AutoCloseable {
                     var rb = new ReadBuffer(frame);
                     var message = codec.decode(rb);
                     pushHandler.accept(message);
+                } else if (handlerRegistry != null && msgType != null
+                        && handlerRegistry.hasHandler(msgType)) {
+                    // Dispatch through @OnMessage handler (addHandler path)
+                    var rb = new ReadBuffer(frame);
+                    var message = codec.decode(rb);
+                    var connId = connectionIds.get(config.connectionType());
+                    handlerRegistry.dispatchAll(message, connId != null ? connId : ConnectionId.INVALID);
                 } else {
                     stashResponseFrame(frame);
                 }
@@ -988,6 +1022,13 @@ public final class Client implements AutoCloseable {
      * Close a specific connection (by type). Remaining connections stay open.
      */
     public void closeConnection(Class<? extends Record> connectionType) {
+        // Fire @OnDisconnect before tearing down the channel
+        if (handlerRegistry != null) {
+            var connId = connectionIds.remove(connectionType);
+            if (connId != null) {
+                handlerRegistry.dispatchDisconnect(connId);
+            }
+        }
         var channel = channels.remove(connectionType);
         if (channel != null) {
             try { channel.close(); } catch (IOException _) {}
@@ -1007,6 +1048,13 @@ public final class Client implements AutoCloseable {
     public void close() {
         if (closed) return;
         closed = true;
+        // Fire @OnDisconnect for all active connections before tearing down
+        if (handlerRegistry != null) {
+            for (var entry : connectionIds.entrySet()) {
+                handlerRegistry.dispatchDisconnect(entry.getValue());
+            }
+            connectionIds.clear();
+        }
         for (var channel : channels.values()) {
             try { channel.close(); } catch (IOException _) {}
         }
@@ -1034,6 +1082,7 @@ public final class Client implements AutoCloseable {
         private final Map<Class<? extends Record>, Class<? extends Record>> serviceToConnection = new HashMap<>();
         private final Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers = new HashMap<>();
         private final Map<Class<? extends Record>, Record> handshakeInstances = new HashMap<>();
+        private ServiceRegistry handlerRegistry;
         private java.util.concurrent.Executor executor;
 
         public Builder connect(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
@@ -1090,6 +1139,23 @@ public final class Client implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Register a handler class with annotated {@code @OnMessage},
+         * {@code @OnConnect}, and {@code @OnDisconnect} methods for inbound
+         * dispatch. Uses the same {@link ServiceRegistry} infrastructure as
+         * the server. Multiple handlers can be registered; all receive events.
+         *
+         * @param handlerInstance the handler instance (must be annotated with {@code @Handles})
+         * @param connectionType the connection type this handler is associated with
+         */
+        public Builder addHandler(Object handlerInstance, Class<? extends Record> connectionType) {
+            if (handlerRegistry == null) {
+                handlerRegistry = new ServiceRegistry(codec);
+            }
+            handlerRegistry.register(handlerInstance);
+            return this;
+        }
+
         public Builder executor(java.util.concurrent.Executor executor) {
             this.executor = executor;
             return this;
@@ -1098,7 +1164,7 @@ public final class Client implements AutoCloseable {
         public Client build() {
             return new Client(List.copyOf(connections), codec, Map.copyOf(serviceToConnection),
                     Map.copyOf(messageHandlers), Map.copyOf(handshakeInstances),
-                    executor);
+                    handlerRegistry, executor);
         }
     }
 }
