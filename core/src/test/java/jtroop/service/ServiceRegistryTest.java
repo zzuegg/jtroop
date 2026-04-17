@@ -141,13 +141,17 @@ class ServiceRegistryTest {
     }
 
     @Test
-    void datagram_annotation_detectedOnInterface() {
-        var codec = new CodecRegistry();
-        var registry = new ServiceRegistry(codec);
-        registry.register(new ChatHandler());
-
-        assertTrue(registry.isDatagram(TypingIndicator.class));
-        assertFalse(registry.isDatagram(ChatMessage.class));
+    void datagram_annotation_presentOnInterfaceMethod() {
+        // @Datagram is now resolved at proxy generation time, not in the
+        // registry. Verify it's still readable via reflection on the
+        // service interface.
+        boolean found = false;
+        for (var m : ChatService.class.getDeclaredMethods()) {
+            if (m.getName().equals("typing") && m.isAnnotationPresent(Datagram.class)) {
+                found = true;
+            }
+        }
+        assertTrue(found, "@Datagram should be present on ChatService.typing");
     }
 
     @Test

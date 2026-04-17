@@ -230,8 +230,9 @@ class FullIntegrationTest {
         Thread.sleep(300);
 
         // Send 100 position updates through forwarder with 30% loss
+        MovementService move = client.service(MovementService.class);
         for (int i = 0; i < 100; i++) {
-            client.send(new PositionUpdate(i, i, i, 0));
+            move.position(new PositionUpdate(i, i, i, 0));
             Thread.sleep(5); // small gap between sends
         }
 

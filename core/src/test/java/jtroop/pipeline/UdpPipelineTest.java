@@ -106,8 +106,10 @@ class UdpPipelineTest {
         client.start();
         Thread.sleep(200);
 
+        // Use service proxy — @Datagram routes to sendViaUdp
+        GameService svc = client.service(GameService.class);
         for (int i = 0; i < 5; i++) {
-            client.send(new Ping(i));
+            svc.ping(new Ping(i));
             // Small throttle — UDP on loopback will drop packets sent tighter
             // than the kernel recv buffer drain rate. The benchmark already
             // shows this under sustained load.
@@ -163,8 +165,9 @@ class UdpPipelineTest {
         Thread.sleep(200);
 
         handler.latch = new CountDownLatch(1);
+        GameService svc2 = client.service(GameService.class);
         for (int i = 0; i < 3; i++) {
-            client.send(new Ping(i));
+            svc2.ping(new Ping(i));
         }
         // Packets should be dropped — latch never reaches 0.
         boolean received = handler.latch.await(1, TimeUnit.SECONDS);
@@ -214,8 +217,9 @@ class UdpPipelineTest {
         client.start();
         Thread.sleep(200);
 
+        GameService svc3 = client.service(GameService.class);
         for (int i = 0; i < count; i++) {
-            client.send(new Ping(i));
+            svc3.ping(new Ping(i));
             // Pace sends. AckLayer retransmit is not driven by the pipeline
             // — a bidirectional protocol or a periodic driver would supply
             // retransmits on the next inbound packet, but this test is
@@ -270,7 +274,8 @@ class UdpPipelineTest {
         Thread.sleep(200);
 
         handler.latch = new CountDownLatch(1);
-        client.send(new Ping(42));
+        GameService svc4 = client.service(GameService.class);
+        svc4.ping(new Ping(42));
         assertTrue(handler.latch.await(2, TimeUnit.SECONDS));
         assertEquals(42, handler.received.get(0).seq());
 

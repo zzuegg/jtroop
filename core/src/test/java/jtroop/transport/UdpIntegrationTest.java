@@ -59,7 +59,9 @@ class UdpIntegrationTest {
         client.start();
         Thread.sleep(300);
 
-        client.send(new FastUpdate(1.0f, 2.0f));
+        // Use service proxy — @Datagram routes to UDP via sendViaUdp
+        GameService svc = client.service(GameService.class);
+        svc.update(new FastUpdate(1.0f, 2.0f));
         assertTrue(handler.updateLatch.await(2, TimeUnit.SECONDS));
         assertEquals(1.0f, handler.updates.getFirst().x());
 
@@ -87,13 +89,16 @@ class UdpIntegrationTest {
         client.start();
         Thread.sleep(300);
 
-        // Non-datagram → TCP
-        client.send(new ReliableCmd(1));
+        // Use service proxy for per-method transport routing
+        GameService svc = client.service(GameService.class);
+
+        // Non-datagram → TCP via sendViaTcp
+        svc.command(new ReliableCmd(1));
         assertTrue(handler.cmdLatch.await(2, TimeUnit.SECONDS));
         assertEquals(1, handler.commands.size());
 
-        // @Datagram → UDP
-        client.send(new FastUpdate(3.0f, 4.0f));
+        // @Datagram → UDP via sendViaUdp
+        svc.update(new FastUpdate(3.0f, 4.0f));
         assertTrue(handler.updateLatch.await(2, TimeUnit.SECONDS));
         assertEquals(1, handler.updates.size());
 

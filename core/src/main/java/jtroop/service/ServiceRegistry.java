@@ -31,7 +31,6 @@ public final class ServiceRegistry {
     private final RawHandlerInvoker[] rawHandlersById = new RawHandlerInvoker[65536];
     private final Map<Class<?>, Class<?>> handlerToInterface = new HashMap<>();
     private final Map<Class<?>, Set<Class<? extends Record>>> interfaceToMessageTypes = new HashMap<>();
-    private final Set<Class<? extends Record>> datagramTypes = new HashSet<>();
     private final List<LifecycleEntry> connectHandlers = new ArrayList<>();
     private final List<LifecycleEntry> disconnectHandlers = new ArrayList<>();
 
@@ -61,18 +60,6 @@ public final class ServiceRegistry {
         var serviceInterface = handles.value();
         handlerToInterface.put(handlerClass, serviceInterface);
         var messageTypes = interfaceToMessageTypes.computeIfAbsent(serviceInterface, _ -> new HashSet<>());
-
-        // Scan service interface for @Datagram annotations — collect the first
-        // Record parameter TYPE (not the method name). This binds transport
-        // routing to the message record type, keeping the entire dispatch model
-        // uniform: record type → handler, record type → codec, record type →
-        // transport. Handler method names are irrelevant.
-        var datagramRecordTypes = new HashSet<Class<?>>();
-        for (Method m : serviceInterface.getDeclaredMethods()) {
-            if (m.isAnnotationPresent(Datagram.class) && m.getParameterCount() > 0) {
-                datagramRecordTypes.add(m.getParameterTypes()[0]);
-            }
-        }
 
         // Scan handler methods for @OnMessage
         var lookup = MethodHandles.lookup();
@@ -121,11 +108,6 @@ public final class ServiceRegistry {
             // Register return type if it's a Record (response type)
             if (Record.class.isAssignableFrom(m.getReturnType()) && m.getReturnType() != void.class) {
                 codec.register((Class<? extends Record>) m.getReturnType());
-            }
-
-            // Check if this message's record type is @Datagram on the interface
-            if (datagramRecordTypes.contains(msgType)) {
-                datagramTypes.add(msgType);
             }
 
             if (zeroAlloc != null) {
@@ -236,10 +218,6 @@ public final class ServiceRegistry {
                 throw new RuntimeException("OnDisconnect dispatch failed", e);
             }
         }
-    }
-
-    public boolean isDatagram(Class<? extends Record> messageType) {
-        return datagramTypes.contains(messageType);
     }
 
     public Class<?> serviceInterface(Class<?> handlerClass) {

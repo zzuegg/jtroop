@@ -56,6 +56,7 @@ public class NetUdpBenchmark {
     // ---- fire-and-forget UDP via Client/Server ----
     private Server server;
     private Client client;
+    private GameService gameSvc;
 
     // ---- raw reliable-UDP state ----
     private DatagramChannel sendChannel;
@@ -91,6 +92,7 @@ public class NetUdpBenchmark {
                 .build();
         client.start();
         Thread.sleep(200);
+        gameSvc = client.service(GameService.class);
 
         // --- reliable UDP raw setup: sender + receiver on localhost ---
         recvChannel = DatagramChannel.open();
@@ -140,7 +142,7 @@ public class NetUdpBenchmark {
      */
     @Benchmark
     public void udpPositionUpdate() {
-        client.send(new PositionUpdate(1.0f, 2.0f, 3.0f, 0.5f));
+        gameSvc.position(new PositionUpdate(1.0f, 2.0f, 3.0f, 0.5f));
     }
 
     /**

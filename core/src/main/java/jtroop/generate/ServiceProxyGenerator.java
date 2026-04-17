@@ -1,5 +1,7 @@
 package jtroop.generate;
 
+import jtroop.service.Datagram;
+
 import java.lang.classfile.ClassFile;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
@@ -7,30 +9,28 @@ import java.lang.constant.MethodTypeDesc;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 import java.util.function.BiFunction;
-import java.util.function.Consumer;
 
 import static java.lang.classfile.ClassFile.*;
 
 /**
  * Generates a hidden class implementing a user-defined service interface and
- * forwarding each method directly to the client's typed {@code send}/{@code request}
- * callbacks. Replaces {@link java.lang.reflect.Proxy}, which allocates an
- * {@code Object[] args} array per invocation and forces reflective dispatch.
+ * forwarding each method directly to the client's typed
+ * {@code sendViaTcp}/{@code sendViaUdp}/{@code request} methods. Replaces
+ * {@link java.lang.reflect.Proxy}, which allocates an {@code Object[] args}
+ * array per invocation and forces reflective dispatch.
  *
- * <p>The generated class takes two targets:
- * <ul>
- *   <li>{@link Consumer} — receives void-returning calls (fire-and-forget)</li>
- *   <li>{@link BiFunction} — receives {@code Record} request-response calls
- *       and returns the typed reply</li>
- * </ul>
- *
- * <p>Each service method becomes a thin stub: push message, invokeinterface on
- * the cached target, (optionally) checkcast and return. Zero per-call
- * allocation; monomorphic call sites inline across.
+ * <p>The generated class holds a reference to the {@code Client} instance and
+ * a {@link BiFunction} for request-response calls. Each void method becomes a
+ * thin stub that pushes the message argument and calls either
+ * {@code client.sendViaTcp(Record)} or {@code client.sendViaUdp(Record)}
+ * depending on whether the interface method carries {@link Datagram @Datagram}.
+ * Zero per-call allocation; monomorphic call sites inline across.
  */
 public final class ServiceProxyGenerator {
 
-    private static final ClassDesc CD_Consumer = ClassDesc.of("java.util.function.Consumer");
+    // Client is in jtroop.client — use its descriptor for invokevirtual.
+    private static final ClassDesc CD_Client = ClassDesc.of("jtroop.client.Client");
+    private static final ClassDesc CD_Record = ClassDesc.of("java.lang.Record");
     private static final ClassDesc CD_BiFunction = ClassDesc.of("java.util.function.BiFunction");
     private static final ClassDesc CD_Object = ConstantDescs.CD_Object;
     private static final ClassDesc CD_Class = ClassDesc.of("java.lang.Class");
@@ -43,7 +43,8 @@ public final class ServiceProxyGenerator {
      * @param serviceInterface interface to implement (all methods must take a
      *                         single {@code Record}-typed argument and return
      *                         either {@code void} or a {@code Record} subtype)
-     * @param sendTarget       consumer invoked for void-returning methods
+     * @param client           the Client instance — void methods call
+     *                         {@code sendViaTcp} or {@code sendViaUdp} on it
      * @param requestTarget    bi-function invoked for record-returning methods:
      *                         args are (Record message, Class&lt;? extends Record&gt; responseType)
      *                         and must return a Record
@@ -52,7 +53,7 @@ public final class ServiceProxyGenerator {
      */
     @SuppressWarnings("unchecked")
     public static <T> T generate(Class<T> serviceInterface,
-                                 Consumer<Record> sendTarget,
+                                 Object client,
                                  BiFunction<Record, Class<?>, Record> requestTarget) {
         if (!serviceInterface.isInterface()) {
             throw new IllegalArgumentException(
@@ -81,10 +82,19 @@ public final class ServiceProxyGenerator {
 
         Method[] methods = serviceInterface.getMethods();
 
+        // Validate: @Datagram on non-void method is an error.
+        for (Method m : methods) {
+            if (m.isAnnotationPresent(Datagram.class) && m.getReturnType() != void.class) {
+                throw new IllegalArgumentException(
+                        "Request/response over UDP is not supported — UDP doesn't guarantee delivery. "
+                                + "Method: " + serviceInterface.getName() + "." + m.getName());
+            }
+        }
+
         byte[] bytes = ClassFile.of().build(thisDesc, cb -> {
             cb.withFlags(ACC_PUBLIC | ACC_FINAL);
             cb.withInterfaceSymbols(ifaceDesc);
-            cb.withField("send", CD_Consumer, ACC_PRIVATE | ACC_FINAL);
+            cb.withField("client", CD_Client, ACC_PRIVATE | ACC_FINAL);
             cb.withField("request", CD_BiFunction, ACC_PRIVATE | ACC_FINAL);
             // A Class<?> field per request-returning method so we don't LDC
             // the class via name at dispatch time (avoids forName path).
@@ -95,15 +105,15 @@ public final class ServiceProxyGenerator {
                 }
             }
 
-            // Constructor: (Consumer, BiFunction, Class[])
+            // Constructor: (Client, BiFunction, Class[])
             var ctorDesc = MethodTypeDesc.of(ConstantDescs.CD_void,
-                    CD_Consumer, CD_BiFunction, CD_Class.arrayType());
+                    CD_Client, CD_BiFunction, CD_Class.arrayType());
             cb.withMethodBody(ConstantDescs.INIT_NAME, ctorDesc, ACC_PUBLIC, b -> {
                 b.aload(0);
                 b.invokespecial(CD_Object, ConstantDescs.INIT_NAME, ConstantDescs.MTD_void);
                 b.aload(0);
                 b.aload(1);
-                b.putfield(thisDesc, "send", CD_Consumer);
+                b.putfield(thisDesc, "client", CD_Client);
                 b.aload(0);
                 b.aload(2);
                 b.putfield(thisDesc, "request", CD_BiFunction);
@@ -147,6 +157,7 @@ public final class ServiceProxyGenerator {
                         : ConstantDescs.CD_void;
                 var methodDesc = MethodTypeDesc.of(returnDesc, paramDesc);
                 final int methodIndex = i;
+                boolean isDatagram = m.isAnnotationPresent(Datagram.class);
 
                 cb.withMethodBody(m.getName(), methodDesc, ACC_PUBLIC, b -> {
                     if (hasReturn) {
@@ -160,13 +171,21 @@ public final class ServiceProxyGenerator {
                                 MethodTypeDesc.of(CD_Object, CD_Object, CD_Object));
                         b.checkcast(returnDesc);
                         b.areturn();
-                    } else {
-                        // send.accept(msg); return;
+                    } else if (isDatagram) {
+                        // client.sendViaUdp(msg); return;
                         b.aload(0);
-                        b.getfield(thisDesc, "send", CD_Consumer);
-                        b.aload(1);
-                        b.invokeinterface(CD_Consumer, "accept",
-                                MethodTypeDesc.of(ConstantDescs.CD_void, CD_Object));
+                        b.getfield(thisDesc, "client", CD_Client);
+                        b.aload(1); // message (concrete Record subtype)
+                        b.invokevirtual(CD_Client, "sendViaUdp",
+                                MethodTypeDesc.of(ConstantDescs.CD_void, CD_Record));
+                        b.return_();
+                    } else {
+                        // client.sendViaTcp(msg); return;
+                        b.aload(0);
+                        b.getfield(thisDesc, "client", CD_Client);
+                        b.aload(1); // message (concrete Record subtype)
+                        b.invokevirtual(CD_Client, "sendViaTcp",
+                                MethodTypeDesc.of(ConstantDescs.CD_void, CD_Record));
                         b.return_();
                     }
                 });
@@ -177,13 +196,13 @@ public final class ServiceProxyGenerator {
             var hiddenClass = lookup.defineHiddenClass(bytes, true,
                     MethodHandles.Lookup.ClassOption.NESTMATE);
             var ctor = hiddenClass.lookupClass().getDeclaredConstructor(
-                    Consumer.class, BiFunction.class, Class[].class);
+                    client.getClass(), BiFunction.class, Class[].class);
 
             Class<?>[] returnTypes = new Class<?>[methods.length];
             for (int i = 0; i < methods.length; i++) {
                 returnTypes[i] = methods[i].getReturnType();
             }
-            return (T) ctor.newInstance(sendTarget, requestTarget, returnTypes);
+            return (T) ctor.newInstance(client, requestTarget, returnTypes);
         } catch (Exception e) {
             throw new RuntimeException("Failed to generate service proxy for "
                     + serviceInterface.getName(), e);

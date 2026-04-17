@@ -7,7 +7,6 @@ import jtroop.core.WriteBuffer;
 import jtroop.pipeline.Layer;
 import jtroop.pipeline.LayerContext;
 import jtroop.pipeline.Pipeline;
-import jtroop.service.ServiceRegistry;
 import jtroop.transport.Transport;
 
 import java.io.IOException;
@@ -22,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BiFunction;
 
 public final class Client implements AutoCloseable {
 
@@ -64,7 +64,6 @@ public final class Client implements AutoCloseable {
     // pipeline call on the connection's hot path.
     private final Map<Class<? extends Record>, LayerContext> contextsByType = new ConcurrentHashMap<>();
     private final java.util.concurrent.Executor executor;
-    private final Set<Class<? extends Record>> datagramMessageTypes;
 
     // Slot-based pending request ring. Zero-allocation request/response:
     //  - request(): atomic-claim a slot, publish thread, park.
@@ -144,6 +143,11 @@ public final class Client implements AutoCloseable {
     // publication from the first-send thread; subsequent reads are a single
     // volatile load + pointer chase (no hashing, no equals).
     private final ConcurrentHashMap<Class<? extends Record>, SendCtx> sendCache = new ConcurrentHashMap<>();
+    // Separate caches for sendViaTcp / sendViaUdp so the same record type can
+    // appear in both without collision. Each cache is populated lazily on first
+    // call and thereafter is a single CHM.get on the hot path.
+    private final ConcurrentHashMap<Class<? extends Record>, SendCtx.Tcp> tcpSendCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Class<? extends Record>, SendCtx.Udp> udpSendCache = new ConcurrentHashMap<>();
 
     private int nextSlot = 0;
 
@@ -151,14 +155,12 @@ public final class Client implements AutoCloseable {
                    Map<Class<? extends Record>, Class<? extends Record>> serviceToConnection,
                    Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers,
                    Map<Class<? extends Record>, Record> handshakeInstances,
-                   Set<Class<? extends Record>> datagramMessageTypes,
                    java.util.concurrent.Executor executor) {
         this.connections = connections;
         this.codec = codec;
         this.serviceToConnection = serviceToConnection;
         this.messageHandlers = messageHandlers;
         this.handshakeInstances = handshakeInstances;
-        this.datagramMessageTypes = datagramMessageTypes;
         this.executor = executor != null ? executor : Runnable::run; // default: same thread
         for (var conn : connections) {
             if (conn.transport().isUdp()) {
@@ -503,6 +505,74 @@ public final class Client implements AutoCloseable {
     }
 
     /**
+     * Send a message explicitly via TCP. Called by generated service proxies for
+     * non-{@code @Datagram} void methods. Uses a dedicated TCP cache so the same
+     * record type can also have a UDP cache entry without collision.
+     *
+     * <p>Not intended for direct use — only the generated service proxy calls this.
+     */
+    @SuppressWarnings("unchecked")
+    public void sendViaTcp(Record message) {
+        var msgType = (Class<? extends Record>) message.getClass();
+        var ctx = tcpSendCache.get(msgType);
+        if (ctx != null) {
+            sendTcpFast(message, ctx);
+            return;
+        }
+        // Cold path: resolve TCP connection, encode, stage, populate cache.
+        int encodedBytes = encodeToWire(message);
+        if (encodedBytes > 0) {
+            var connType = resolveConnection(msgType);
+            var slot = channelSlots.get(connType);
+            if (slot != null) {
+                eventLoop.stageWrite(slot, wireBuf.get());
+                var config = configByType.get(connType);
+                var lctx = contextsByType.get(connType);
+                Layer.Context lc = lctx != null ? lctx : LayerContext.NOOP;
+                var encoder = codec.resolveEncoder((Class<? extends Record>) msgType);
+                boolean singleFraming = config.pipeline().size() == 1
+                        && config.layers() != null
+                        && config.layers().length == 1
+                        && config.layers()[0] instanceof jtroop.pipeline.layers.FramingLayer;
+                tcpSendCache.put(msgType, new SendCtx.Tcp(
+                        slot, config.pipeline().fused(), lc,
+                        encoder.fixedPayloadSize(), singleFraming));
+            }
+        }
+    }
+
+    /**
+     * Send a message explicitly via UDP. Called by generated service proxies for
+     * {@code @Datagram} void methods. Uses a dedicated UDP cache so the same
+     * record type can also have a TCP cache entry without collision.
+     *
+     * <p>Not intended for direct use — only the generated service proxy calls this.
+     */
+    @SuppressWarnings("unchecked")
+    public void sendViaUdp(Record message) {
+        var msgType = (Class<? extends Record>) message.getClass();
+        var ctx = udpSendCache.get(msgType);
+        if (ctx != null) {
+            sendUdpFast(message, ctx);
+            return;
+        }
+        // Cold path: resolve UDP connection, encode, send, populate cache.
+        var connType = resolveConnection(msgType);
+        var ch = udpChannels.get(connType);
+        if (ch == null) {
+            throw new IllegalStateException("No UDP connection for " + msgType.getName());
+        }
+        var cfg = udpConfigByType.get(connType);
+        boolean hasLayers = cfg != null && cfg.pipeline().size() > 0;
+        var lctx = contextsByType.get(connType);
+        Layer.Context lc = lctx != null ? lctx : LayerContext.NOOP;
+        var fused = cfg != null ? cfg.pipeline().fused() : null;
+        var udpCtx = new SendCtx.Udp(ch, fused, lc, hasLayers, connType);
+        udpSendCache.put(msgType, udpCtx);
+        sendUdpFast(message, udpCtx);
+    }
+
+    /**
      * Hot TCP send with all references pre-resolved (zero map lookups).
      *
      * <p>For fixed-size messages with a single FramingLayer, the encode path
@@ -544,28 +614,12 @@ public final class Client implements AutoCloseable {
         }
     }
 
-    /** Slow path: first-time cache population for TCP or UDP. Runs once per
+    /** Slow path: first-time cache population for TCP. Runs once per
      *  message type; subsequent sends hit the unified {@link #sendCache}. */
     @SuppressWarnings("unchecked")
     private void sendCold(Record message, Class<? extends Record> msgType) {
-        // Try UDP first (datagram types are known at build time).
-        if (datagramMessageTypes.contains(msgType)) {
-            var connType = resolveConnection(msgType);
-            var ch = udpChannels.get(connType);
-            if (ch == null) {
-                throw new IllegalStateException("No UDP connection for " + msgType.getName());
-            }
-            var cfg = udpConfigByType.get(connType);
-            boolean hasLayers = cfg != null && cfg.pipeline().size() > 0;
-            var lctx = contextsByType.get(connType);
-            Layer.Context lc = lctx != null ? lctx : LayerContext.NOOP;
-            var fused = cfg != null ? cfg.pipeline().fused() : null;
-            var udpCtx = new SendCtx.Udp(ch, fused, lc, hasLayers, connType);
-            sendCache.put(msgType, udpCtx);
-            sendUdpFast(message, udpCtx);
-            return;
-        }
-        // TCP path.
+        // Default send() always routes via TCP. The proxy generator directs
+        // @Datagram methods to sendViaUdp instead — sendCold is TCP-only now.
         int encodedBytes = encodeToWire(message);
         if (encodedBytes > 0) {
             var connType = resolveConnection(msgType);
@@ -793,21 +847,22 @@ public final class Client implements AutoCloseable {
     }
 
     private final Map<Class<?>, Object> proxyCache = new HashMap<>();
-    // Stable Consumer/BiFunction instances bound once; hands off to generated
-    // service proxies. Allocated once per Client → no per-call lambda capture.
-    private final java.util.function.Consumer<Record> sendFn = this::send;
-    private final java.util.function.BiFunction<Record, Class<?>, Record> requestFn =
+    // Stable BiFunction bound once; hands off to generated service proxies
+    // for request/response methods. Allocated once per Client → no per-call
+    // lambda capture.
+    private final BiFunction<Record, Class<?>, Record> requestFn =
             (msg, rt) -> request(msg, (Class<? extends Record>) rt);
 
     @SuppressWarnings("unchecked")
     public <T> T service(Class<T> serviceInterface) {
         var existing = proxyCache.get(serviceInterface);
         if (existing != null) return (T) existing;
-        // Typed hidden-class proxy: each service method becomes a concrete
-        // bytecode stub that forwards to sendFn / requestFn. No JDK Proxy,
-        // no per-call Object[] args, no reflective dispatch.
+        // Typed hidden-class proxy: each void method becomes a concrete
+        // bytecode stub that calls client.sendViaTcp or client.sendViaUdp
+        // depending on @Datagram. Request/response uses the BiFunction.
+        // No JDK Proxy, no per-call Object[] args, no reflective dispatch.
         T proxy = jtroop.generate.ServiceProxyGenerator.generate(
-                serviceInterface, sendFn, requestFn);
+                serviceInterface, this, requestFn);
         proxyCache.put(serviceInterface, proxy);
         return proxy;
     }
@@ -899,7 +954,6 @@ public final class Client implements AutoCloseable {
         private final Map<Class<? extends Record>, Class<? extends Record>> serviceToConnection = new HashMap<>();
         private final Map<Class<? extends Record>, java.util.function.Consumer<Record>> messageHandlers = new HashMap<>();
         private final Map<Class<? extends Record>, Record> handshakeInstances = new HashMap<>();
-        private final Set<Class<? extends Record>> datagramMessageTypes = new HashSet<>();
         private java.util.concurrent.Executor executor;
 
         public Builder connect(Class<? extends Record> connectionType, Transport transport, Layer... layers) {
@@ -932,14 +986,12 @@ public final class Client implements AutoCloseable {
 
         public Builder addService(Class<?> serviceInterface, Class<? extends Record> connectionType) {
             for (var method : serviceInterface.getDeclaredMethods()) {
-                boolean isDatagram = method.isAnnotationPresent(jtroop.service.Datagram.class);
                 for (var paramType : method.getParameterTypes()) {
                     if (Record.class.isAssignableFrom(paramType)) {
                         @SuppressWarnings("unchecked")
                         var recordType = (Class<? extends Record>) paramType;
                         codec.register(recordType);
                         serviceToConnection.put(recordType, connectionType);
-                        if (isDatagram) datagramMessageTypes.add(recordType);
                     }
                 }
                 if (Record.class.isAssignableFrom(method.getReturnType())) {
@@ -965,7 +1017,7 @@ public final class Client implements AutoCloseable {
 
         public Client build() {
             return new Client(List.copyOf(connections), codec, Map.copyOf(serviceToConnection),
-                    Map.copyOf(messageHandlers), Map.copyOf(handshakeInstances), Set.copyOf(datagramMessageTypes),
+                    Map.copyOf(messageHandlers), Map.copyOf(handshakeInstances),
                     executor);
         }
     }
