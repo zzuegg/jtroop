@@ -33,7 +33,11 @@ import java.nio.ByteBuffer;
  */
 public final class AckLayer implements Layer {
 
-    private final long retransmitTimeoutNanos;
+    /** Default number of retransmit attempts before a packet is dropped. */
+    public static final int DEFAULT_MAX_RETRIES = 10;
+
+    private final long baseTimeoutNanos;
+    private final int maxRetries;
 
     private int sendSeq = 0;
     private int lastAckedSeq = -1;   // highest seq acknowledged by peer
@@ -43,20 +47,41 @@ public final class AckLayer implements Layer {
     // Slots are recycled when processAck matches.
     private static final int INITIAL_CAPACITY = 64;
     private static final int MAX_PAYLOAD_PER_SLOT = 1500; // MTU-sized datagrams
+    /** Cap the backoff doubling so retries don't stretch beyond ~64×base. */
+    private static final int MAX_BACKOFF_SHIFT = 6;
+
     private int[] unackSeqs = new int[INITIAL_CAPACITY];
-    private long[] unackSentAtNanos = new long[INITIAL_CAPACITY];
+    /** When the slot is next eligible for retransmit (nanos, absolute). */
+    private long[] unackNextRetryAt = new long[INITIAL_CAPACITY];
+    /** How many retransmits this slot has already emitted. */
+    private byte[] unackRetries = new byte[INITIAL_CAPACITY];
     private int[] unackLengths = new int[INITIAL_CAPACITY];
     // Flat payload store: slot i occupies bytes [i*MAX_PAYLOAD_PER_SLOT,
     // i*MAX_PAYLOAD_PER_SLOT + lengths[i]). One allocation at construction time.
     private byte[] unackPayloads = new byte[INITIAL_CAPACITY * MAX_PAYLOAD_PER_SLOT];
     private int unackCount = 0;
+    /** Cumulative count of packets dropped because their retry budget was
+     *  exhausted. Callers use this to decide whether to tear down the
+     *  connection. Never resets. */
+    private int exhaustedCount = 0;
 
     public AckLayer() {
-        this(200); // default 200ms timeout
+        this(200L, DEFAULT_MAX_RETRIES);
     }
 
     public AckLayer(long retransmitTimeoutMs) {
-        this.retransmitTimeoutNanos = retransmitTimeoutMs * 1_000_000L;
+        this(retransmitTimeoutMs, DEFAULT_MAX_RETRIES);
+    }
+
+    public AckLayer(long retransmitTimeoutMs, int maxRetries) {
+        if (retransmitTimeoutMs <= 0) {
+            throw new jtroop.ConfigurationException("retransmitTimeoutMs must be positive");
+        }
+        if (maxRetries < 1) {
+            throw new jtroop.ConfigurationException("maxRetries must be >= 1");
+        }
+        this.baseTimeoutNanos = retransmitTimeoutMs * 1_000_000L;
+        this.maxRetries = maxRetries;
         // Initialize seqs to -1 so an "empty" slot is distinguishable.
         for (int i = 0; i < unackSeqs.length; i++) unackSeqs[i] = -1;
     }
@@ -76,7 +101,8 @@ public final class AckLayer implements Layer {
         // Track for retransmit. Copy payload bytes into the flat store.
         int slot = allocateSlot();
         unackSeqs[slot] = seq;
-        unackSentAtNanos[slot] = System.nanoTime();
+        unackNextRetryAt[slot] = System.nanoTime() + baseTimeoutNanos;
+        unackRetries[slot] = 0;
         unackLengths[slot] = payloadLen;
         int base = slot * MAX_PAYLOAD_PER_SLOT;
         // Use bulk get into the flat store so no temporary byte[] is allocated.
@@ -102,15 +128,18 @@ public final class AckLayer implements Layer {
         int newCap = seqs.length * 2;
         var newSeqs = new int[newCap];
         var newTimes = new long[newCap];
+        var newRetries = new byte[newCap];
         var newLens = new int[newCap];
         var newData = new byte[newCap * MAX_PAYLOAD_PER_SLOT];
         System.arraycopy(seqs, 0, newSeqs, 0, seqs.length);
         for (int i = seqs.length; i < newCap; i++) newSeqs[i] = -1;
-        System.arraycopy(unackSentAtNanos, 0, newTimes, 0, seqs.length);
+        System.arraycopy(unackNextRetryAt, 0, newTimes, 0, seqs.length);
+        System.arraycopy(unackRetries, 0, newRetries, 0, seqs.length);
         System.arraycopy(unackLengths, 0, newLens, 0, seqs.length);
         System.arraycopy(unackPayloads, 0, newData, 0, unackPayloads.length);
         unackSeqs = newSeqs;
-        unackSentAtNanos = newTimes;
+        unackNextRetryAt = newTimes;
+        unackRetries = newRetries;
         unackLengths = newLens;
         unackPayloads = newData;
         unackCount++;
@@ -162,36 +191,82 @@ public final class AckLayer implements Layer {
         return unackCount;
     }
 
-    /** Whether any unacked packets have exceeded the retransmit timeout. */
+    /** Whether any unacked packets are due for retransmit. */
     public boolean hasRetransmits() {
         long now = System.nanoTime();
         var seqs = unackSeqs;
-        var times = unackSentAtNanos;
+        var nextAt = unackNextRetryAt;
         for (int i = 0; i < seqs.length; i++) {
-            if (seqs[i] >= 0 && now - times[i] >= retransmitTimeoutNanos) return true;
+            if (seqs[i] >= 0 && now >= nextAt[i]) return true;
         }
         return false;
     }
 
     /**
-     * Write retransmit packets (seq + payload) into the buffer.
-     * Returns the number of packets retransmitted.
+     * Write retransmit packets (seq + payload) into the buffer. Packets that
+     * have hit the retry cap are dropped — their slot is released and
+     * {@link #exhaustedCount()} advances — instead of being retransmitted
+     * yet again, which would otherwise be an amplification vector against
+     * silent peers.
+     *
+     * <p>Exponential backoff: each successive retry for the same slot is
+     * scheduled {@code baseTimeoutNanos << min(retries, 6)} nanos in the
+     * future, so a truly-silent peer generates retries at 1×, 2×, 4×, 8×,
+     * 16×, 32×, 64×, 64×, ... the base timeout. Bounded shift — no
+     * {@code Math.pow}, no allocation.
+     *
+     * @return the number of packets retransmitted (not dropped)
      */
     public int writeRetransmits(ByteBuffer buf) {
         long now = System.nanoTime();
         var seqs = unackSeqs;
-        var times = unackSentAtNanos;
+        var nextAt = unackNextRetryAt;
+        var retries = unackRetries;
         var lens = unackLengths;
         var data = unackPayloads;
         int count = 0;
         for (int i = 0; i < seqs.length; i++) {
-            if (seqs[i] >= 0 && now - times[i] >= retransmitTimeoutNanos) {
-                buf.putInt(seqs[i]);
-                buf.put(data, i * MAX_PAYLOAD_PER_SLOT, lens[i]);
-                times[i] = now;
-                count++;
+            if (seqs[i] < 0 || now < nextAt[i]) continue;
+            if (retries[i] >= maxRetries) {
+                // Retry budget exhausted — drop the packet silently and
+                // release the slot. Caller polls exhaustedCount() to detect.
+                seqs[i] = -1;
+                retries[i] = 0;
+                lens[i] = 0;
+                unackCount--;
+                exhaustedCount++;
+                continue;
             }
+            buf.putInt(seqs[i]);
+            buf.put(data, i * MAX_PAYLOAD_PER_SLOT, lens[i]);
+            int nextRetry = retries[i] + 1;
+            retries[i] = (byte) nextRetry;
+            int shift = nextRetry < MAX_BACKOFF_SHIFT ? nextRetry : MAX_BACKOFF_SHIFT;
+            nextAt[i] = now + (baseTimeoutNanos << shift);
+            count++;
         }
         return count;
+    }
+
+    /**
+     * Cumulative number of packets whose retry budget was exhausted since
+     * this layer was constructed. Callers checking periodically can
+     * request a connection close once this count advances — the higher
+     * layer owns that policy.
+     */
+    public int exhaustedCount() { return exhaustedCount; }
+
+    /**
+     * Reset per-connection state on close. Defensive — the class-level
+     * javadoc already says one instance per connection, but this lets the
+     * framework call onConnectionClose uniformly across all layer types.
+     */
+    @Override
+    public void onConnectionClose(long connectionId) {
+        java.util.Arrays.fill(unackSeqs, -1);
+        java.util.Arrays.fill(unackRetries, (byte) 0);
+        java.util.Arrays.fill(unackLengths, 0);
+        unackCount = 0;
+        pendingAckSeq = -1;
     }
 }

@@ -103,6 +103,61 @@ class AckLayerTest {
     }
 
     @Test
+    void sender_capsRetransmits_atMaxRetries_andReleasesSlot() throws InterruptedException {
+        // 1ms base timeout, cap at 3 retries → exponential backoff: 1, 2, 4ms then give up.
+        var layer = new AckLayer(1, 3);
+
+        var p = ByteBuffer.allocate(8);
+        p.putInt(1);
+        p.flip();
+        var out = ByteBuffer.allocate(64);
+        layer.encodeOutbound(p, out);
+        assertEquals(1, layer.unackedCount());
+
+        // Silent peer: poll retransmits in a loop and count. Current main
+        // retransmits forever (bounded only by our 2s safety deadline).
+        var buf = ByteBuffer.allocate(1024);
+        int totalRetransmits = 0;
+        long deadline = System.nanoTime() + 2_000_000_000L; // 2s safety cap
+        while (System.nanoTime() < deadline) {
+            Thread.sleep(40);
+            buf.clear();
+            totalRetransmits += layer.writeRetransmits(buf);
+            if (layer.unackedCount() == 0) break;
+        }
+
+        assertEquals(3, totalRetransmits,
+                "should retransmit exactly maxRetries times; got " + totalRetransmits);
+        assertEquals(1, layer.exhaustedCount(),
+                "exhausted packet count must increment when cap is reached");
+        assertEquals(0, layer.unackedCount(),
+                "slot must be released once retries are exhausted");
+    }
+
+    @Test
+    void sender_exhaustedCount_isZero_whenAcksArriveInTime() throws InterruptedException {
+        var layer = new AckLayer(1, 3);
+        var p = ByteBuffer.allocate(8);
+        p.putInt(1);
+        p.flip();
+        var out = ByteBuffer.allocate(64);
+        layer.encodeOutbound(p, out);
+
+        // Ack arrives before any retransmit cycle.
+        var ackBuf = ByteBuffer.allocate(4);
+        ackBuf.putInt(0);
+        ackBuf.flip();
+        layer.processAck(ackBuf);
+
+        // Wait past the retransmit window; nothing should be retransmitted or exhausted.
+        Thread.sleep(50);
+        assertEquals(0, layer.exhaustedCount());
+        assertEquals(0, layer.unackedCount());
+        var buf = ByteBuffer.allocate(64);
+        assertEquals(0, layer.writeRetransmits(buf));
+    }
+
+    @Test
     void sender_retransmitsUnacked() {
         var layer = new AckLayer(50); // 50ms timeout
 
