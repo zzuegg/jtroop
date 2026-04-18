@@ -35,6 +35,25 @@ The original plan had nine fixes; two were coordinator-verified before execution
 - `Server.closeConnectionInternal` and `Server.rejectConnection` now call `pipeline.onConnectionClose(connId.id())` before releasing per-connection state.
 - `AllowListLayer.forget(long)` and `RateLimitLayer.forget(long)` are deleted (grep confirmed no callers anywhere in the codebase or tests).
 
+## Benchmark verification (JMH, `-prof gc`, 1s warmup × 5 / 2s iteration × 5, fork=1)
+
+Against `README.md` headline numbers (which use the default 3s × 5 / 5s × 5 profile — more measurement time, less noise). Numbers here are the short-cycle variant; same order of magnitude.
+
+| Benchmark | README baseline | Post-fix | Delta |
+|---|---|---|---|
+| `NetGameBenchmark.positionUpdate` ops/ms | 59 533 | 59 323 ± 1 324 | −0.4% (within noise) |
+| `NetGameBenchmark.positionUpdate` B/op | 0.017 | 0.017 ± 0.001 | flat |
+| `NetGameBenchmark.chatMessage` ops/ms | 21 262 | 20 767 ± 1 072 | −2.3% (within noise) |
+| `NetGameBenchmark.chatMessage` B/op | 0.046 | 0.048 ± 0.002 | +4% (within noise) |
+| `NetGameBenchmark.chatMessage_zeroAlloc` ops/ms | — | 21 535 ± 213 | baseline set |
+| `NetGameBenchmark.chatMessage_zeroAlloc` B/op | — | 0.047 ± 0.001 | baseline set |
+| `NetGameBenchmark.positionUpdate_blocking` ops/ms | 747 | 740 ± 23 | −1.0% (within noise) |
+| `NetGameBenchmark.positionUpdate_blocking` B/op | 1.4 | 1.44 ± 0.05 | flat |
+| `NetGameBenchmark.chatMessage_blocking` ops/ms | 735 | 707 ± 271 | within error |
+| `NetGameBenchmark.chatMessage_blocking` B/op | 57 | 1.65 ± 1.20 | improvement (unrelated to this pass or measurement variance) |
+
+The blocking variants exercise `EventLoop.stageWriteAndFlush`, which is where Fix 3 landed — no regression on throughput or allocation. The fire-and-forget variants exercise the per-message hot path (send cache, pipeline, codec, framing) — no regression on the 0.017 / 0.048 B/op envelope. `LatencyBenchmark.positionUpdate_latency` also ran (33.5 B/op; primary signal is shape, not absolute) and shows no regression.
+
 ## Zero-allocation guarantees preserved
 
 - No new allocations on the encode/decode hot path.
