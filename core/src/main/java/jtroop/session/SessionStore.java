@@ -70,7 +70,14 @@ public final class SessionStore {
         }
         int index = freeHead;
         freeHead = nextFree[index];
-        generations[index]++;
+        // Wrap generation past the signed boundary so it stays positive.
+        // Without this, after 2^31 reuses of the same slot the generation
+        // becomes negative, {@link ConnectionId#isValid()} (which checks
+        // > 0) starts returning false for live handles, and the aliasing
+        // protection that generation provides silently stops working.
+        int nextGen = generations[index] + 1;
+        if (nextGen <= 0) nextGen = 1;
+        generations[index] = nextGen;
         stateAndActive[index] = ACTIVE_BIT; // active=1, state=0
         lastActivity[index] = 0;
         count++;

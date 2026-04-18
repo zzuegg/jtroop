@@ -356,4 +356,34 @@ class SessionTest {
         store.forEachActiveLong(id -> count[0]++);
         assertEquals(0, count[0]);
     }
+
+    @Test
+    void sessionStore_generationWrapsPositiveAfterIntegerMaxValue() throws Exception {
+        var store = new SessionStore(1);
+        // Reflectively seed the single slot's generation near the signed-int
+        // boundary so we can exercise the rollover in O(1) test time rather
+        // than doing 2^31 allocate/release cycles.
+        var gensField = SessionStore.class.getDeclaredField("generations");
+        gensField.setAccessible(true);
+        var generations = (int[]) gensField.get(store);
+        generations[0] = Integer.MAX_VALUE - 1;
+
+        var first = store.allocate();
+        assertEquals(Integer.MAX_VALUE, first.generation());
+        assertTrue(first.isValid(), "generation=MAX_VALUE must still be valid");
+        store.release(first);
+
+        // Next allocation would naively roll to Integer.MIN_VALUE (negative).
+        // Post-fix: wraps to 1 so isValid() stays correct.
+        var second = store.allocate();
+        assertEquals(1, second.generation(),
+                "generation must wrap to 1 past the signed-int boundary");
+        assertTrue(second.isValid());
+
+        // Stale-handle check across the wrap boundary: first's id must NOT
+        // match the current slot state (different generation number).
+        assertFalse(store.isActive(first),
+                "stale pre-wrap handle must not match post-wrap slot");
+        assertTrue(store.isActive(second));
+    }
 }
