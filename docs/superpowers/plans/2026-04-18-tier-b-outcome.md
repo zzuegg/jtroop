@@ -89,15 +89,25 @@ Post-tier-C benchmark numbers (same `-prof gc` short-cycle profile):
 | `NetGameBenchmark.chatMessage` ops/ms | 21 262 | 20 182 ± 869 | −5.1% (CI overlaps baseline) |
 | `NetGameBenchmark.chatMessage` B/op | 0.046 | 0.049 ± 0.002 | +0.003 (within noise) |
 
-## Follow-ups (still open — tier D / infra / long-tail)
+## Tier-D push (landed same-day continuation)
 
-- `Server.java:462` parenthesise for readability only (no behaviour bug — verified mathematically equivalent).
-- `BufferCharSequence.subSequence` zero-alloc view — **skipped**: grep showed no callers in the codebase.
-- Committed JMH baseline + CI regression gate — infrastructure work.
-- Parameterised tests across codec/framing boundary suites — hygiene.
-- Allocation-assertion harness in unit tests — hygiene.
-- `Server.processInboundLegacy` per-read frame cap for DoS fairness — connection-starvation hardening, separate concern from correctness.
-- `ConnectionId` 2³¹ generation rollover — extreme long-tail.
-- `Server.broadcast-during-shutdown` race — hard to reproduce; requires targeted stress test.
-- UDP handshake silent no-op — API hygiene (currently `connectUdp` ignores the handshake argument instead of throwing).
-- `CodecRegistry.auto-register-on-encode` vs require-register-on-decode inconsistency — mostly documentation.
+| Commit | Fix | Class |
+|---|---|---|
+| `cdc751c` | `Server.processInboundLegacy` per-read frame cap (256 / read) + `Server.java:462` parenthesisation (readability) | DoS fairness + readability |
+| `7fb72f6` | `Client.Builder.connect(handshake, UDP-transport, ...)` now throws instead of silently dropping the handshake | API hygiene |
+| `4e6367e` | `SessionStore` generation wraps to 1 past `Integer.MAX_VALUE` so `ConnectionId.isValid()` keeps working after 2³¹ slot reuses | correctness long-tail |
+| `4b38750` | `BufferCharSequence.subSequence` zero-alloc view on clean char boundaries; falls back to materialisation only mid-surrogate-pair | perf (tier D) |
+| `627b84e` | `Allocation` harness + 3 starter zero-alloc regression tests (codec roundtrip, writeUtf8, readUtf8CharSequence) | test infra |
+| `3995c36` | `benchmark/baselines/net-game-2026-04-18.json` committed + JMH configured to emit JSON | regression infra |
+| `6ea13df` | `scripts/jmh-diff.py` CI-gate tool that diffs a fresh run vs a baseline | regression infra |
+| `e831511` | `FramingLayerBoundaryTest` migrated 3 out-of-range tests → one `@ParameterizedTest` with 4 values | test hygiene pilot |
+
+Full-suite stability: 3/3 consecutive clean runs post-push.
+jmh-diff self-check: `OK — 2 benchmarks within envelope (alloc ±5.0 %, throughput ±10.0 %)`.
+
+## Truly remaining (deliberately skipped)
+
+- `CodecRegistry.auto-register-on-encode` vs require-register-on-decode asymmetry — not a bug: encode has a `Class`, decode only has a `typeId`; the asymmetry is forced by information availability, not a gap. Documentation-only item.
+- `Server.broadcast-during-shutdown` race — no reproducible failure path; would require crafted concurrent stress test.
+- Broader parameterised-test migration across codec/framing boundary suites — pilot landed in `e831511`; applying the same pattern to other suites is mechanical hygiene, can be batched when those tests are next touched.
+- CI job wiring — the components (JSON output, golden baseline, `scripts/jmh-diff.py`) are all committed; the GitHub Actions / Jenkins config glue belongs in ops-level infrastructure, outside this source-tree pass.
