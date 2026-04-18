@@ -119,6 +119,36 @@ public final class Pipeline {
         return decodeInbound(LayerContext.NOOP, wire);
     }
 
+    /**
+     * Broadcast a connection-close event to every layer in the pipeline.
+     * Cold path — invoked once per connection on the close path by Server /
+     * Client, not per message. Layers that hold per-connection state (allow
+     * lists, rate limiters, ack windows, duplicate filters, sequence
+     * numbers) evict it in their {@link Layer#onConnectionClose(long)}
+     * override.
+     *
+     * <p>Iterates layers in reverse order so outer decorators (e.g. a
+     * connection-level rate limiter wrapping a framing layer) see the
+     * close event before the layers they wrap.
+     *
+     * <p>Uses {@code invokeinterface} through the plain {@code layers[]}
+     * array — acceptable because this is cold-path. The fused hot path is
+     * unaffected.
+     */
+    public void onConnectionClose(long connectionId) {
+        for (int i = layers.length - 1; i >= 0; i--) {
+            try {
+                layers[i].onConnectionClose(connectionId);
+            } catch (Throwable t) {
+                // A misbehaving layer must not block other layers from cleaning
+                // up. Log and continue — this is the close path, not a
+                // user-facing exception site.
+                System.err.println("Pipeline.onConnectionClose: layer "
+                        + layers[i].getClass().getName() + " threw: " + t);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Mutation helpers — all return a new Pipeline. See class-level javadoc
     // for the stateful-layer warning.

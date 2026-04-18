@@ -19,8 +19,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * connections so a single first-read burst doesn't get incorrectly flagged.
  *
  * <p><b>Per-instance state.</b> A small {@code ConcurrentHashMap<Long,
- * Boolean>} tracks which connections have already been closed; the entry is
- * cleared via {@link #forget(long)} on disconnect if the server wires that up.
+ * Boolean>} tracks which connections have already been closed; entries
+ * are cleared automatically via {@link #onConnectionClose(long)} which
+ * the server/client invoke on every close path.
  */
 public final class RateLimitLayer implements Layer {
 
@@ -71,8 +72,13 @@ public final class RateLimitLayer implements Layer {
         return wire;
     }
 
-    /** Remove the closed marker for a disconnected connection. */
-    public void forget(long connectionId) {
+    /**
+     * Auto-evicts the closed marker on connection close — invoked by
+     * {@link jtroop.pipeline.Pipeline#onConnectionClose(long)} from the
+     * server/client close paths.
+     */
+    @Override
+    public void onConnectionClose(long connectionId) {
         closed.remove(connectionId);
     }
 

@@ -127,6 +127,67 @@ class AllowListLayerTest {
         server.close();
     }
 
+    /** Unit-level: Layer.onConnectionClose evicts the cached decision. */
+    @Test
+    void onConnectionClose_evictsCachedDecision() throws Exception {
+        var loopback = InetAddress.getByName("127.0.0.1");
+        var layer = new AllowListLayer(Set.of(loopback));
+
+        long connId = 0x00000001_00000042L;
+        var ctx = new LayerContext(
+                connId,
+                new InetSocketAddress(loopback, 55555),
+                System.nanoTime(),
+                () -> {}, () -> {});
+        var wire = ByteBuffer.allocate(8);
+        wire.putInt(1);
+        wire.flip();
+        layer.decodeInbound(ctx, wire);
+        assertEquals(1, layer.cachedCount(), "decision should be cached after first decode");
+
+        layer.onConnectionClose(connId);
+        assertEquals(0, layer.cachedCount(), "decision must be evicted on close");
+    }
+
+    /** Integration: rapid connect/disconnect cycles do NOT leak cached
+     *  decisions — Pipeline.onConnectionClose fires on every close path. */
+    @Test
+    void rapidConnectDisconnect_doesNotLeakCachedDecisions() throws Exception {
+        var handler = new PingHandler();
+        var loopback = InetAddress.getByName("127.0.0.1");
+        var serverLayer = new AllowListLayer(Set.of(loopback));
+
+        var server = Server.builder()
+                .listen(GameConnection.class, Transport.tcp(0),
+                        serverLayer, new FramingLayer())
+                .addService(handler, GameConnection.class)
+                .build();
+        server.start();
+        int port = server.port(GameConnection.class);
+
+        final int cycles = 20;
+        for (int i = 0; i < cycles; i++) {
+            var client = Client.builder()
+                    .connect(GameConnection.class, Transport.tcp("localhost", port),
+                            new FramingLayer())
+                    .addService(PingService.class, GameConnection.class)
+                    .build();
+            client.start();
+            var pong = client.request(new Ping(i), Pong.class);
+            assertEquals(i, pong.seq());
+            client.close();
+        }
+        // Wait briefly for the close dispatch on the server side.
+        long deadline = System.currentTimeMillis() + 2_000;
+        while (serverLayer.cachedCount() > 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(25);
+        }
+        assertEquals(0, serverLayer.cachedCount(),
+                "decisions must be evicted on every close; leaked "
+                        + serverLayer.cachedCount() + " after " + cycles + " cycles");
+        server.close();
+    }
+
     @Test
     void loopbackDenied_clientRequestFails() throws Exception {
         var handler = new PingHandler();

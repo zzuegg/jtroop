@@ -76,6 +76,24 @@ class RateLimitLayerTest {
     }
 
     @Test
+    void onConnectionClose_evictsClosedMarker() {
+        var layer = new RateLimitLayer(100L, /* grace */ 0L);
+        long connectedAt = System.nanoTime() - 1_000_000_000L;
+        var ctx = new LayerContext(
+                99L, null, connectedAt,
+                () -> {}, () -> {});
+        ctx.addBytesRead(1_000_000);
+        var wire = ByteBuffer.allocate(8);
+        wire.putInt(1);
+        wire.flip();
+        layer.decodeInbound(ctx, wire);
+        assertTrue(layer.hasClosed(99L), "over-limit peer should be marked closed");
+
+        layer.onConnectionClose(99L);
+        assertFalse(layer.hasClosed(99L), "close callback must evict the marker");
+    }
+
+    @Test
     void repeatedOverage_onlyClosesOnce() {
         var layer = new RateLimitLayer(100L, /* grace */ 0L);
         int[] closeCount = {0};

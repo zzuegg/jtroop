@@ -35,6 +35,32 @@ public interface Layer {
     }
 
     /**
+     * Connection lifecycle callback invoked once when a connection closes
+     * (normal shutdown, handshake rejection, peer reset, timeout). Cold
+     * path — fires at most once per connection, not per message.
+     *
+     * <p>Use this to release any per-connection state a layer keeps in its
+     * own data structures. The default is a no-op; stateful layers such as
+     * {@code AllowListLayer}, {@code RateLimitLayer}, {@code AckLayer},
+     * {@code DuplicateFilterLayer} and {@code SequencingLayer} override it
+     * to evict their per-connection entries so long-lived servers don't
+     * accumulate memory proportional to total connections ever seen.
+     *
+     * <p>Invoked by {@link Pipeline#onConnectionClose(long)} which the
+     * {@code Server} / {@code Client} call on every close path. Safe to
+     * call from any thread; layers must perform their own synchronisation
+     * if they share state with the hot encode/decode path.
+     *
+     * @param connectionId packed {@code ConnectionId} of the closing
+     *                     connection — same value as
+     *                     {@link Context#connectionId()} previously saw
+     *                     on encode/decode calls for this connection.
+     */
+    default void onConnectionClose(long connectionId) {
+        // no-op by default
+    }
+
+    /**
      * Per-connection view exposed to every layer call. Immutable accessors;
      * mutating methods ({@link #closeAfterFlush}, {@link #closeNow}) schedule
      * the action on the owning {@code EventLoop}.

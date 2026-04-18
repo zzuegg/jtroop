@@ -645,6 +645,9 @@ public final class Server implements AutoCloseable {
         try { channel.close(); } catch (IOException _) {}
         key.cancel();
         handshakePending.remove(connId);
+        // Let every layer release per-connection state (allow-list cache,
+        // rate-limit markers, ack slots, ...). Cold path, once per connection.
+        config.pipeline().onConnectionClose(connId.id());
         // Clear the flat slot BEFORE releasing the session — otherwise a
         // concurrent allocate could reuse the slot and race the null-store,
         // leaking a stale channel ref into fan-out.
@@ -829,6 +832,10 @@ public final class Server implements AutoCloseable {
         key.cancel();
         try { channel.close(); } catch (IOException _) {}
         serviceRegistry.dispatchDisconnect(connId);
+        // Let every layer release per-connection state (allow-list cache,
+        // rate-limit markers, ack slots, ...). Cold path, once per connection.
+        var cfg = connectionConfig.get(connId);
+        if (cfg != null) cfg.pipeline().onConnectionClose(connId.id());
         // Clear the flat slot BEFORE releasing the session — otherwise a
         // concurrent allocate could reuse the slot and race the null-store,
         // leaking a stale channel ref into fan-out.

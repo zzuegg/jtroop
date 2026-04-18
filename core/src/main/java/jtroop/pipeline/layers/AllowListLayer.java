@@ -23,9 +23,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p><b>Per-instance state.</b> The decision cache is shared across all
  * connections that see this layer instance, so one instance can safely be
- * reused for every accepted connection. Entries are not evicted
- * automatically — use {@link #forget(long)} from a {@code @OnDisconnect}
- * handler if long-lived servers need to reclaim memory.
+ * reused for every accepted connection. Entries are evicted automatically
+ * via {@link #onConnectionClose(long)} which the {@code Server}/{@code
+ * Client} invoke on every close path — no user wiring required.
  */
 public final class AllowListLayer implements Layer {
 
@@ -68,8 +68,13 @@ public final class AllowListLayer implements Layer {
         return allowed.contains(peer.getAddress());
     }
 
-    /** Remove the cached decision for a disconnected connection. */
-    public void forget(long connectionId) {
+    /**
+     * Auto-evicts the cached decision when the connection closes. Invoked
+     * once per connection by {@link jtroop.pipeline.Pipeline#onConnectionClose(long)}
+     * from the server/client close paths.
+     */
+    @Override
+    public void onConnectionClose(long connectionId) {
         decisions.remove(connectionId);
     }
 
