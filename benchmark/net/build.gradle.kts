@@ -26,4 +26,7 @@ jmh {
     (project.findProperty("jmh.warmup") as String?)?.let { warmup.set(it) }
     profilers.addAll(listOf("gc", "stack"))
     forceGC.set(true)
+    // Emit JSON so a committed golden baseline can be diffed by CI.
+    resultFormat.set("JSON")
+    resultsFile.set(file("build/results/jmh/results.json"))
 }
