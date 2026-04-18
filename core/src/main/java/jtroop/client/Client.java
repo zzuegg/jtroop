@@ -1123,6 +1123,14 @@ public final class Client implements AutoCloseable {
 
         @SuppressWarnings("unchecked")
         public Builder connect(Record handshakeInstance, Transport transport, Layer... layers) {
+            // The handshake is exchanged over a stream-oriented connection;
+            // there is no UDP handshake path on the client side. Fail fast so
+            // the misconfiguration is caught at builder time rather than
+            // silently accepting the handshake instance and never using it.
+            if (transport.isUdp()) {
+                throw new jtroop.ConfigurationException(
+                        "UDP transport does not support handshake. Use connect(connType, Transport.udpConnected(...), ...) without a handshake instance.");
+            }
             var connType = (Class<? extends Record>) handshakeInstance.getClass();
             codec.register(connType);
             // Register nested Accepted record if present
