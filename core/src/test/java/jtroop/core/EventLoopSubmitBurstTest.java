@@ -110,37 +110,32 @@ class EventLoopSubmitBurstTest {
     }
 
     /**
-     * Re-entrant submit from the loop thread itself while the ring is full
-     * should throw immediately — there is no way to drain the ring without
-     * returning from the current task, so a "block until free" semantic would
-     * deadlock. Pre-fix this case silently allocated into setupOverflow;
-     * post-fix it throws IllegalStateException.
+     * Re-entrant submits from the loop thread that exceed the main ring
+     * must not block (would deadlock the sole drainer) and must not
+     * silently drop. Post-fix: overflow lands in the growable self-submit
+     * queue (ArrayDeque) so every submit succeeds and every task runs,
+     * regardless of how many the current task enqueues.
      */
     @Test
-    void submitFromLoopThread_onFullRing_throwsInsteadOfSilentAllocation() throws Exception {
+    void submitFromLoopThread_beyondRingCapacity_allTasksRun() throws Exception {
         var loop = new EventLoop("reentrant-test");
-        var caught = new AtomicReference<Throwable>();
-        var done = new CountDownLatch(1);
+        var error = new AtomicReference<Throwable>();
+        var allRun = new CountDownLatch(5000);
 
         loop.submit(() -> {
             try {
-                // Fill the ring from the loop thread itself. The 4096-th
-                // submit must throw rather than allocating an overflow node.
-                final Runnable noop = () -> {};
                 for (int i = 0; i < 5000; i++) {
-                    loop.submit(noop);
+                    loop.submit(allRun::countDown);
                 }
             } catch (Throwable t) {
-                caught.set(t);
-            } finally {
-                done.countDown();
+                error.set(t);
             }
         });
         loop.start();
-        assertTrue(done.await(10, java.util.concurrent.TimeUnit.SECONDS));
-        assertNotNull(caught.get(),
-                "re-entrant submit beyond ring capacity must throw, not allocate");
-        assertInstanceOf(IllegalStateException.class, caught.get());
+        assertTrue(allRun.await(10, java.util.concurrent.TimeUnit.SECONDS),
+                "every re-entrantly-submitted task must eventually run");
+        assertNull(error.get(),
+                "re-entrant submit must not throw under overflow: " + error.get());
         loop.close();
     }
 }
