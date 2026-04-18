@@ -71,6 +71,67 @@ class AllowListLayerTest {
         assertEquals(1, layer.cachedCount(), "decision must be cached, not re-checked");
     }
 
+    /** IPv4-mapped IPv6 (::ffff:a.b.c.d) is semantically the same host as
+     *  a.b.c.d — the allow-list must accept either form. Pre-fix, an
+     *  allow-list containing {@code 127.0.0.1} denied a peer whose
+     *  connecting socket reported {@code ::ffff:127.0.0.1} (common on
+     *  dual-stack JVMs), breaking legitimate loopback connectivity and
+     *  conversely allowing an attacker on a dual-stack host to evade a
+     *  deny-list entry by connecting via the other family. */
+    @Test
+    void ipv4MappedIpv6_treatedAsSameHost() throws Exception {
+        var loopback4 = InetAddress.getByName("127.0.0.1");
+        // Force construction as an actual 16-byte Inet6Address — this is what
+        // a dual-stack Java NIO socket reports as the remote address when an
+        // IPv4 peer connects via an IPv6 listener. InetAddress.getByName for
+        // "::ffff:127.0.0.1" auto-normalises to Inet4Address in the common JDK,
+        // so we build the IPv6 mapped form byte-wise.
+        byte[] mapped = new byte[16];
+        mapped[10] = (byte) 0xFF;
+        mapped[11] = (byte) 0xFF;
+        mapped[12] = 127;
+        mapped[13] = 0;
+        mapped[14] = 0;
+        mapped[15] = 1;
+        var mapped6 = java.net.Inet6Address.getByAddress(null, mapped, 0);
+
+        // Layer is configured with the IPv4 form only.
+        var layer = new AllowListLayer(Set.of(loopback4));
+
+        boolean[] closed6 = {false};
+        var ctx6 = new LayerContext(
+                0x00000001_00000001L,
+                new InetSocketAddress(mapped6, 55555),
+                System.nanoTime(),
+                () -> closed6[0] = true,
+                () -> closed6[0] = true);
+
+        var wire = ByteBuffer.allocate(8);
+        wire.putInt(1);
+        wire.flip();
+
+        // Same host via IPv4-mapped IPv6 must pass through.
+        var out = layer.decodeInbound(ctx6, wire);
+        assertSame(wire, out, "IPv4-mapped IPv6 form of an allow-listed IPv4 must pass");
+        assertFalse(closed6[0], "IPv4-mapped IPv6 of allow-listed peer must not close");
+
+        // And the reverse direction — layer configured with IPv6 form,
+        // peer arrives as IPv4 — also matches.
+        var layer6 = new AllowListLayer(Set.of(mapped6));
+        boolean[] closed4 = {false};
+        var ctx4 = new LayerContext(
+                0x00000001_00000002L,
+                new InetSocketAddress(loopback4, 44444),
+                System.nanoTime(),
+                () -> closed4[0] = true,
+                () -> closed4[0] = true);
+        wire.rewind();
+        var out2 = layer6.decodeInbound(ctx4, wire);
+        assertSame(wire, out2,
+                "IPv4 form of an IPv4-mapped IPv6 allow-listed peer must pass");
+        assertFalse(closed4[0]);
+    }
+
     /** Unit-level: denied peer triggers closeNow() and decode returns null. */
     @Test
     void deniedAddress_callsCloseNow_andReturnsNull() throws Exception {

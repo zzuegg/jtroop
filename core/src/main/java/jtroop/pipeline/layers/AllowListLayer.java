@@ -2,9 +2,13 @@ package jtroop.pipeline.layers;
 
 import jtroop.pipeline.Layer;
 
+import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -34,7 +38,51 @@ public final class AllowListLayer implements Layer {
 
     public AllowListLayer(Set<InetAddress> allowed) {
         java.util.Objects.requireNonNull(allowed, "parameter 'allowed' must not be null");
-        this.allowed = Set.copyOf(allowed);
+        // Expand each IPv4 entry to also include its IPv4-mapped IPv6 form
+        // (::ffff:a.b.c.d) and vice versa. A dual-stack Java NIO socket
+        // reports an IPv4 peer that connects via the IPv6 listener with the
+        // mapped form — without this canonicalisation, a legitimate peer
+        // would be denied (false negative) and, symmetrically, a deny-list
+        // entry in one form would be bypassable by connecting via the
+        // other. Done once at construction; zero per-connection cost.
+        var expanded = new HashSet<InetAddress>(allowed.size() * 2);
+        for (InetAddress a : allowed) {
+            expanded.add(a);
+            InetAddress mate = mappedMate(a);
+            if (mate != null) expanded.add(mate);
+        }
+        this.allowed = Set.copyOf(expanded);
+    }
+
+    /**
+     * Returns the IPv4-mapped IPv6 form of an IPv4 address, or the IPv4
+     * form of an IPv4-mapped IPv6 address, or {@code null} for any other
+     * address family (genuine IPv6, site-local, etc.).
+     */
+    private static InetAddress mappedMate(InetAddress a) {
+        try {
+            if (a instanceof Inet4Address) {
+                byte[] src = a.getAddress();
+                byte[] m = new byte[16];
+                m[10] = (byte) 0xFF;
+                m[11] = (byte) 0xFF;
+                m[12] = src[0];
+                m[13] = src[1];
+                m[14] = src[2];
+                m[15] = src[3];
+                return Inet6Address.getByAddress(null, m, 0);
+            }
+            if (a instanceof Inet6Address v6) {
+                byte[] src = v6.getAddress();
+                // IPv4-mapped IPv6 canonical form: ::ffff:a.b.c.d → bytes 0..9=0, 10..11=0xFF, 12..15=IPv4
+                for (int i = 0; i < 10; i++) if (src[i] != 0) return null;
+                if ((src[10] & 0xFF) != 0xFF || (src[11] & 0xFF) != 0xFF) return null;
+                return InetAddress.getByAddress(new byte[]{src[12], src[13], src[14], src[15]});
+            }
+        } catch (UnknownHostException _) {
+            // getByAddress only throws on wrong-length input — we build fixed-length arrays above.
+        }
+        return null;
     }
 
     @Override
