@@ -5,9 +5,8 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 public final class EventLoop implements Runnable, AutoCloseable {
 
@@ -19,12 +18,17 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private static final VarHandle WRITE_TARGETS;
     private static final VarHandle SETUP_SLOTS;
     private static final VarHandle WAITING_THREADS;
+    private static final VarHandle SETUP_READ_INDEX;
+    private static final VarHandle PARKED_PRODUCER;
     static {
         try {
             PENDING_WRITE = MethodHandles.arrayElementVarHandle(boolean[].class);
             WRITE_TARGETS = MethodHandles.arrayElementVarHandle(SocketChannel[].class);
             SETUP_SLOTS   = MethodHandles.arrayElementVarHandle(Runnable[].class);
             WAITING_THREADS = MethodHandles.arrayElementVarHandle(Thread[].class);
+            var lookup = MethodHandles.lookup();
+            SETUP_READ_INDEX = lookup.findVarHandle(EventLoop.class, "setupReadIndex", long.class);
+            PARKED_PRODUCER  = lookup.findVarHandle(EventLoop.class, "parkedProducer", Thread.class);
         } catch (Throwable t) {
             throw new ExceptionInInitializerError(t);
         }
@@ -38,16 +42,61 @@ public final class EventLoop implements Runnable, AutoCloseable {
     // allocation on the fast path. Producers CAS a write index, then
     // release-store the Runnable into the ring slot. The single consumer
     // (loop thread) acquire-loads each slot; a null means "not yet published".
-    // Overflow (ring full) falls back to a ConcurrentLinkedQueue so no task
-    // is ever dropped; that path does allocate a node but is off the hot path
-    // for the sizes we see in practice (submits happen on accept / connect /
-    // close — O(connection lifecycle), not O(message)).
+    //
+    // When the ring is full:
+    //  * External-thread submits block (bounded spin-then-parkNanos) until
+    //    the consumer frees a slot. Zero heap allocation — the former
+    //    ConcurrentLinkedQueue overflow (~32 B / Node per spilled submit)
+    //    was a zero-alloc violation and an unbounded-heap-growth DoS
+    //    vector under a flooded submit() caller.
+    //  * Re-entrant submits from the loop thread itself throw
+    //    IllegalStateException — there is no way to drain the ring
+    //    without returning from the current task, so "block until free"
+    //    would deadlock. 4096 slots are generous; exceeding this from a
+    //    single task is a design error, not back-pressure.
     private static final int SETUP_RING_CAPACITY = 4096; // power of 2
     private static final int SETUP_RING_MASK = SETUP_RING_CAPACITY - 1;
+    /**
+     * Self-submit ring reserved exclusively for re-entrant submits from the
+     * loop thread. Small (512) because re-entrant workloads tend to have
+     * short submit chains, and the loop thread drains it between external
+     * drains. Decoupled from the main ring so external producers saturating
+     * the main ring cannot starve the loop's own internal work.
+     */
+    private static final int SELF_RING_CAPACITY = 512; // power of 2
+    private static final int SELF_RING_MASK = SELF_RING_CAPACITY - 1;
+    /** Spin iterations before a ring-full external producer falls back to parkNanos. */
+    private static final int SUBMIT_SPIN_BUDGET = 64;
+    /** parkNanos deadline when ring stays full; bounds producer wake latency. */
+    private static final long SUBMIT_PARK_NS = 1_000_000L;
+
     private final Runnable[] setupRing = new Runnable[SETUP_RING_CAPACITY];
     private final AtomicLong setupWriteIndex = new AtomicLong(0);
-    private long setupReadIndex = 0; // single-consumer (event-loop thread)
-    private final Queue<Runnable> setupOverflow = new ConcurrentLinkedQueue<>();
+    /**
+     * Single-consumer cursor written by the loop thread. External producers
+     * read via {@link #SETUP_READ_INDEX} getAcquire to pair with the
+     * consumer's setRelease — guarantees monotonic visibility so a blocked
+     * producer eventually sees a drain.
+     */
+    @SuppressWarnings("FieldMayBeFinal")
+    private volatile long setupReadIndex = 0;
+    /**
+     * At most one external producer parked waiting for a main-ring slot.
+     * A second waiter overwrites this and the displaced waiter relies on its
+     * own parkNanos(1 ms) timeout to re-check — max 1 ms extra wake latency
+     * under multi-producer contention. No lost-wakeup hang possible.
+     */
+    @SuppressWarnings("FieldMayBeFinal")
+    private volatile Thread parkedProducer = null;
+    /**
+     * SPSC self-submit ring (loop thread only, producer == consumer). Plain
+     * array + two indices; no CAS, no volatile — single-thread access.
+     * Used as a fallback when the main ring is full and the current submit
+     * comes from the loop thread itself (we cannot block on self).
+     */
+    private final Runnable[] selfRing = new Runnable[SELF_RING_CAPACITY];
+    private int selfRingHead = 0;
+    private int selfRingTail = 0;
 
     private final ByteBuffer[] writeBuffers;
     private final boolean[] pendingWrite;
@@ -91,28 +140,95 @@ public final class EventLoop implements Runnable, AutoCloseable {
      * <p>Fast path (ring has room): zero heap allocation — CAS-claim a slot,
      * release-store the Runnable reference, wake the selector.
      *
-     * <p>Slow path (ring full, &gt; {@value #SETUP_RING_CAPACITY} backlog): falls
-     * back to a ConcurrentLinkedQueue. Correct but allocates a queue node.
-     * Never drops a task.
+     * <p>External producer slow path (ring full): bounded spin, then
+     * {@code parkNanos(1 ms)} loop re-reading the consumer cursor via
+     * acquire; the consumer unparks the waiter after each drain batch. No
+     * heap allocation, no lost wakeup.
+     *
+     * <p>Re-entrant slow path (loop thread submitting beyond 4096 in-flight
+     * tasks from the current task): throws {@link IllegalStateException}.
+     * Blocking on self would deadlock, and 4096 is a generous budget for
+     * any single task's followup work — exceeding it indicates a design
+     * error, not back-pressure.
      */
     public void submit(Runnable task) {
+        boolean onLoopThread = Thread.currentThread() == thread;
         long idx;
-        do {
+        while (true) {
             idx = setupWriteIndex.get();
-            if (idx - setupReadIndex >= SETUP_RING_CAPACITY) {
-                // Ring full — fall back. `setupReadIndex` is a plain long
-                // read here (producer side) so it may be stale; that only
-                // causes us to declare full a bit early, which is safe.
-                setupOverflow.add(task);
-                selector.wakeup();
+            long read = (long) SETUP_READ_INDEX.getAcquire(this);
+            if (idx - read < SETUP_RING_CAPACITY) {
+                if (setupWriteIndex.compareAndSet(idx, idx + 1)) break;
+                continue; // lost CAS race, retry immediately
+            }
+            // Main ring full.
+            if (onLoopThread) {
+                // Fall back to the self-submit ring. Cannot block on self —
+                // we'd deadlock the only thread that drains. The self ring
+                // is reserved exclusively for this case so external
+                // producers saturating the main ring never starve the
+                // loop's own followup work.
+                submitToSelfRing(task);
                 return;
             }
-        } while (!setupWriteIndex.compareAndSet(idx, idx + 1));
+            // External producer: back off and wait for a main-ring slot.
+            awaitSetupRingSpace(idx);
+        }
 
         int slot = (int) (idx & SETUP_RING_MASK);
         // Release-store so the consumer's acquire-load sees the publish.
         SETUP_SLOTS.setRelease(setupRing, slot, task);
         selector.wakeup();
+    }
+
+    /**
+     * SPSC enqueue on the self-submit ring. Only the loop thread ever calls
+     * this (from {@link #submit} when the main ring is full) and only the
+     * loop thread drains it in {@link #processSetupTasks} — so no CAS or
+     * memory-barrier instruction is needed.
+     */
+    private void submitToSelfRing(Runnable task) {
+        int tail = selfRingTail;
+        int next = (tail + 1) & SELF_RING_MASK;
+        if (next == selfRingHead) {
+            throw new IllegalStateException(
+                    "EventLoop self-submit ring full (capacity=" + SELF_RING_CAPACITY +
+                    "); a single task enqueued too many followup tasks from the loop thread");
+        }
+        selfRing[tail] = task;
+        selfRingTail = next;
+        // selector.wakeup not needed — we are the loop thread; control will
+        // return to processSetupTasks immediately after the current task.
+    }
+
+    /**
+     * External-producer wait path: spins briefly on the common case where the
+     * consumer is about to drain, then parks with a self-timed 1 ms deadline
+     * so a racing multi-waiter scenario never hangs.
+     */
+    private void awaitSetupRingSpace(long claimedIdx) {
+        int spins = 0;
+        while ((claimedIdx - (long) SETUP_READ_INDEX.getAcquire(this)) >= SETUP_RING_CAPACITY) {
+            if (spins < SUBMIT_SPIN_BUDGET) {
+                Thread.onSpinWait();
+                spins++;
+            } else {
+                // Re-publish each loop iteration so the consumer can find us
+                // after a spurious wake or after another waiter cleared the
+                // slot via getAndSet.
+                PARKED_PRODUCER.setRelease(this, Thread.currentThread());
+                // Re-check after publishing in case the consumer drained
+                // between our last read and the publish — otherwise we could
+                // park just after the final drain and miss the unpark.
+                if ((claimedIdx - (long) SETUP_READ_INDEX.getAcquire(this)) < SETUP_RING_CAPACITY) {
+                    break;
+                }
+                LockSupport.parkNanos(SUBMIT_PARK_NS);
+            }
+        }
+        // Leave parkedProducer cleared for the next caller's benefit; we
+        // may not have been the one who published it (spin-only path).
+        PARKED_PRODUCER.compareAndSet(this, Thread.currentThread(), null);
     }
 
     /**
@@ -374,19 +490,24 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private boolean hasSetupTasks() {
         int slot = (int) (setupReadIndex & SETUP_RING_MASK);
         if (SETUP_SLOTS.getAcquire(setupRing, slot) != null) return true;
-        return !setupOverflow.isEmpty();
+        return selfRingHead != selfRingTail;
     }
 
     private void processSetupTasks() {
-        // Drain the MPSC ring first (zero-alloc fast path).
+        // Drain the MPSC ring. Zero heap allocation on this path — the ring
+        // is the only task queue now that setupOverflow has been removed.
+        boolean drainedAny = false;
         while (true) {
             int slot = (int) (setupReadIndex & SETUP_RING_MASK);
             var task = (Runnable) SETUP_SLOTS.getAcquire(setupRing, slot);
             if (task == null) break; // slot not yet published / ring empty
-            // Clear slot before running so a producer can refill even if the
-            // task itself submits more work (re-entrant-safe).
+            // Clear slot and advance the release cursor BEFORE running the
+            // task so a re-entrant submit from the task body can reuse the
+            // just-freed slot. setRelease pairs with SETUP_READ_INDEX
+            // getAcquire on the producer side.
             SETUP_SLOTS.setRelease(setupRing, slot, (Runnable) null);
-            setupReadIndex++;
+            SETUP_READ_INDEX.setRelease(this, setupReadIndex + 1);
+            drainedAny = true;
             try {
                 task.run();
             } catch (Throwable t) {
@@ -396,13 +517,26 @@ public final class EventLoop implements Runnable, AutoCloseable {
                 System.err.println("EventLoop: setup task failed: " + t);
             }
         }
-        // Drain overflow (tasks that arrived while the ring was full).
-        Runnable overflow;
-        while ((overflow = setupOverflow.poll()) != null) {
+        if (drainedAny) {
+            // Wake any external producer parked on main-ring-full.
+            var waiter = (Thread) PARKED_PRODUCER.getAndSet(this, (Thread) null);
+            if (waiter != null) LockSupport.unpark(waiter);
+        }
+        // Drain self-submit ring. Single-thread access → plain reads/writes.
+        // Tasks run here may submit again (re-entrant); the enqueue goes into
+        // whichever ring has room (main first, then self again), and the
+        // outer loop picks it up on the next iteration. Bounded: each task
+        // body may enqueue at most SELF_RING_CAPACITY − pending without
+        // triggering the submitToSelfRing throw.
+        while (selfRingHead != selfRingTail) {
+            int h = selfRingHead;
+            var task = selfRing[h];
+            selfRing[h] = null;
+            selfRingHead = (h + 1) & SELF_RING_MASK;
             try {
-                overflow.run();
+                task.run();
             } catch (Throwable t) {
-                System.err.println("EventLoop: setup task failed: " + t);
+                System.err.println("EventLoop: self-submit task failed: " + t);
             }
         }
     }
