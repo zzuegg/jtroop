@@ -21,8 +21,23 @@ import sys
 
 
 def load(path):
+    """Return a dict keyed by (benchmark, sorted-params) so parameterised
+    benchmarks with the same method name but different @Param values stay
+    distinct."""
     with open(path) as f:
-        return {r["benchmark"]: r for r in json.load(f)}
+        out = {}
+        for r in json.load(f):
+            params = r.get("params") or {}
+            key = (r["benchmark"], tuple(sorted(params.items())))
+            out[key] = r
+        return out
+
+
+def key_to_str(key):
+    name, params = key
+    if not params:
+        return name
+    return name + "[" + ",".join(f"{k}={v}" for k, v in params) + "]"
 
 
 def primary_score(record):
@@ -38,11 +53,12 @@ def alloc_norm(record):
 
 def check(baseline, candidate, alloc_envelope, tp_envelope):
     regressions = []
-    for name, base in baseline.items():
-        if name not in candidate:
-            print(f"MISSING in candidate: {name}", file=sys.stderr)
+    for key, base in baseline.items():
+        if key not in candidate:
+            print(f"MISSING in candidate: {key_to_str(key)}", file=sys.stderr)
             return 2
-        cand = candidate[name]
+        cand = candidate[key]
+        name = key_to_str(key)
 
         # Throughput: higher is better for "thrpt" mode; lower for "avgt".
         base_score = primary_score(base)
