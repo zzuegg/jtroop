@@ -180,28 +180,25 @@ class UdpLayerTest {
     }
 
     @Test
-    void duplicateFilterLayer_handlesMinValueLikeSentinel() {
-        // The implementation uses Integer.MIN_VALUE as an internal sentinel —
-        // make sure that doesn't accidentally match a real seq of MIN_VALUE.
-        // (Real protocols never emit MIN_VALUE, but defensive check.)
+    void duplicateFilterLayer_acceptsSeqMinValueFirstThenDeduplicates() {
+        // Post-rollover fix (see commit 3b40baf): DuplicateFilterLayer no
+        // longer uses Integer.MIN_VALUE as a sentinel — occupied slots are
+        // tracked by the `size` counter, not by a special value in the
+        // array. A legitimate post-rollover packet with seq=Integer.MIN_VALUE
+        // is therefore accepted on first sight and deduplicated on second.
         var layer = new DuplicateFilterLayer(8);
         var buf1 = ByteBuffer.allocate(64);
         buf1.putInt(Integer.MIN_VALUE);
         buf1.putInt(1);
         buf1.flip();
-        // First time: the stored sentinel equals MIN_VALUE so a naive impl
-        // would report "already seen". We accept: the current impl treats
-        // MIN_VALUE as sentinel, so this is documented behaviour — drop.
-        // Either behaviour is acceptable as long as it's consistent, so we
-        // only assert that the second pass produces the same result as the first.
         var first = layer.decodeInbound(buf1);
+        assertNotNull(first, "first seq=MIN_VALUE must be accepted");
 
         var buf2 = ByteBuffer.allocate(64);
         buf2.putInt(Integer.MIN_VALUE);
         buf2.putInt(1);
         buf2.flip();
         var second = layer.decodeInbound(buf2);
-        assertEquals(first == null, second == null,
-                "MIN_VALUE handling must be deterministic across repeated calls");
+        assertNull(second, "second seq=MIN_VALUE must be dropped as duplicate");
     }
 }

@@ -70,9 +70,16 @@ class ReliableUdpIntegrationTest {
         var fwdAddr = new InetSocketAddress("127.0.0.1", fwdPort);
 
         // Per-connection state on BOTH sides (demonstrates per-connection instantiation).
-        var clientAck = new AckLayer(80); // 80ms retransmit timeout
+        // Small base timeout + high retry cap so the exponential-backoff schedule
+        // fits many retries into the test's 20 s deadline. At 20 ms base, backoff
+        // of 20, 40, 80, 160, 320, 640, 1280, 1280, 1280, ... ms gives ≳ 15 retries
+        // per packet before deadline — 0.5^15 ≈ 3e-5 per packet, 40 packets ⇒
+        // essentially never hits the cap under 50 % loss. (Pre-Fix-6 AckLayer
+        // retransmitted at a constant 80 ms forever; this test then relied on the
+        // unbounded-retry behaviour that is now intentionally capped.)
+        var clientAck = new AckLayer(20, 100); // 20 ms base timeout, 100-retry cap
         var clientSeq = new SequencingLayer(); // used only on encode path in this test
-        var serverAck = new AckLayer(80);
+        var serverAck = new AckLayer(20, 100);
         var serverDupFilter = new DuplicateFilterLayer(256);
 
         var receivedPayloads = new BitSet(packetCount);
