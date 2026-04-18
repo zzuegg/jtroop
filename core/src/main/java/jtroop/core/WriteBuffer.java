@@ -1,8 +1,19 @@
 package jtroop.core;
 
+import jtroop.ProtocolException;
 import java.nio.ByteBuffer;
 
 public final class WriteBuffer {
+
+    private static final int MAX_UTF8_LEN = 0xFFFF;
+
+    private static int checkUtf8Length(int byteLen) {
+        if (byteLen > MAX_UTF8_LEN) {
+            throw new ProtocolException(
+                    "UTF-8 payload exceeds " + MAX_UTF8_LEN + " bytes (" + byteLen + ")");
+        }
+        return byteLen;
+    }
 
     private final ByteBuffer buf;
 
@@ -108,6 +119,7 @@ public final class WriteBuffer {
                     i++;
                 }
             }
+            checkUtf8Length(w);
             buf.position(startPos + w);
             // Backpatch length prefix.
             arr[buf.arrayOffset() + lenPos]     = (byte) ((w >> 8) & 0xFF);
@@ -139,6 +151,7 @@ public final class WriteBuffer {
                 }
             }
             int byteLen = buf.position() - startPos;
+            checkUtf8Length(byteLen);
             buf.putShort(lenPos, (short) byteLen);
         }
     }
@@ -157,9 +170,10 @@ public final class WriteBuffer {
         }
         if (value instanceof BufferCharSequence bcs) {
             // Fast path: copy raw UTF-8 bytes directly — no char decode needed.
-            buf.putShort((short) bcs.byteLength());
+            int bl = checkUtf8Length(bcs.byteLength());
+            buf.putShort((short) bl);
             // BufferCharSequence wraps a byte[] region; copy it out.
-            buf.put(bcs.backingArray(), bcs.backingOffset(), bcs.byteLength());
+            buf.put(bcs.backingArray(), bcs.backingOffset(), bl);
             return;
         }
         // Generic CharSequence path: encode char-by-char
@@ -193,6 +207,7 @@ public final class WriteBuffer {
             }
         }
         int byteLen = buf.position() - startPos;
+        checkUtf8Length(byteLen);
         buf.putShort(lenPos, (short) byteLen);
     }
 }

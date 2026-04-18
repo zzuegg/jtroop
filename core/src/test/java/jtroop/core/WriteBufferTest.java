@@ -1,5 +1,6 @@
 package jtroop.core;
 
+import jtroop.ProtocolException;
 import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 
@@ -108,5 +109,64 @@ class WriteBufferTest {
         assertEquals(2, buf.get());
         assertEquals(3, buf.get());
         assertEquals(4, buf.get());
+    }
+
+    // ---------- UTF-8 64-KiB boundary (Fix 9) ----------
+
+    private static String repeatAscii(int count) {
+        var chars = new char[count];
+        java.util.Arrays.fill(chars, 'a');
+        return new String(chars);
+    }
+
+    @Test
+    void writeString_exactly64KiBMinusOne_encodesSuccessfully_heapBuffer() {
+        // 65 535 bytes fits in the u16 length prefix (max representable = 0xFFFF).
+        var s = repeatAscii(0xFFFF);
+        var buf = ByteBuffer.allocate(0xFFFF + 2 + 16);
+        var wb = new WriteBuffer(buf);
+        wb.writeString(s);
+        buf.flip();
+        assertEquals(0xFFFF, buf.getShort() & 0xFFFF);
+        assertEquals(0xFFFF, buf.remaining());
+    }
+
+    @Test
+    void writeString_above64KiB_throwsProtocolException_heapBuffer() {
+        // 65 536 bytes does NOT fit in u16. On current main this silently
+        // truncates the length prefix; after fix it must throw.
+        var s = repeatAscii(0x10000);
+        var buf = ByteBuffer.allocate(0x10000 + 2 + 16);
+        var wb = new WriteBuffer(buf);
+        assertThrows(ProtocolException.class, () -> wb.writeString(s));
+    }
+
+    @Test
+    void writeString_above64KiB_throwsProtocolException_directBuffer() {
+        var s = repeatAscii(0x10000);
+        var buf = ByteBuffer.allocateDirect(0x10000 + 2 + 16);
+        var wb = new WriteBuffer(buf);
+        assertThrows(ProtocolException.class, () -> wb.writeString(s));
+    }
+
+    @Test
+    void writeCharSequence_above64KiB_throwsProtocolException_genericPath() {
+        var s = repeatAscii(0x10000);
+        // Wrap in a non-String, non-BufferCharSequence CharSequence so we hit
+        // the generic path at lines ~165–196.
+        CharSequence cs = new StringBuilder(s);
+        var buf = ByteBuffer.allocateDirect(0x10000 + 2 + 16);
+        var wb = new WriteBuffer(buf);
+        assertThrows(ProtocolException.class, () -> wb.writeCharSequence(cs));
+    }
+
+    @Test
+    void writeCharSequence_above64KiB_throwsProtocolException_bufferCharSequencePath() {
+        var raw = new byte[0x10000];
+        java.util.Arrays.fill(raw, (byte) 'a');
+        var bcs = new BufferCharSequence(raw, 0, raw.length);
+        var buf = ByteBuffer.allocate(0x10000 + 2 + 16);
+        var wb = new WriteBuffer(buf);
+        assertThrows(ProtocolException.class, () -> wb.writeCharSequence(bcs));
     }
 }
