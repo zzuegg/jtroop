@@ -63,6 +63,24 @@ The blocking variants exercise `EventLoop.stageWriteAndFlush`, which is where Fi
 - `EventLoop.stageWriteAndFlush` wait loop uses only `VarHandle` acquire/release and `LockSupport.parkNanos` — no allocation, no synchronisation beyond what already existed on the per-slot buffer.
 - `Pipeline.onConnectionClose` iterates a plain `Layer[]` via `invokeinterface`; close is called O(connections), not O(messages), so this is acceptable.
 
+## Tier-C additions (landed same-day)
+
+After tier B completed, two tier-C MEDIUM-severity items were addressed:
+
+| Commit | Fix | Verification |
+|---|---|---|
+| `bdf1f8a` | `CompressionLayer` decompression-bomb cap — new `maxUncompressedSize` (default 16 MiB); rejects negative/over-cap `originalSize` before any allocation, blocking the ~2 GB-per-frame OOM vector | 5 new tests in `CompressionBombTest` (bomb, negative, boundary-at-cap, over-cap, encode-side) |
+| `d315792` | `AllowListLayer` IPv4 ↔ IPv4-mapped IPv6 canonicalisation at construction — ends false-negative deny of IPv4 peers arriving via an IPv6 listener on dual-stack JVMs, and symmetrically closes the deny-list bypass | New `ipv4MappedIpv6_treatedAsSameHost` test using a byte-constructed 16-byte `Inet6Address` |
+
+Post-tier-C benchmark numbers (same `-prof gc` short-cycle profile):
+
+| Benchmark | Baseline | Post-tier-C | Delta |
+|---|---|---|---|
+| `NetGameBenchmark.positionUpdate` ops/ms | 59 533 | 58 853 ± 3 152 | −1.1% (within noise) |
+| `NetGameBenchmark.positionUpdate` B/op | 0.017 | 0.017 ± 0.001 | flat |
+| `NetGameBenchmark.chatMessage` ops/ms | 21 262 | 20 153 ± 1 601 | −5.2% (CI overlaps baseline) |
+| `NetGameBenchmark.chatMessage` B/op | 0.046 | 0.050 ± 0.004 | +0.004 (within noise) |
+
 ## Follow-ups
 
 Recorded for tier C / tier D:
