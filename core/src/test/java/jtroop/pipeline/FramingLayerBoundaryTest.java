@@ -3,6 +3,8 @@ package jtroop.pipeline;
 import jtroop.ProtocolException;
 import jtroop.pipeline.layers.FramingLayer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.ByteBuffer;
 
@@ -15,35 +17,22 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class FramingLayerBoundaryTest {
 
-    @Test
-    void rejectsNegativeLength() {
-        // A garbage or hostile peer sends a negative length prefix. Previously
-        // this triggered BufferUnderflowException or an IndexOutOfBounds from
-        // slice(). Now it must be rejected cleanly so the server can close the
-        // connection instead of dying on an internal buffer exception.
+    // Garbage or hostile peer sends an unacceptable length prefix. Previously
+    // negative lengths triggered BufferUnderflowException or IndexOutOfBounds
+    // from slice(), and over-MAX lengths stalled the read loop forever.
+    // All out-of-range values must surface a ProtocolException so the server
+    // can close the connection cleanly.
+    @ParameterizedTest(name = "length={0}")
+    @ValueSource(ints = {
+            -1,
+            Integer.MIN_VALUE,
+            FramingLayer.MAX_FRAME_LENGTH + 1,
+            Integer.MAX_VALUE
+    })
+    void rejectsOutOfRangeLength(int length) {
         var framing = new FramingLayer();
         var wire = ByteBuffer.allocate(16);
-        wire.putInt(-1);
-        wire.flip();
-        assertThrows(ProtocolException.class, () -> framing.decodeInbound(wire));
-    }
-
-    @Test
-    void rejectsLengthAboveMax() {
-        // length > MAX_FRAME_LENGTH can never be satisfied by the read loop:
-        // the buffer isn't big enough, so we'd return null forever and stall.
-        var framing = new FramingLayer();
-        var wire = ByteBuffer.allocate(16);
-        wire.putInt(FramingLayer.MAX_FRAME_LENGTH + 1);
-        wire.flip();
-        assertThrows(ProtocolException.class, () -> framing.decodeInbound(wire));
-    }
-
-    @Test
-    void rejectsHugeLength() {
-        var framing = new FramingLayer();
-        var wire = ByteBuffer.allocate(16);
-        wire.putInt(Integer.MAX_VALUE);
+        wire.putInt(length);
         wire.flip();
         assertThrows(ProtocolException.class, () -> framing.decodeInbound(wire));
     }
