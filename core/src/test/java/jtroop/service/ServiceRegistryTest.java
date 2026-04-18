@@ -163,6 +163,37 @@ class ServiceRegistryTest {
         assertEquals(ChatService.class, registry.serviceInterface(ChatHandler.class));
     }
 
+    // --- Handler inheritance: @OnMessage on a superclass must be discovered ---
+
+    interface PingService { void ping(ChatMessage msg); }
+
+    static abstract class PingBaseHandler {
+        final List<ChatMessage> receivedByBase = new ArrayList<>();
+        @OnMessage
+        void ping(ChatMessage msg, ConnectionId sender) {
+            receivedByBase.add(msg);
+        }
+    }
+
+    @Handles(PingService.class)
+    static class PingSubHandler extends PingBaseHandler { }
+
+    @Test
+    void register_findsOnMessageDeclaredInSuperclass() {
+        var codec = new CodecRegistry();
+        var registry = new ServiceRegistry(codec);
+        var handler = new PingSubHandler();
+        registry.register(handler);
+
+        // Pre-fix: getDeclaredMethods on PingSubHandler yields nothing (no
+        // methods declared there), so the @OnMessage in PingBaseHandler is
+        // silently skipped and dispatch would throw "No handler for message
+        // type". Post-fix: the inherited annotation is picked up.
+        registry.dispatch(new ChatMessage("hi", 0), ConnectionId.of(0, 1));
+        assertEquals(1, handler.receivedByBase.size());
+        assertEquals("hi", handler.receivedByBase.get(0).text());
+    }
+
     @Test
     void messageTypes_listedForServiceInterface() {
         var codec = new CodecRegistry();

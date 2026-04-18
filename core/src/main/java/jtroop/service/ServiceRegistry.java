@@ -78,9 +78,13 @@ public final class ServiceRegistry {
         handlerToInterface.put(handlerClass, serviceInterface);
         var messageTypes = interfaceToMessageTypes.computeIfAbsent(serviceInterface, _ -> new HashSet<>());
 
-        // Scan handler methods for @OnMessage
+        // Scan handler methods for @OnMessage — walking up the class hierarchy
+        // so an @OnMessage declared in a superclass is picked up. Within the
+        // walk we deduplicate by (name, parameter types) so a subclass that
+        // overrides an annotated superclass method registers only once.
         var lookup = MethodHandles.lookup();
-        for (Method m : handlerClass.getDeclaredMethods()) {
+        var seenSignatures = new java.util.HashSet<String>();
+        for (Method m : collectAnnotatedMethodsHierarchy(handlerClass, OnMessage.class, seenSignatures)) {
             if (!m.isAnnotationPresent(OnMessage.class)) continue;
             m.setAccessible(true);
 
@@ -143,8 +147,9 @@ public final class ServiceRegistry {
             }
         }
 
-        // Scan for lifecycle methods
-        for (Method m : handlerClass.getDeclaredMethods()) {
+        // Scan for lifecycle methods (also inherited — same rules as @OnMessage).
+        var lifecycleSeen = new java.util.HashSet<String>();
+        for (Method m : collectAnnotatedMethodsHierarchy(handlerClass, null, lifecycleSeen)) {
             m.setAccessible(true);
             try {
                 if (m.isAnnotationPresent(OnConnect.class)) {
@@ -226,6 +231,36 @@ public final class ServiceRegistry {
                 throw new JtroopException("Dispatch failed for " + message.getClass().getName(), e);
             }
         }
+    }
+
+    /**
+     * Walk the class hierarchy starting at {@code cls} down to (but not
+     * including) {@link Object}, collecting methods. Subclass methods are
+     * yielded first so an override shadows the parent version; the
+     * {@code seen} set tracks (name, parameter-types) signatures seen so
+     * far so the parent's overridden method is skipped.
+     *
+     * <p>If {@code annotation} is non-null, only methods carrying that
+     * annotation are yielded (faster — most methods aren't annotated).
+     * If null, every method is yielded.
+     */
+    private static java.util.List<Method> collectAnnotatedMethodsHierarchy(
+            Class<?> cls,
+            Class<? extends java.lang.annotation.Annotation> annotation,
+            java.util.Set<String> seen) {
+        var result = new java.util.ArrayList<Method>();
+        for (Class<?> c = cls; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Method m : c.getDeclaredMethods()) {
+                if (annotation != null && !m.isAnnotationPresent(annotation)) continue;
+                var sig = m.getName() + "(" + java.util.Arrays.stream(m.getParameterTypes())
+                        .map(Class::getName)
+                        .reduce((a, b) -> a + "," + b).orElse("") + ")";
+                if (seen.add(sig)) {
+                    result.add(m);
+                }
+            }
+        }
+        return result;
     }
 
     public Object dispatch(Record message, ConnectionId sender) {
