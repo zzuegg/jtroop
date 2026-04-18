@@ -15,6 +15,46 @@ class DuplicateFilterSequencingEdgeCaseTest {
 
     // ---- DuplicateFilterLayer ----
 
+    /** Craft a wire frame with a specific 4-byte seq + payload. */
+    private static ByteBuffer seqFrame(int seq) {
+        var buf = ByteBuffer.allocate(8);
+        buf.putInt(seq);
+        buf.putInt(0); // payload byte
+        buf.flip();
+        return buf;
+    }
+
+    @Test
+    void sequencingLayer_32bitRollover_acceptsSuccessors() {
+        var layer = new SequencingLayer();
+        // Seed lastReceivedSeq just below rollover by feeding an in-order packet.
+        var near = seqFrame(Integer.MAX_VALUE - 1);
+        assertNotNull(layer.decodeInbound(near));
+        var top = seqFrame(Integer.MAX_VALUE);
+        assertNotNull(layer.decodeInbound(top));
+
+        // Rollover: next seq is Integer.MIN_VALUE (signed wrap). Pre-fix:
+        // signed <= comparison says MIN_VALUE <= MAX_VALUE → dropped forever.
+        // Post-fix: wrap-aware comparison accepts it.
+        var rolled = seqFrame(Integer.MIN_VALUE);
+        assertNotNull(layer.decodeInbound(rolled),
+                "first post-rollover packet must be accepted, not dropped as stale");
+
+        var after = seqFrame(Integer.MIN_VALUE + 1);
+        assertNotNull(layer.decodeInbound(after));
+    }
+
+    @Test
+    void duplicateFilter_sentinelCollision_allowsLegitimateSeqMinValue() {
+        var layer = new DuplicateFilterLayer(4);
+        // Pre-fix: Integer.MIN_VALUE is the EMPTY sentinel. A legitimate
+        // post-rollover packet with seq=Integer.MIN_VALUE is incorrectly
+        // flagged as duplicate (matches uninitialised slot) and dropped.
+        var rolled = seqFrame(Integer.MIN_VALUE);
+        assertNotNull(layer.decodeInbound(rolled),
+                "first seq=Integer.MIN_VALUE must not collide with empty sentinel");
+    }
+
     @Test
     void duplicateFilter_shortWire_returnsNull() {
         var layer = new DuplicateFilterLayer(8);

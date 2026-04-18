@@ -19,6 +19,9 @@ public final class SequencingLayer implements Layer {
 
     private int sendSeq = 0;
     private int lastReceivedSeq = -1;
+    /** False until the first packet is accepted; thereafter lastReceivedSeq
+     *  is compared modulo 2^32 so sequence rollover is transparent. */
+    private boolean anyReceived = false;
 
     @Override
     public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
@@ -30,12 +33,19 @@ public final class SequencingLayer implements Layer {
     public ByteBuffer decodeInbound(Layer.Context ctx, ByteBuffer wire) {
         if (wire.remaining() < 4) return null;
         int seq = wire.getInt();
-        if (seq <= lastReceivedSeq) {
+        // Wrap-aware "is seq strictly after lastReceivedSeq modulo 2^32".
+        // The unsigned-wrap trick: (seq - lastReceivedSeq) interpreted as a
+        // signed int is positive iff seq comes after lastReceivedSeq in the
+        // 32-bit wrap window. Handles the MAX_VALUE → MIN_VALUE rollover
+        // transparently — pre-fix the signed <= compare dropped every packet
+        // after rollover as "stale" and stalled the protocol forever.
+        if (anyReceived && (seq - lastReceivedSeq) <= 0) {
             // Stale packet — skip remaining
             wire.position(wire.limit());
             return null;
         }
         lastReceivedSeq = seq;
+        anyReceived = true;
         // Return the same buffer, positioned past the 4-byte sequence prefix.
         // Callers read from position..limit so no {@code slice()} allocation
         // is required. {@code wire.getInt()} above already advanced position

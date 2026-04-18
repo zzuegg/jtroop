@@ -19,8 +19,6 @@ import java.nio.ByteBuffer;
  */
 public final class DuplicateFilterLayer implements Layer {
 
-    private static final int EMPTY = Integer.MIN_VALUE;
-
     private final int[] seen;
     private int writeIdx;
     private int size;
@@ -28,9 +26,10 @@ public final class DuplicateFilterLayer implements Layer {
     public DuplicateFilterLayer(int capacity) {
         if (capacity <= 0) throw new ConfigurationException("capacity must be positive");
         this.seen = new int[capacity];
-        // Fill with sentinel — sequence numbers are non-negative in normal use,
-        // so EMPTY (Integer.MIN_VALUE) never collides with a real seq.
-        for (int i = 0; i < capacity; i++) seen[i] = EMPTY;
+        // No sentinel needed — {@link #containsSeq} only scans the first
+        // {@code size} ring positions, which are the occupied ones. Using a
+        // sentinel value (e.g. Integer.MIN_VALUE) would alias a legitimate
+        // post-rollover sequence number and incorrectly flag it as duplicate.
     }
 
     @Override
@@ -59,9 +58,12 @@ public final class DuplicateFilterLayer implements Layer {
     }
 
     private boolean containsSeq(int seq) {
-        // Linear scan — no allocation, branch-predictor friendly.
+        // Linear scan over ONLY the occupied slots [0..size). Unwritten slots
+        // carry the default-zero and would collide with seq=0 otherwise —
+        // more importantly, any single sentinel value would collide with a
+        // legitimate post-rollover sequence number.
         var arr = seen;
-        int n = arr.length;
+        int n = size;
         for (int i = 0; i < n; i++) {
             if (arr[i] == seq) return true;
         }
