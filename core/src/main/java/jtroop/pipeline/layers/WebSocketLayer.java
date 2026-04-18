@@ -142,9 +142,89 @@ public final class WebSocketLayer implements Layer {
                 decoded.put(wire.get(payloadStart + i));
             }
         }
+        // RFC 6455 §5.6: text-frame payloads MUST be valid UTF-8. Only text
+        // frames reach this point (non-fin / non-text rejected at line 127).
+        // Hand-rolled per-byte check against the RFC 3629 production — zero
+        // allocation, no CharsetDecoder instance, no char[] materialization.
+        validateUtf8(decoded, decoded.position());
         decoded.flip();
         wire.position((int) (start + totalLen));
         return decoded;
+    }
+
+    /**
+     * Validate that {@code [0, len)} in {@code buf} is a well-formed UTF-8
+     * sequence per RFC 3629. Throws {@link ProtocolException} on any
+     * overlong encoding, surrogate codepoint, out-of-range code point,
+     * truncated multi-byte sequence, or invalid start/continuation byte.
+     *
+     * <p>Zero allocation: walks the buffer via absolute {@code get(int)}
+     * without touching position or creating intermediate objects.
+     */
+    private static void validateUtf8(ByteBuffer buf, int len) {
+        int i = 0;
+        while (i < len) {
+            int b1 = buf.get(i) & 0xFF;
+            if (b1 < 0x80) { i++; continue; }
+            // 0x80..0xC1 are never valid start bytes (continuations + overlong 2-byte leads)
+            if (b1 < 0xC2) {
+                throw new ProtocolException("invalid UTF-8 start byte 0x"
+                        + Integer.toHexString(b1) + " at offset " + i);
+            }
+            if (b1 < 0xE0) {
+                // 2-byte sequence
+                if (i + 1 >= len) {
+                    throw new ProtocolException("truncated UTF-8 2-byte sequence at offset " + i);
+                }
+                int b2 = buf.get(i + 1) & 0xFF;
+                if ((b2 & 0xC0) != 0x80) {
+                    throw new ProtocolException("invalid UTF-8 continuation at offset " + (i + 1));
+                }
+                i += 2;
+            } else if (b1 < 0xF0) {
+                // 3-byte sequence
+                if (i + 2 >= len) {
+                    throw new ProtocolException("truncated UTF-8 3-byte sequence at offset " + i);
+                }
+                int b2 = buf.get(i + 1) & 0xFF;
+                int b3 = buf.get(i + 2) & 0xFF;
+                if ((b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) {
+                    throw new ProtocolException("invalid UTF-8 continuation in 3-byte at offset " + i);
+                }
+                // Reject overlong (U+0000..U+07FF re-encoded as 3-byte)
+                if (b1 == 0xE0 && b2 < 0xA0) {
+                    throw new ProtocolException("overlong UTF-8 3-byte sequence at offset " + i);
+                }
+                // Reject surrogate range U+D800..U+DFFF (encoded as 0xED 0xA0..0xBF ...)
+                if (b1 == 0xED && b2 >= 0xA0) {
+                    throw new ProtocolException("UTF-8 surrogate code point at offset " + i);
+                }
+                i += 3;
+            } else if (b1 < 0xF5) {
+                // 4-byte sequence, covers U+10000..U+10FFFF
+                if (i + 3 >= len) {
+                    throw new ProtocolException("truncated UTF-8 4-byte sequence at offset " + i);
+                }
+                int b2 = buf.get(i + 1) & 0xFF;
+                int b3 = buf.get(i + 2) & 0xFF;
+                int b4 = buf.get(i + 3) & 0xFF;
+                if ((b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 || (b4 & 0xC0) != 0x80) {
+                    throw new ProtocolException("invalid UTF-8 continuation in 4-byte at offset " + i);
+                }
+                // Reject overlong (U+0000..U+FFFF re-encoded as 4-byte)
+                if (b1 == 0xF0 && b2 < 0x90) {
+                    throw new ProtocolException("overlong UTF-8 4-byte sequence at offset " + i);
+                }
+                // Reject code points above U+10FFFF
+                if (b1 == 0xF4 && b2 >= 0x90) {
+                    throw new ProtocolException("UTF-8 code point above U+10FFFF at offset " + i);
+                }
+                i += 4;
+            } else {
+                throw new ProtocolException("invalid UTF-8 start byte 0x"
+                        + Integer.toHexString(b1) + " at offset " + i);
+            }
+        }
     }
 
     @Override
