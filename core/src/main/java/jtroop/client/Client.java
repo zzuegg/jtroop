@@ -75,8 +75,14 @@ public final class Client implements AutoCloseable {
     //    its own stack frame. With the full codec.decode chain inlined, C2
     //    scalar-replaces the record — it never hits the heap.
     // No CompletableFuture per call, no Integer boxing, no HashMap entry.
-    // 256 slots supports up to 256 in-flight requests per Client (typical: 1-4).
-    private static final int REQ_SLOTS = 256;
+    //
+    // 4096 slots supports up to 4096 in-flight requests per Client (typical:
+    // 1–16). At 64 B/scratch + 20 B metadata per slot, the pre-allocation is
+    // ~340 KB — cheap insurance against the "slot 0 reused while request 0
+    // is still pending" collision that 256 could hit under high concurrent
+    // request load. A collision check at claim-time additionally guards
+    // against exhaustion beyond the pre-allocated capacity.
+    private static final int REQ_SLOTS = 4096;
     private static final int REQ_MASK = REQ_SLOTS - 1;
     // Per-slot scratch size. Covers typeId (2B) + small primitive response
     // records; grown lazily if a larger response arrives.
@@ -892,11 +898,28 @@ public final class Client implements AutoCloseable {
         // hidden class → new EchoAck(seq)), enabling scalar replacement of
         // the returned record itself — the cross-thread handoff carries only
         // primitive bytes, never an object reference.
-        int slot = requestIdCounter.getAndIncrement() & REQ_MASK;
         Thread self = Thread.currentThread();
-        // Publish waiter *before* send so the reader can't see a response
-        // without also seeing the thread to unpark.
-        REQ_WAITER.setRelease(reqWaiters, slot, self);
+        // Claim a slot via CAS. Pre-fix: getAndIncrement with modulo could
+        // wrap onto a slot still in use by an earlier, slow-responding
+        // request — the second waiter would overwrite the first's entry and
+        // either block forever (if the first had already left) or wake up
+        // reading the WRONG response bytes out of reqScratch. The CAS loop
+        // below skips occupied slots until it finds a free one or gives up.
+        int slot;
+        int attempts = 0;
+        while (true) {
+            slot = requestIdCounter.getAndIncrement() & REQ_MASK;
+            if ((int) REQ_READY.getAcquire(reqReady, slot) == 0
+                    && REQ_WAITER.compareAndSet(reqWaiters, slot, (Thread) null, self)) {
+                break;
+            }
+            if (++attempts > REQ_SLOTS * 2) {
+                throw new RuntimeException(
+                        "Request slots exhausted (capacity=" + REQ_SLOTS
+                                + "); too many concurrent in-flight requests");
+            }
+        }
+        // waiter already published by the CAS above.
         // Must use sendBlocking — send() stages bytes non-blocking, which
         // leaves the request in the write buffer for up to 1ms until the
         // selector drains it. sendBlocking's direct-write fast path pushes
