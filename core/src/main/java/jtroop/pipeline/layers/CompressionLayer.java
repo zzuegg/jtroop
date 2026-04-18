@@ -48,9 +48,19 @@ public final class CompressionLayer implements Layer, AutoCloseable {
     /** Default minimum payload size before compression is attempted. */
     private static final int DEFAULT_MIN_COMPRESS_SIZE = 64;
 
+    /**
+     * Default upper bound on the {@code originalSize} a peer may announce in
+     * a compressed frame. 16 MiB is generous for any game/IoT/RPC payload
+     * while putting a firm ceiling on the worst-case decompression
+     * allocation a malicious peer can force. Configurable via the 3-arg
+     * constructor.
+     */
+    public static final int DEFAULT_MAX_UNCOMPRESSED = 16 * 1024 * 1024;
+
     private final Deflater deflater;
     private final Inflater inflater;
     private final int minCompressSize;
+    private final int maxUncompressedSize;
 
     // Input side scratch arrays. Grow on demand; never shrink. After warmup
     // these stabilise to the hot-path working set, giving zero allocation.
@@ -82,9 +92,26 @@ public final class CompressionLayer implements Layer, AutoCloseable {
      *                        raw without zlib. Set to 0 to always compress.
      */
     public CompressionLayer(int level, int minCompressSize) {
+        this(level, minCompressSize, DEFAULT_MAX_UNCOMPRESSED);
+    }
+
+    /**
+     * @param level               deflate level (0..9, or {@link Deflater#DEFAULT_COMPRESSION}).
+     * @param minCompressSize     payloads smaller than this (bytes) are passed through raw.
+     * @param maxUncompressedSize upper bound on the {@code originalSize} a peer may
+     *                            announce in a compressed frame. Frames claiming a
+     *                            larger uncompressed payload are rejected with
+     *                            {@link ProtocolException} BEFORE any allocation —
+     *                            prevents decompression-bomb DoS. Must be &gt; 0.
+     */
+    public CompressionLayer(int level, int minCompressSize, int maxUncompressedSize) {
+        if (maxUncompressedSize <= 0) {
+            throw new jtroop.ConfigurationException("maxUncompressedSize must be positive");
+        }
         this.deflater = new Deflater(level);
         this.inflater = new Inflater();
         this.minCompressSize = minCompressSize;
+        this.maxUncompressedSize = maxUncompressedSize;
     }
 
     /** Returns the minimum payload size (bytes) that triggers compression. */
@@ -95,6 +122,12 @@ public final class CompressionLayer implements Layer, AutoCloseable {
     @Override
     public void encodeOutbound(Layer.Context ctx, ByteBuffer payload, ByteBuffer out) {
         int len = payload.remaining();
+        if (len > maxUncompressedSize) {
+            // Refuse to produce a frame whose own decoder would reject it.
+            throw new ProtocolException(
+                    "payload size " + len + " exceeds configured maxUncompressedSize " +
+                    maxUncompressedSize);
+        }
 
         // Small-payload bypass: skip zlib entirely, write raw with flag.
         if (len < minCompressSize) {
@@ -161,6 +194,15 @@ public final class CompressionLayer implements Layer, AutoCloseable {
 
         if (wire.remaining() < 4) return null;
         int originalSize = wire.getInt();
+        // Decompression-bomb defense: reject announced sizes that are
+        // negative or above the configured ceiling BEFORE allocating the
+        // output buffer. A malicious peer could otherwise force ~2 GB
+        // allocations with a handful of tiny compressed payloads.
+        if (originalSize < 0 || originalSize > maxUncompressedSize) {
+            throw new ProtocolException(
+                    "compressed frame declares originalSize=" + originalSize +
+                    " (max " + maxUncompressedSize + ")");
+        }
         int compLen = wire.remaining();
 
         byte[] comp = compressedScratch;
