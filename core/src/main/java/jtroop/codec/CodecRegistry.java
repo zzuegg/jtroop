@@ -108,6 +108,19 @@ public final class CodecRegistry {
         java.util.Objects.requireNonNull(type, "parameter 'type' must not be null");
         if (byClass.containsKey(type)) return;
         int id = stableTypeId(type);
+        // Reject type-id collision. Pre-fix, the second registration silently
+        // overwrote the slot — the first type could then never be decoded
+        // (its typeId pointed at the second type's codec), and any malformed
+        // wire byte matching the shared id would decode as the wrong record.
+        // Fail fast at registration so the operator can rename one of the
+        // conflicting types before the server starts serving traffic.
+        var existing = byId[id];
+        if (existing != null && existing.type() != type) {
+            throw new ConfigurationException(
+                    "Type-ID collision on id=" + id + " (0x" + Integer.toHexString(id)
+                            + "): " + existing.type().getName() + " and " + type.getName()
+                            + " both hash to the same 16-bit slot. Rename one of them.");
+        }
         var components = buildComponentCodecs(type);
         var constructor = buildConstructor(type);
         var accessors = buildAccessors(type);
