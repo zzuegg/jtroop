@@ -750,12 +750,23 @@ public final class Server implements AutoCloseable {
             var rb = new ReadBuffer(frame);
             var message = codec.decode(rb);
 
-            executor.execute(() -> {
+            // Mirror the inlineExecutor branch in processInboundLegacy so the
+            // fused-receiver fallback path stays zero-alloc under the default
+            // inline executor. Pre-fix this unconditionally allocated the
+            // ~40 B lambda capture, defeating EA on the fallback path.
+            if (inlineExecutor) {
                 var result = serviceRegistry.dispatch(message, sender);
                 if (result instanceof Record response) {
                     sendResponse(response, config, channel, sender);
                 }
-            });
+            } else {
+                executor.execute(() -> {
+                    var result = serviceRegistry.dispatch(message, sender);
+                    if (result instanceof Record response) {
+                        sendResponse(response, config, channel, sender);
+                    }
+                });
+            }
         }
     }
 
