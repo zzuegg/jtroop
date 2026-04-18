@@ -192,9 +192,63 @@ class BufferCharSequenceTest {
     // --- subSequence ---
 
     @Test
-    void subSequence_delegatesToString() {
+    void subSequence_asciiRange() {
         var cs = of("abcdef");
         assertEquals("bcd", cs.subSequence(1, 4).toString());
+    }
+
+    @Test
+    void subSequence_zeroAllocView_returnsBufferCharSequence_onCleanBoundaries() {
+        // Zero-alloc path: both endpoints on clean char boundaries → a
+        // BufferCharSequence view over the same backing array.
+        var cs = of("hello world");
+        var sub = cs.subSequence(6, 11);
+        assertEquals("world", sub.toString());
+        assertInstanceOf(BufferCharSequence.class, sub,
+                "clean-boundary subSequence must return a BufferCharSequence view, not a String");
+    }
+
+    @Test
+    void subSequence_multibyteUtf8_boundaries() {
+        // 'é' (U+00E9, 2-byte), '中' (U+4E2D, 3-byte), '😀' (U+1F600, 4-byte / surrogate pair)
+        var cs = of("a\u00e9\u4e2d\uD83D\uDE00"); // length = 5 chars (surrogate pair counts as 2)
+        assertEquals("a", cs.subSequence(0, 1).toString());
+        assertEquals("\u00e9", cs.subSequence(1, 2).toString());
+        assertEquals("\u4e2d", cs.subSequence(2, 3).toString());
+        // End-of-string including full surrogate pair.
+        assertEquals("\uD83D\uDE00", cs.subSequence(3, 5).toString());
+    }
+
+    @Test
+    void subSequence_midSurrogatePair_fallsBackToString() {
+        // A surrogate pair occupies char indices 3 and 4. Ending at index 4
+        // would split the pair — must fall back to the materialised String.
+        var cs = of("a\u00e9\u4e2d\uD83D\uDE00");
+        var sub = cs.subSequence(0, 4);
+        // Start is on a clean boundary, end is mid-pair → fallback.
+        // Result must be a 4-char string containing the high surrogate.
+        assertEquals(4, sub.length());
+        assertEquals('\uD83D', sub.charAt(3));
+    }
+
+    @Test
+    void subSequence_emptyRange() {
+        var cs = of("abcdef");
+        assertEquals("", cs.subSequence(2, 2).toString());
+    }
+
+    @Test
+    void subSequence_fullRange_returnsEquivalent() {
+        var cs = of("abcdef");
+        assertEquals("abcdef", cs.subSequence(0, 6).toString());
+    }
+
+    @Test
+    void subSequence_outOfBounds_throws() {
+        var cs = of("abc");
+        assertThrows(IndexOutOfBoundsException.class, () -> cs.subSequence(-1, 2));
+        assertThrows(IndexOutOfBoundsException.class, () -> cs.subSequence(0, 4));
+        assertThrows(IndexOutOfBoundsException.class, () -> cs.subSequence(2, 1));
     }
 
     // --- toString caching ---
