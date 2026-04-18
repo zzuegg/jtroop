@@ -286,6 +286,19 @@ public final class HttpLayer implements Layer {
                     numStart++;
                 }
                 if (numStart == digitStart) return -3;
+                // RFC 7230 §3.3.2: Content-Length = 1*DIGIT. Anything other
+                // than trailing OWS (SP/HTAB) or CRLF after the digits is
+                // malformed — silently accepting the leading digits is a
+                // request-smuggling vector because different front-ends will
+                // disagree on the framed body length ("4 2" interpreted as 4
+                // by one and 42 by another).
+                int trail = numStart;
+                while (trail < to) {
+                    byte b = wire.get(trail);
+                    if (b == ' ' || b == '\t') { trail++; continue; }
+                    if (b == '\r' || b == '\n') break;
+                    return -3;
+                }
                 int parsed = (int) value;
                 if (found >= 0 && found != parsed) return -2;
                 found = parsed;

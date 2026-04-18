@@ -58,6 +58,62 @@ class HttpLayerTest {
         assertNull(layer.decodeInbound(wire(partial)));
     }
 
+    // ---- Content-Length smuggling / malformed edges ----
+    // Per RFC 7230 §3.3.2 the value is `1*DIGIT`. Anything non-digit after
+    // the leading optional whitespace is malformed — quietly accepting the
+    // leading digits is a request-smuggling vector (different proxies would
+    // disagree on the framed body length).
+
+    @Test
+    void decodeInbound_contentLengthWithEmbeddedSpace_rejected() {
+        var layer = new HttpLayer();
+        // "4 2" parses as 4 in a naive implementation → body-length
+        // mis-parse → subsequent bytes treated as next request (smuggling).
+        var req = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4 2\r\n\r\nAAAAAA";
+        assertThrows(HttpProtocolException.class, () -> layer.decodeInbound(wire(req)));
+    }
+
+    @Test
+    void decodeInbound_contentLengthHexPrefix_rejected() {
+        var layer = new HttpLayer();
+        // "0x42" parses as 0 naively (digit '0' then non-digit 'x').
+        var req = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0x42\r\n\r\n";
+        assertThrows(HttpProtocolException.class, () -> layer.decodeInbound(wire(req)));
+    }
+
+    @Test
+    void decodeInbound_contentLengthTrailingGarbage_rejected() {
+        var layer = new HttpLayer();
+        var req = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 42abc\r\n\r\n"
+                + "A".repeat(42);
+        assertThrows(HttpProtocolException.class, () -> layer.decodeInbound(wire(req)));
+    }
+
+    @Test
+    void decodeInbound_contentLengthTrailingWhitespace_accepted() {
+        // OWS after the value is explicitly allowed by RFC 7230 §3.2.4.
+        var layer = new HttpLayer();
+        var req = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5   \r\n\r\nhello";
+        var frame = layer.decodeInbound(wire(req));
+        assertNotNull(frame, "trailing spaces/tabs around the value are allowed (OWS)");
+        var parsed = HttpLayer.parseFrame(frame);
+        assertEquals("hello", new String(parsed.body(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void decodeInbound_contentLengthNegativeSign_rejected() {
+        var layer = new HttpLayer();
+        var req = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: -5\r\n\r\nhello";
+        assertThrows(HttpProtocolException.class, () -> layer.decodeInbound(wire(req)));
+    }
+
+    @Test
+    void decodeInbound_contentLengthPlusSign_rejected() {
+        var layer = new HttpLayer();
+        var req = "POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: +5\r\n\r\nhello";
+        assertThrows(HttpProtocolException.class, () -> layer.decodeInbound(wire(req)));
+    }
+
     @Test
     void encodeOutbound_emitsValidHttpResponse() {
         var layer = new HttpLayer();
