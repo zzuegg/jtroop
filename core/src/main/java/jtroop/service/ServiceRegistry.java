@@ -25,7 +25,15 @@ public final class ServiceRegistry {
     // call and one field read per dispatch — keeps the path small enough for
     // C2 to inline the full chain and scalar-replace injectables (CLAUDE.md
     // rule #3).
-    private final Map<Class<? extends Record>, HandlerInvoker> handlers = new HashMap<>();
+    // IdentityHashMap (not HashMap) on the hot-path message-type lookup.
+    // Class keys are always identity-compared, so an identity map saves the
+    // virtual Class.equals() dispatch inside HashMap.get — small but real
+    // savings on the per-dispatch fast path. Safe without synchronisation
+    // because registration completes before Server/Client.start() publishes
+    // the registry reference, giving readers happens-before via the
+    // start-time barrier.
+    private final Map<Class<? extends Record>, HandlerInvoker> handlers =
+            new java.util.IdentityHashMap<>();
     // Multi-handler support: when multiple handler classes register for the
     // same message type, all invokers are collected here. dispatchAll() fans
     // out to every registered invoker for a given type. The single-handler
