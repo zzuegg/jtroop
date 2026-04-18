@@ -65,32 +65,39 @@ The blocking variants exercise `EventLoop.stageWriteAndFlush`, which is where Fi
 
 ## Tier-C additions (landed same-day)
 
-After tier B completed, two tier-C MEDIUM-severity items were addressed:
+After tier B completed, a full tier-C sweep landed the remaining MEDIUM-severity items from the review:
 
 | Commit | Fix | Verification |
 |---|---|---|
-| `bdf1f8a` | `CompressionLayer` decompression-bomb cap — new `maxUncompressedSize` (default 16 MiB); rejects negative/over-cap `originalSize` before any allocation, blocking the ~2 GB-per-frame OOM vector | 5 new tests in `CompressionBombTest` (bomb, negative, boundary-at-cap, over-cap, encode-side) |
-| `d315792` | `AllowListLayer` IPv4 ↔ IPv4-mapped IPv6 canonicalisation at construction — ends false-negative deny of IPv4 peers arriving via an IPv6 listener on dual-stack JVMs, and symmetrically closes the deny-list bypass | New `ipv4MappedIpv6_treatedAsSameHost` test using a byte-constructed 16-byte `Inet6Address` |
+| `bdf1f8a` | `CompressionLayer` decompression-bomb cap — new `maxUncompressedSize` (default 16 MiB); rejects negative/over-cap `originalSize` before any allocation, blocking the ~2 GB-per-frame OOM vector | 5 new tests in `CompressionBombTest` |
+| `d315792` | `AllowListLayer` IPv4 ↔ IPv4-mapped IPv6 canonicalisation at construction — ends false-negative deny of IPv4 peers arriving via an IPv6 listener on dual-stack JVMs, and symmetrically closes the deny-list bypass | `ipv4MappedIpv6_treatedAsSameHost` |
+| `3b40baf` | `SequencingLayer` + `DuplicateFilterLayer` 32-bit wrap safety — TCP-style `(seq - last) > 0` comparison in Sequencing; sentinel-free occupancy tracking in DuplicateFilter so a legitimate post-rollover seq=MIN_VALUE isn't collided with | Two rollover regression tests |
+| `dc85b0b` → `80d45ee` | `EventLoop.submit` final design — removed the setupOverflow CLQ spill (allocation-leaky under burst), size main ring to 64 K to cover broadcast storms, growable `ArrayDeque`-backed self-submit queue for re-entrant overflow. No magic numbers can now overflow — the ring is an optimisation, the deque is the correctness backstop. | `EventLoopSubmitBurstTest` + ConcurrencyTest stability 7/7 runs green |
+| `c92fca4` | `HttpLayer.Content-Length` now rejects embedded non-digit garbage — "4 2", "0x42", "42abc" used to parse as leading digits only (request-smuggling vector); now all return 400 Bad Request | 6 new HTTP tests (embedded space, hex prefix, trailing garbage, trailing whitespace accepted, ±sign rejected) |
+| `6d7d45a` | `ServiceRegistry` dispatch uses `IdentityHashMap` — skips the virtual `Class.equals()` inside HashMap's bucket scan on every message dispatch | Existing dispatch benchmarks |
+| `471f44b` | `ServiceRegistry` discovers `@OnMessage` / `@OnConnect` / `@OnDisconnect` in superclasses — walks the class hierarchy with (name, parameter-types) signature deduplication | `register_findsOnMessageDeclaredInSuperclass` |
+| `7e6f0f2` | `CodecRegistry` rejects type-ID collisions at registration — fail fast naming both conflicting types rather than silently overwriting the slot | Fix by inspection; no brute-force collision test shipped |
+| `1080fbe` | `Server.processOneFallbackFrame` now honours `inlineExecutor=true` — was unconditionally allocating a ~40 B lambda even on the zero-alloc default path | Existing fallback tests |
+| `91fef3b` | `Client.request` CAS-claims request slots — prevents slot-reuse collisions where request N+256 would trample the waiter token of a still-pending request N; bumped `REQ_SLOTS` 256 → 4096 for normal-load headroom | Full suite green (ServiceProxyTest, DualTransportTest, EndToEndTest) |
 
 Post-tier-C benchmark numbers (same `-prof gc` short-cycle profile):
 
 | Benchmark | Baseline | Post-tier-C | Delta |
 |---|---|---|---|
-| `NetGameBenchmark.positionUpdate` ops/ms | 59 533 | 58 853 ± 3 152 | −1.1% (within noise) |
+| `NetGameBenchmark.positionUpdate` ops/ms | 59 533 | 59 108 ± 1 806 | −0.7% (within noise) |
 | `NetGameBenchmark.positionUpdate` B/op | 0.017 | 0.017 ± 0.001 | flat |
-| `NetGameBenchmark.chatMessage` ops/ms | 21 262 | 20 153 ± 1 601 | −5.2% (CI overlaps baseline) |
-| `NetGameBenchmark.chatMessage` B/op | 0.046 | 0.050 ± 0.004 | +0.004 (within noise) |
+| `NetGameBenchmark.chatMessage` ops/ms | 21 262 | 20 182 ± 869 | −5.1% (CI overlaps baseline) |
+| `NetGameBenchmark.chatMessage` B/op | 0.046 | 0.049 ± 0.002 | +0.003 (within noise) |
 
-## Follow-ups
+## Follow-ups (still open — tier D / infra / long-tail)
 
-Recorded for tier C / tier D:
-- `EventLoop.submit` ring overflow removal with `trySubmit()` sibling API.
-- `Server.java:462` parenthesise for readability.
-- `CompressionLayer` decompression-bomb cap.
-- `SequencingLayer` / `DuplicateFilterLayer` 32-bit rollover handling.
-- `AllowListLayer` IPv4-mapped IPv6 normalisation.
-- `BufferCharSequence.subSequence` zero-alloc view.
-- Identity-map for `ServiceRegistry` dispatch.
-- Committed JMH baseline + CI regression gate.
-- Parameterised tests across codec/framing boundary suites.
-- Allocation-assertion harness in unit tests.
+- `Server.java:462` parenthesise for readability only (no behaviour bug — verified mathematically equivalent).
+- `BufferCharSequence.subSequence` zero-alloc view — **skipped**: grep showed no callers in the codebase.
+- Committed JMH baseline + CI regression gate — infrastructure work.
+- Parameterised tests across codec/framing boundary suites — hygiene.
+- Allocation-assertion harness in unit tests — hygiene.
+- `Server.processInboundLegacy` per-read frame cap for DoS fairness — connection-starvation hardening, separate concern from correctness.
+- `ConnectionId` 2³¹ generation rollover — extreme long-tail.
+- `Server.broadcast-during-shutdown` race — hard to reproduce; requires targeted stress test.
+- UDP handshake silent no-op — API hygiene (currently `connectUdp` ignores the handshake argument instead of throwing).
+- `CodecRegistry.auto-register-on-encode` vs require-register-on-decode inconsistency — mostly documentation.
