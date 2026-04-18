@@ -18,11 +18,13 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private static final VarHandle PENDING_WRITE;
     private static final VarHandle WRITE_TARGETS;
     private static final VarHandle SETUP_SLOTS;
+    private static final VarHandle WAITING_THREADS;
     static {
         try {
             PENDING_WRITE = MethodHandles.arrayElementVarHandle(boolean[].class);
             WRITE_TARGETS = MethodHandles.arrayElementVarHandle(SocketChannel[].class);
             SETUP_SLOTS   = MethodHandles.arrayElementVarHandle(Runnable[].class);
+            WAITING_THREADS = MethodHandles.arrayElementVarHandle(Thread[].class);
         } catch (Throwable t) {
             throw new ExceptionInInitializerError(t);
         }
@@ -241,13 +243,49 @@ public final class EventLoop implements Runnable, AutoCloseable {
             }
         }
         // Slow path: contended buffer, back-pressure, or channel not ready.
-        waitingThreads[slot] = Thread.currentThread();
-        stageWrite(slot, data);
-        selector.wakeup();
-        while ((boolean) PENDING_WRITE.getAcquire(pendingWrite, slot)) {
-            Thread.onSpinWait();
+        // Publish self BEFORE staging so a flush that races with us sees the
+        // waiter via the release/acquire pair; the subsequent stageWrite's
+        // setRelease on pendingWrite also covers happens-before for this
+        // slot write.
+        var self = Thread.currentThread();
+        WAITING_THREADS.setRelease(waitingThreads, slot, self);
+        try {
+            stageWrite(slot, data);
+            selector.wakeup();
+            // Hybrid spin-then-park. A short onSpinWait budget absorbs the
+            // common case where flushPendingWrites drains within a few
+            // hundred nanoseconds — cheaper than crossing into the kernel.
+            // When back-pressure is real, fall back to parkNanos(1ms): the
+            // loop does the kernel sleep, flushPendingWrites unparks us on
+            // drain for prompt wake, and parkNanos's own 1ms deadline
+            // bounds latency if a racing waiter on the same slot stole our
+            // waitingThreads entry (max 1ms extra wake latency under
+            // concurrent waiters — no lost-wakeup hang).
+            int spins = 0;
+            while ((boolean) PENDING_WRITE.getAcquire(pendingWrite, slot)) {
+                if (spins < FLUSH_WAIT_SPIN_BUDGET) {
+                    Thread.onSpinWait();
+                    spins++;
+                } else {
+                    // Re-publish before parking: a sibling caller may have
+                    // overwritten our slot, and flush's getAndSet(null) may
+                    // have consumed our token after a spurious wake.
+                    WAITING_THREADS.setRelease(waitingThreads, slot, self);
+                    java.util.concurrent.locks.LockSupport.parkNanos(FLUSH_WAIT_PARK_NS);
+                }
+            }
+        } finally {
+            // Clear only our own token so we don't trample a newer caller.
+            WAITING_THREADS.compareAndSet(waitingThreads, slot, self, null);
         }
     }
+
+    /** Spin iterations before falling back to parkNanos. ~200ns-1us worth
+     *  of onSpinWait on modern x86; covers the typical drain latency. */
+    private static final int FLUSH_WAIT_SPIN_BUDGET = 64;
+    /** parkNanos deadline when back-pressure is real. 1ms ≈ one selector
+     *  tick; bounds wake latency if another thread stole our waiter slot. */
+    private static final long FLUSH_WAIT_PARK_NS = 1_000_000L;
 
     public void flush() {
         selector.wakeup();
@@ -411,7 +449,10 @@ public final class EventLoop implements Runnable, AutoCloseable {
                     }
                 }
                 if (fullyDrained) {
-                    var waiter = waitingThreads[i];
+                    // Atomically claim-and-clear so a concurrent caller
+                    // doesn't see a stale pointer and a future drain doesn't
+                    // re-unpark an already-unparked thread.
+                    var waiter = (Thread) WAITING_THREADS.getAndSet(waitingThreads, i, null);
                     if (waiter != null) {
                         java.util.concurrent.locks.LockSupport.unpark(waiter);
                     }
