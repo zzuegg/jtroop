@@ -459,7 +459,7 @@ public final class Server implements AutoCloseable {
 
         // Synthetic ConnectionId based on remote address hash (simplified —
         // real impl would track UDP sessions).
-        var connId = ConnectionId.of(remoteAddr.hashCode() & 0x7FFFFFFF % 4096, 1);
+        var connId = ConnectionId.of((remoteAddr.hashCode() & 0x7FFFFFFF) % 4096, 1);
 
         // Decode message directly (no framing needed for UDP — datagrams are self-delimiting)
         if (readBuf.remaining() >= 2) {
@@ -690,13 +690,21 @@ public final class Server implements AutoCloseable {
         processInboundLegacy(wire, sender, config, channel, lc);
     }
 
+    /** Maximum number of frames dispatched from a single read cycle on one
+     *  connection. Caps the per-read work so a peer sending a huge buffered
+     *  stream of concatenated frames can't starve other connections on the
+     *  same event loop. Leftover bytes stay in the read buffer and get
+     *  picked up on the next selector cycle. */
+    private static final int MAX_FRAMES_PER_READ = 256;
+
     /** Standard 3-stage path: fused pipeline decode -> codec decode -> dispatch. */
     private void processInboundLegacy(ByteBuffer wire, ConnectionId sender,
                                        ListenerConfig config, SocketChannel channel,
                                        Layer.Context lc) {
         var fused = config.pipeline().fused();
         var frame = fused.decodeInbound(lc, wire);
-        while (frame != null) {
+        int dispatched = 0;
+        while (frame != null && dispatched < MAX_FRAMES_PER_READ) {
             int typeId = frame.getShort() & 0xFFFF;
             if (serviceRegistry.hasRawHandler(typeId)) {
                 serviceRegistry.dispatchRaw(typeId, frame, sender);
@@ -727,6 +735,7 @@ public final class Server implements AutoCloseable {
                 }
             }
 
+            dispatched++;
             frame = fused.decodeInbound(lc, wire);
         }
     }
